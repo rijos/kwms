@@ -1,0 +1,55 @@
+[package]
+name = "kwms"
+version = "0.1.0"
+edition = "2021"
+description = "WM(T)S server for aerial imagery"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# http
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace"] }
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+schemars = "0.8"
+
+# gdal / geo
+gdal = "0.17"
+
+# storage / cache
+opendal = "0.50"
+moka = { version = "0.12", features = ["future"] }
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.23"
+metrics-exporter-prometheus = "0.15"
+
+# cli
+clap = { version = "4", features = ["derive"] }
+
+# utils
+bytes = "1"
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+humantime-serde = "1"
+bytesize = { version = "1", features = ["serde"] }
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+pretty_assertions = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
