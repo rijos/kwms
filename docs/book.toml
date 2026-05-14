@@ -1,0 +1,13 @@
+[book]
+title = "kwms — design"
+description = "WMS/WMTS/TMS webserver in Rust"
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+
+[output.html.fold]
+enable = true
+level = 1
