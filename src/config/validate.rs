@@ -1,11 +1,326 @@
 //! Validation pass — structural + CRS-aware semantic checks.
 
-use anyhow::Result;
+use std::collections::HashSet;
+use std::ops::RangeInclusive;
+use std::time::Duration;
 
-use super::model::Config;
+use anyhow::{anyhow, bail, Context, Result};
 
-/// Run all validation rules. Errors include file path + YAML location when
-/// available.
-pub fn validate(_config: &Config) -> Result<()> {
-    todo!("phase 2 (config agent)")
+use super::model::{Config, LayerConfig, LevelRule};
+
+/// Well-known grid names recognised without an entry in `config.grids`.
+///
+/// Mirrors the list in `docs/src/configuration.md`.
+const WELL_KNOWN_GRIDS: &[&str] = &[
+    "webmercator",
+    "global_geodetic",
+    "rd_new_quad",
+    "etrs89_laea_quad",
+    "utm_31n_quad",
+    "utm_32n_quad",
+];
+
+const SUPPORTED_RESAMPLING: &[&str] = &[
+    "nearest",
+    "bilinear",
+    "cubic",
+    "cubic_spline",
+    "lanczos",
+    "average",
+    "mode",
+];
+
+/// Run all validation rules. Returns the first error encountered, with context
+/// naming the offending layer/field where possible.
+pub fn validate(config: &Config) -> Result<()> {
+    // Validate any custom grids' CRS via the crs module. This is the only
+    // place we call into `crs::validate` and is exercised by integration tests.
+    for (name, grid) in &config.grids {
+        crate::crs::validate(&grid.crs)
+            .with_context(|| format!("grid '{}': invalid crs '{}'", name, grid.crs))?;
+    }
+
+    // Unique layer names.
+    let mut seen = HashSet::new();
+    for layer in &config.layers {
+        if !seen.insert(layer.name.as_str()) {
+            bail!("duplicate layer name '{}'", layer.name);
+        }
+    }
+
+    // Per-layer checks.
+    for layer in &config.layers {
+        validate_layer(layer, config)
+            .with_context(|| format!("layer '{}'", layer.name))?;
+    }
+
+    Ok(())
+}
+
+fn validate_layer(layer: &LayerConfig, config: &Config) -> Result<()> {
+    if layer.formats.is_empty() {
+        bail!("formats must be non-empty");
+    }
+    if layer.sources.is_empty() {
+        bail!("sources must be non-empty");
+    }
+
+    // Grid references — must be either a well-known name or a key in
+    // `config.grids`.
+    if layer.grids.is_empty() {
+        bail!("grids must be non-empty");
+    }
+    for g in &layer.grids {
+        let is_well_known = WELL_KNOWN_GRIDS.contains(&g.as_str());
+        let is_custom = config.grids.contains_key(g);
+        if !is_well_known && !is_custom {
+            bail!(
+                "grid '{}' is not a well-known name and is not defined in `grids:`",
+                g
+            );
+        }
+    }
+
+    // Cache TTL must be positive.
+    if layer.cache.ttl == Duration::ZERO {
+        bail!("cache.ttl must be > 0");
+    }
+
+    // Level rule ranges must parse and not overlap within one layer.
+    validate_level_rules(&layer.cache.level_rules)?;
+
+    // Resampling must be one of the supported kernels.
+    if !SUPPORTED_RESAMPLING.contains(&layer.resampling.as_str()) {
+        bail!("resampling '{}' is not supported", layer.resampling);
+    }
+
+    Ok(())
+}
+
+fn validate_level_rules(rules: &[LevelRule]) -> Result<()> {
+    let mut parsed: Vec<RangeInclusive<u32>> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let range = parse_level_range(&rule.levels)
+            .with_context(|| format!("cache.level_rules: invalid range '{}'", rule.levels))?;
+        // Check overlap against earlier ranges.
+        for existing in &parsed {
+            if ranges_overlap(existing, &range) {
+                bail!(
+                    "cache.level_rules: range '{}-{}' overlaps with '{}-{}'",
+                    range.start(),
+                    range.end(),
+                    existing.start(),
+                    existing.end()
+                );
+            }
+        }
+        parsed.push(range);
+    }
+    Ok(())
+}
+
+fn parse_level_range(s: &str) -> Result<RangeInclusive<u32>> {
+    let s = s.trim();
+    if let Some((lo, hi)) = s.split_once('-') {
+        let lo: u32 = lo
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("range start is not a non-negative integer: '{}'", lo))?;
+        let hi: u32 = hi
+            .trim()
+            .parse()
+            .map_err(|_| anyhow!("range end is not a non-negative integer: '{}'", hi))?;
+        if lo > hi {
+            bail!("range start ({}) > range end ({})", lo, hi);
+        }
+        Ok(lo..=hi)
+    } else {
+        let v: u32 = s
+            .parse()
+            .map_err(|_| anyhow!("level is not a non-negative integer: '{}'", s))?;
+        Ok(v..=v)
+    }
+}
+
+fn ranges_overlap(a: &RangeInclusive<u32>, b: &RangeInclusive<u32>) -> bool {
+    a.start() <= b.end() && b.start() <= a.end()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::model::{
+        CacheMode, Config, LayerCacheConfig, LayerConfig, LevelRule, MaxResolution, SourceConfig,
+    };
+    use crate::encode::OutputFormat;
+
+    /// Build a minimal, valid `LayerConfig` that uses only well-known grids
+    /// (so validation never touches `crs::validate`).
+    fn good_layer(name: &str) -> LayerConfig {
+        LayerConfig {
+            name: name.into(),
+            grids: vec!["webmercator".into()],
+            max_resolution: MaxResolution::default(),
+            bbox: None,
+            sources: vec![SourceConfig {
+                uri: "vsiaz://photos/x.vrt".into(),
+                credentials: None,
+            }],
+            cache: LayerCacheConfig::default(),
+            title: "T".into(),
+            abstract_: String::new(),
+            keywords: vec![],
+            attribution: None,
+            metadata_url: None,
+            formats: vec![OutputFormat::Png],
+            resampling: "bilinear".into(),
+            queryable: true,
+            opaque: false,
+            nodata: None,
+        }
+    }
+
+    fn cfg(layers: Vec<LayerConfig>) -> Config {
+        Config {
+            layers,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_config_passes() {
+        let mut l = good_layer("a");
+        l.cache.level_rules = vec![
+            LevelRule { levels: "0-5".into(), mode: CacheMode::Cache },
+            LevelRule { levels: "10".into(), mode: CacheMode::Passthrough },
+            LevelRule { levels: "18-21".into(), mode: CacheMode::Passthrough },
+        ];
+        validate(&cfg(vec![l])).expect("should be valid");
+    }
+
+    #[test]
+    fn duplicate_layer_names_fails() {
+        let l1 = good_layer("a");
+        let l2 = good_layer("a");
+        let err = validate(&cfg(vec![l1, l2])).unwrap_err();
+        assert!(err.to_string().contains("duplicate layer name 'a'"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_formats_fails() {
+        let mut l = good_layer("a");
+        l.formats.clear();
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("formats must be non-empty"), "got: {s}");
+        assert!(s.contains("layer 'a'"), "got: {s}");
+    }
+
+    #[test]
+    fn empty_sources_fails() {
+        let mut l = good_layer("a");
+        l.sources.clear();
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("sources must be non-empty"), "got: {s}");
+    }
+
+    #[test]
+    fn unknown_grid_fails() {
+        let mut l = good_layer("a");
+        l.grids = vec!["nope_grid".into()];
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("grid 'nope_grid'"), "got: {s}");
+    }
+
+    #[test]
+    fn all_well_known_grids_pass() {
+        // Sanity: every name in our list should validate. Use one layer per
+        // name to keep names unique.
+        for (i, name) in WELL_KNOWN_GRIDS.iter().enumerate() {
+            let mut l = good_layer(&format!("layer{i}"));
+            l.grids = vec![(*name).into()];
+            validate(&cfg(vec![l])).expect("well-known grid must pass");
+        }
+    }
+
+    #[test]
+    fn zero_ttl_fails() {
+        let mut l = good_layer("a");
+        l.cache.ttl = Duration::ZERO;
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("cache.ttl"), "got: {s}");
+    }
+
+    #[test]
+    fn unsupported_resampling_fails() {
+        let mut l = good_layer("ortho2024");
+        l.resampling = "foo".into();
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(
+            s.contains("layer 'ortho2024'") && s.contains("resampling 'foo' is not supported"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn each_supported_resampling_passes() {
+        for (i, r) in SUPPORTED_RESAMPLING.iter().enumerate() {
+            let mut l = good_layer(&format!("l{i}"));
+            l.resampling = (*r).into();
+            validate(&cfg(vec![l])).expect("supported resampling must pass");
+        }
+    }
+
+    #[test]
+    fn malformed_level_range_fails() {
+        let mut l = good_layer("a");
+        l.cache.level_rules = vec![LevelRule {
+            levels: "not-a-range".into(),
+            mode: CacheMode::Cache,
+        }];
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("level_rules"), "got: {s}");
+    }
+
+    #[test]
+    fn overlapping_level_ranges_fail() {
+        let mut l = good_layer("a");
+        l.cache.level_rules = vec![
+            LevelRule { levels: "0-10".into(), mode: CacheMode::Cache },
+            LevelRule { levels: "5-15".into(), mode: CacheMode::Passthrough },
+        ];
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("overlaps"), "got: {s}");
+    }
+
+    #[test]
+    fn single_level_range_parses() {
+        let mut l = good_layer("a");
+        l.cache.level_rules = vec![LevelRule {
+            levels: "15".into(),
+            mode: CacheMode::Cache,
+        }];
+        validate(&cfg(vec![l])).expect("single level must parse");
+    }
+
+    #[test]
+    fn empty_grids_fails() {
+        let mut l = good_layer("a");
+        l.grids.clear();
+        let err = validate(&cfg(vec![l])).unwrap_err();
+        let s = format!("{err:#}");
+        assert!(s.contains("grids must be non-empty"), "got: {s}");
+    }
+
+    #[test]
+    fn parse_level_range_inverted_fails() {
+        let err = parse_level_range("20-10").unwrap_err();
+        assert!(err.to_string().contains("range start"), "got: {err}");
+    }
 }
