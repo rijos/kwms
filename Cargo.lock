@@ -1096,6 +1096,7 @@ dependencies = [
  "bytes",
  "bytesize",
  "clap",
+ "crossbeam-channel",
  "gdal",
  "humantime-serde",
  "metrics",
