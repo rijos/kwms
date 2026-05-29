@@ -32,4 +32,4 @@ VSI prefixes supported via GDAL: `vsiaz://`, `vsis3://`, `vsicurl://`, `vsigs://
 
 ### Reprojection
 
-When the source's native CRS differs from the requested CRS, reprojection happens inside the GDAL implementation using GDAL's warp API (cheaper than re-warping in pure Rust and gives access to the full GDAL resampling kernel list). Per-layer config picks the resampling method (nearest / bilinear / cubic / lanczos / …); the default is bilinear.
+When the source's native CRS differs from the requested CRS, reprojection happens inside the GDAL implementation using GDAL's warp API (cheaper than re-warping in pure Rust and gives access to the full GDAL resampling kernel list). Per-layer config picks the resampling method (`nearestneighbour` / `bilinear` / `cubic` / `lanczos` / …); the default is `bilinear`. Token spellings are GDAL's — see `gdal::raster::ResampleAlg::from_str`.

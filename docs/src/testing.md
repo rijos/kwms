@@ -32,7 +32,7 @@ For each fixture, the test file asserts:
 
 ### Updating golden files
 
-Golden XML files are checked into the repo. Update workflow: set `KWMS_UPDATE_GOLDEN=1` and re-run the failing test; the test harness writes the produced XML over the golden file. CI runs without the env var, so accidental drift fails the build.
+Golden XML files are checked into the repo. Update workflow: set `UPDATE_GOLDEN=1` and re-run the failing test; the test harness writes the produced XML over the golden file. CI runs without the env var, so accidental drift fails the build. (The name is deliberately unprefixed: the loader's `KWMS_*` env-var override path would otherwise inject the variable into the config tree.)
 
 ### Schema validation (future)
 

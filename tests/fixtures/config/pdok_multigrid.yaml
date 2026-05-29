@@ -1,0 +1,25 @@
+# PDOK-style fixture: multiple layers, each advertised on multiple
+# grids. Exercises CRS-per-grid mapping, per-CRS BoundingBox transformation,
+# and per-grid level-count derivation in capabilities.
+layers:
+  - name: ortho2023
+    title: Luchtfoto 2023 RGB
+    abstract: Aerial RGB orthomosaic, capture year 2023.
+    keywords: [aerial, orthomosaic, "2023"]
+    attribution: "Sample data — kwms fixtures"
+    grids: [webmercator, rd_new_quad]
+    bbox: [3.17, 50.58, 7.49, 53.64]
+    sources:
+      - uri: tests/fixtures/sources/ortho_small.tif
+    formats: [png, jpeg]
+
+  - name: ortho2024
+    title: Luchtfoto 2024 RGB
+    abstract: Aerial RGB orthomosaic, capture year 2024.
+    keywords: [aerial, orthomosaic, "2024"]
+    attribution: "Sample data — kwms fixtures"
+    grids: [webmercator, rd_new_quad]
+    bbox: [3.17, 50.58, 7.49, 53.64]
+    sources:
+      - uri: tests/fixtures/sources/ortho_small.tif
+    formats: [png, jpeg]

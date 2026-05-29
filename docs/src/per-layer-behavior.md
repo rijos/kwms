@@ -4,7 +4,7 @@
 
 - Triggered whenever the request CRS differs from the source's native CRS.
 - Performed inside the GDAL source implementation via GDAL's warp API.
-- Each layer declares a single resampling kernel applied uniformly to all reprojection and level-driven resampling (no separate up/down kernels in v1). Allowed kernels: `nearest`, `bilinear`, `cubic`, `cubic_spline`, `lanczos`, `average`, `mode`. Default: `bilinear`.
+- Each layer declares a single resampling kernel applied uniformly to all reprojection and level-driven resampling (no separate up/down kernels in v1). Tokens are delegated to GDAL's `ResampleAlg::from_str`: `nearestneighbour`, `bilinear`, `cubic`, `cubicspline`, `lanczos`, `average`, `mode`, `gauss`. Default: `bilinear`.
 
 ## Bounding box & out-of-coverage requests
 

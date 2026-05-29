@@ -1,0 +1,11 @@
+# Baseline fixture: one layer, one well-known grid, defaults everywhere.
+# Used to verify that the simplest valid config produces well-formed
+# capabilities and renders tiles correctly.
+layers:
+  - name: ortho
+    title: Ortho (minimal)
+    grids: [webmercator]
+    sources:
+      - uri: tests/fixtures/sources/ortho_small.tif
+    formats: [png]
+    bbox: [3.0, 50.0, 7.5, 54.0]

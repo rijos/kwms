@@ -1,0 +1,13 @@
+# Both queryable and opaque set to their non-default values, so the
+# capabilities goldens reflect the toggled XML attributes.
+# (Defaults: queryable=true, opaque=false; here we flip both.)
+layers:
+  - name: ortho_flags
+    title: Ortho (flags off)
+    grids: [webmercator]
+    queryable: false
+    opaque: true
+    sources:
+      - uri: tests/fixtures/sources/ortho_small.tif
+    formats: [png]
+    bbox: [3.0, 50.0, 7.5, 54.0]

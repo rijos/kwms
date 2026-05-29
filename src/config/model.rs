@@ -2,7 +2,6 @@
 //! deserialize into.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -89,33 +88,54 @@ fn default_hot_max() -> String {
     "512MB".into()
 }
 
+/// Persistent cache backend config — delegated to opendal.
+///
+/// `backend` is any [`opendal::Scheme`] name (`fs`, `s3`, `azblob`, `gcs`,
+/// `redis`, `memcached`, `webdav`, `hdfs`, …). `options` is a free-form
+/// key/value map passed verbatim to [`opendal::Operator::via_iter`]. We
+/// keep no typed knowledge of per-backend option keys here — that
+/// catalogue lives in opendal and would just drift if we mirrored it.
+///
+/// References:
+/// - Scheme list: <https://docs.rs/opendal/0.50/opendal/enum.Scheme.html>
+/// - Per-backend option keys: <https://docs.rs/opendal/0.50/opendal/services/index.html>
+/// - Builder entry point: <https://docs.rs/opendal/0.50/opendal/struct.Operator.html#method.via_iter>
+///
+/// Default: `fs` rooted at `/var/cache/kwms`, equivalent to writing
+///
+/// ```yaml
+/// persistent:
+///   backend: fs
+///   options:
+///     root: /var/cache/kwms
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "backend", rename_all = "lowercase")]
-pub enum PersistentCacheConfig {
-    Fs {
-        path: PathBuf,
-    },
-    Azure {
-        container: String,
-        #[serde(default)]
-        credentials: Option<String>,
-    },
-    S3 {
-        bucket: String,
-        #[serde(default)]
-        credentials: Option<String>,
-    },
-    Redis {
-        url: String,
-    },
-    Memcached {
-        url: String,
-    },
+#[serde(deny_unknown_fields)]
+pub struct PersistentCacheConfig {
+    /// opendal scheme name (`fs`, `s3`, `azblob`, …).
+    /// See <https://docs.rs/opendal/0.50/opendal/enum.Scheme.html>.
+    pub backend: String,
+    /// Free-form options passed verbatim to `Operator::via_map`. Per-backend
+    /// keys are documented at
+    /// <https://docs.rs/opendal/0.50/opendal/services/index.html>.
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+    /// Optional reference into `secrets.yaml::credentials.<name>`. Entries
+    /// from the named credentials block are merged into `options` at
+    /// operator-build time so secret material never sits in `config.yaml`.
+    #[serde(default)]
+    pub credentials: Option<String>,
 }
 
 impl Default for PersistentCacheConfig {
     fn default() -> Self {
-        Self::Fs { path: PathBuf::from("/var/cache/kwms") }
+        let mut options = HashMap::new();
+        options.insert("root".into(), "/var/cache/kwms".into());
+        Self {
+            backend: "fs".into(),
+            options,
+            credentials: None,
+        }
     }
 }
 

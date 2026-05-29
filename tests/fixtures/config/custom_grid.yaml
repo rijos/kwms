@@ -1,0 +1,19 @@
+# Declares a custom (non-well-known) grid in the top-level grids: section
+# and references it from a layer. Exercises the custom-grid resolution path
+# in capabilities rendering and validation (CRS must validate via PROJ).
+grids:
+  rd_custom_local:
+    crs: EPSG:28992
+    top_left: [-285401.92, 903401.92]
+    base_resolution: 3440.64
+    tile_size: [256, 256]
+    origin: top_left
+
+layers:
+  - name: ortho_local
+    title: Ortho (custom grid)
+    grids: [rd_custom_local]
+    sources:
+      - uri: tests/fixtures/sources/ortho_small.tif
+    formats: [png]
+    bbox: [120000.0, 480000.0, 130000.0, 490000.0]

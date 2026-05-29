@@ -1,0 +1,13 @@
+# Like single_grid_minimal but with max_resolution capped to 0.5 m/pixel.
+# Capabilities golden should show a truncated TileMatrix list — webmercator
+# would normally advertise ~22 levels; capping at 0.5 m/px drops the
+# deepest few.
+layers:
+  - name: ortho
+    title: Ortho (max_resolution=0.5)
+    grids: [webmercator]
+    max_resolution: 0.5
+    sources:
+      - uri: tests/fixtures/sources/ortho_small.tif
+    formats: [png]
+    bbox: [3.0, 50.0, 7.5, 54.0]

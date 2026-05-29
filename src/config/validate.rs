@@ -2,9 +2,12 @@
 
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
+use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use gdal::errors::GdalError;
+use gdal::raster::ResampleAlg;
 
 use super::model::{Config, LayerConfig, LevelRule};
 
@@ -18,16 +21,6 @@ const WELL_KNOWN_GRIDS: &[&str] = &[
     "etrs89_laea_quad",
     "utm_31n_quad",
     "utm_32n_quad",
-];
-
-const SUPPORTED_RESAMPLING: &[&str] = &[
-    "nearest",
-    "bilinear",
-    "cubic",
-    "cubic_spline",
-    "lanczos",
-    "average",
-    "mode",
 ];
 
 /// Run all validation rules. Returns the first error encountered, with context
@@ -89,10 +82,16 @@ fn validate_layer(layer: &LayerConfig, config: &Config) -> Result<()> {
     // Level rule ranges must parse and not overlap within one layer.
     validate_level_rules(&layer.cache.level_rules)?;
 
-    // Resampling must be one of the supported kernels.
-    if !SUPPORTED_RESAMPLING.contains(&layer.resampling.as_str()) {
-        bail!("resampling '{}' is not supported", layer.resampling);
-    }
+    // Resampling kernel — delegated to GDAL. The token in `config.yaml` must
+    // be one GDAL recognises (e.g. `nearestneighbour`, `bilinear`, `cubic`,
+    // `cubicspline`, `lanczos`, `average`, `mode`, `gauss`); see GDAL's
+    // `ResampleAlg::from_str` for the exact list. `GdalError`'s Display impl
+    // omits the descriptive payload, so we unwrap the `BadArgument` variant
+    // to keep the kernel list in the user-facing message.
+    ResampleAlg::from_str(&layer.resampling).map_err(|e| match e {
+        GdalError::BadArgument(msg) => anyhow!("resampling {}", msg),
+        other => anyhow!("resampling '{}': {other:?}", layer.resampling),
+    })?;
 
     Ok(())
 }
@@ -260,18 +259,29 @@ mod tests {
         l.resampling = "foo".into();
         let err = validate(&cfg(vec![l])).unwrap_err();
         let s = format!("{err:#}");
+        // Message is sourced from GDAL — it says `'foo' does not match one of [...]`
+        // and lists the supported kernels. We assert on the offending token
+        // and the "does not match" phrase rather than the exact list, so a
+        // future GDAL release adding a kernel doesn't break this test.
         assert!(
-            s.contains("layer 'ortho2024'") && s.contains("resampling 'foo' is not supported"),
+            s.contains("layer 'ortho2024'")
+                && s.contains("'foo'")
+                && s.contains("does not match"),
             "got: {s}"
         );
     }
 
     #[test]
     fn each_supported_resampling_passes() {
-        for (i, r) in SUPPORTED_RESAMPLING.iter().enumerate() {
+        // Source of truth: whatever GDAL's `ResampleAlg::from_str` accepts.
+        // We exercise every variant by spelling it the way GDAL expects
+        // (lowercase, no separators).
+        for (i, alg) in ResampleAlg::iter().enumerate() {
+            let token = alg.to_string().to_lowercase();
             let mut l = good_layer(&format!("l{i}"));
-            l.resampling = (*r).into();
-            validate(&cfg(vec![l])).expect("supported resampling must pass");
+            l.resampling = token.clone();
+            validate(&cfg(vec![l]))
+                .unwrap_or_else(|e| panic!("token `{token}` must validate: {e:#}"));
         }
     }
 

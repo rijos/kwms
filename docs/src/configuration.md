@@ -47,12 +47,30 @@ cache:
   hot:
     max_bytes: "512MB"               # moka in-process tier
   persistent:
+    # Delegated to opendal: `backend` is any opendal Scheme name and
+    # `options` is a free-form key/value map handed to Operator::via_map.
+    # See https://docs.rs/opendal/0.50/opendal/enum.Scheme.html for the
+    # full backend list and https://docs.rs/opendal/0.50/opendal/services/
+    # for per-backend option keys.
     backend: fs
-    path: /var/cache/kwms
-    # or, for cloud-backed caches:
-    # backend: azure
-    # container: tilecache
-    # credentials: cache_blob        # references secrets.yaml
+    options:
+      root: /var/cache/kwms
+    # Examples for other backends:
+    # backend: azblob
+    # options:
+    #   container: tilecache
+    #   endpoint: https://acct.blob.core.windows.net
+    # credentials: cache_blob        # merged into `options` from secrets.yaml
+    #
+    # backend: s3
+    # options:
+    #   bucket: tilecache
+    #   region: eu-west-1
+    # credentials: cache_s3
+    #
+    # backend: redis
+    # options:
+    #   endpoint: redis://localhost:6379
 
 # ---- custom grids (omit if you only use well-known grids) ----
 # Well-known grids shipped in v1 (usable as bare strings in a layer's grids: list):

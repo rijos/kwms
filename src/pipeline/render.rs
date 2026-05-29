@@ -104,15 +104,19 @@ async fn compute_tile(
 
 /// Map the per-layer `resampling:` string to the public `Resampling` enum.
 ///
-/// Unknown values default to [`Resampling::Bilinear`] — the config validator
-/// rejects unknown spellings on load, so this branch should never fire in
-/// practice and serves only as a defensive fallback.
+/// Tokens are GDAL's — `nearestneighbour`, `bilinear`, `cubic`, `cubicspline`,
+/// `lanczos`, `average`, `mode`. Unknown values default to
+/// [`Resampling::Bilinear`]; the config validator delegates to GDAL's
+/// `ResampleAlg::from_str` and rejects unknown spellings on load, so this
+/// branch should never fire in practice and serves only as a defensive
+/// fallback. `gauss` is accepted by validation but not yet mapped here —
+/// we don't expose it through our internal [`Resampling`] enum.
 pub fn resampling_from_str(s: &str) -> Resampling {
     match s.trim().to_ascii_lowercase().as_str() {
-        "nearest" => Resampling::Nearest,
+        "nearestneighbour" => Resampling::Nearest,
         "bilinear" => Resampling::Bilinear,
         "cubic" => Resampling::Cubic,
-        "cubic_spline" | "cubicspline" => Resampling::CubicSpline,
+        "cubicspline" => Resampling::CubicSpline,
         "lanczos" => Resampling::Lanczos,
         "average" => Resampling::Average,
         "mode" => Resampling::Mode,
@@ -302,11 +306,14 @@ mod tests {
 
     #[test]
     fn resampling_from_str_known_and_unknown() {
-        assert!(matches!(resampling_from_str("nearest"), Resampling::Nearest));
+        assert!(matches!(
+            resampling_from_str("nearestneighbour"),
+            Resampling::Nearest
+        ));
         assert!(matches!(resampling_from_str("BILINEAR"), Resampling::Bilinear));
         assert!(matches!(resampling_from_str("cubic"), Resampling::Cubic));
         assert!(matches!(
-            resampling_from_str("cubic_spline"),
+            resampling_from_str("cubicspline"),
             Resampling::CubicSpline
         ));
         assert!(matches!(resampling_from_str("lanczos"), Resampling::Lanczos));

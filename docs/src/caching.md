@@ -9,7 +9,7 @@ Tile-level only: `(layer, z, x, y, format, CRS)`. No separate cache for assemble
 Two tiers:
 
 - **Hot tier**: in-process [`moka`](https://crates.io/crates/moka) async cache, bounded by total bytes (configurable). Caches decoded/encoded tile bytes so cache hits skip both source I/O and encoding.
-- **Persistent tier**: [`opendal`](https://crates.io/crates/opendal) operator. Backends configurable per deployment — filesystem for single-node, Azure Blob / S3 / Redis / Memcached for multi-instance. OpenDAL's built-in retry and metric layers are enabled.
+- **Persistent tier**: [`opendal`](https://crates.io/crates/opendal) operator. We don't enumerate backends or per-backend options ourselves — the `backend:` key in `config.yaml` is any [opendal `Scheme`](https://docs.rs/opendal/0.50/opendal/enum.Scheme.html) name (`fs`, `s3`, `azblob`, `gcs`, `redis`, `memcached`, `webdav`, `hdfs`, …) and the `options:` map is passed verbatim to [`Operator::via_iter`](https://docs.rs/opendal/0.50/opendal/struct.Operator.html#method.via_iter). Per-backend option keys are documented at <https://docs.rs/opendal/0.50/opendal/services/>. OpenDAL's built-in retry and metric layers are enabled.
 
 Lookup order: hot → persistent → source (render + populate both tiers on miss).
 
