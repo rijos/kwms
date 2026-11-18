@@ -14,6 +14,8 @@ use crate::server::AppState;
 /// when the listener exits (cleanly or with an error).
 pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
     init_tracing();
+    // Before anything can run a coordinate transform.
+    crate::crs::disable_proj_network()?;
 
     let (config, secrets) =
         crate::config::load::load(&config_path, &secrets_path).with_context(|| {
@@ -25,7 +27,8 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
         })?;
 
     let bind = config.server.bind.clone();
-    tracing::info!(bind = %bind, "starting kwms server");
+    let metrics_bind = config.server.metrics_bind.clone();
+    tracing::info!(bind = %bind, metrics_bind = ?metrics_bind, "starting kwms server");
 
     let state = Arc::new(AppState::new(config, secrets).context("building application state")?);
     let app = crate::server::router(state);
@@ -33,9 +36,28 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("binding to `{bind}`"))?;
-    axum::serve(listener, app)
-        .await
-        .context("axum serve loop exited with error")?;
+    let main = async {
+        axum::serve(listener, app)
+            .await
+            .context("axum serve loop exited with error")
+    };
+
+    // `/metrics` lives on its own listener so it can be kept off the
+    // public network (see `server.metrics_bind`).
+    match metrics_bind {
+        Some(addr) => {
+            let metrics_listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .with_context(|| format!("binding metrics listener to `{addr}`"))?;
+            let metrics = async {
+                axum::serve(metrics_listener, crate::server::metrics_router())
+                    .await
+                    .context("metrics serve loop exited with error")
+            };
+            tokio::try_join!(main, metrics)?;
+        }
+        None => main.await?,
+    }
     Ok(())
 }
 

@@ -15,14 +15,19 @@ impl Pyramid {
     /// Select the pyramid level whose resolution is the coarsest that still
     /// covers the requested (bbox, output size) without oversampling.
     ///
-    /// The requested resolution is `bbox.width() / output_size.0` in the
-    /// grid's CRS units per pixel. The deepest level `k` whose
+    /// The requested resolution is the coarser of `bbox.width() / size.0`
+    /// and `bbox.height() / size.1`, in the grid's CRS units per pixel.
+    /// Using the coarser axis bounds the number of covering tiles by the
+    /// output size on *both* axes (a narrow but very tall bbox can't force a
+    /// deep level). The deepest level `k` whose
     /// `grid.resolution(k) >= requested_res` is returned, capped by
     /// `self.max_level`. Returns `0` if even level 0 oversamples (i.e.
     /// the request is coarser than what level 0 can deliver).
     pub fn select_level(&self, bbox: &Bbox, size: (u32, u32)) -> u32 {
         let width_px = size.0.max(1) as f64;
-        let requested = (bbox.maxx - bbox.minx).abs() / width_px;
+        let height_px = size.1.max(1) as f64;
+        let requested = ((bbox.maxx - bbox.minx).abs() / width_px)
+            .max((bbox.maxy - bbox.miny).abs() / height_px);
 
         // Walk from level 0 upwards while the level's resolution is still
         // coarser-or-equal to the requested resolution — that's the deepest

@@ -1,70 +1,71 @@
 //! Bounded, per-source pool of opened GDAL datasets.
 //!
-//! `gdal::Dataset` is `!Sync` (and only `Send` because the crate marks it so —
-//! a dataset must be used from a single thread at a time). The pool here is
-//! a **dedicated worker-thread pool**: one OS thread per slot, each owning
-//! its own `Dataset` for its entire lifetime. Tokio callers submit a closure
-//! to *any* idle worker via a shared crossbeam channel; the worker runs it on
-//! its dataset and reports the result back over a `tokio::sync::oneshot`.
+//! GDAL rule (docs/src/concurrency.md): a dataset — and the bands it owns —
+//! must never be used by two threads at once. The pool enforces it by
+//! construction: one OS thread per slot, each owning its own `Dataset` for
+//! its whole life; jobs are closures run *on* that thread with `&mut` access.
 //!
-//! This sidesteps the `!Send`-across-threads concern by ensuring each
-//! `Dataset` is never moved off its owner thread once opened. See
-//! `docs/src/source-abstraction.md`, "Dataset pooling".
+//! Concurrency properties:
+//! * **Admission never blocks a runtime thread.** Callers first take a slot
+//!   permit from an async, FIFO-fair `tokio::sync::Semaphore` (one permit per
+//!   worker), waiting at most [`QUEUE_TIMEOUT`] before failing with [`Busy`]
+//!   (HTTP 429). Holding a permit guarantees the bounded job channel has
+//!   room, so the hand-off is a non-blocking `try_send`.
+//! * **Capacity is exact under cancellation.** The permit moves into the job
+//!   and is released only when the job has run on the worker, even if the
+//!   caller's future was dropped meanwhile.
+//! * **A panicking job doesn't kill the worker.** Each job runs under
+//!   `catch_unwind`; after a panic the worker drops its dataset and reopens
+//!   it, so no state touched by the failed job is reused.
+//! * **No deadlock:** a worker never waits for anything but its next job,
+//!   and jobs never submit to a pool themselves.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use crossbeam_channel::{bounded, Sender};
-use tokio::sync::oneshot;
+use crossbeam_channel::{bounded, Sender, TrySendError};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::dataset::OpenedDataset;
+use crate::pipeline::error::Busy;
 
-/// A boxed unit of work that runs on a worker thread holding a `gdal::Dataset`.
+/// Longest a caller waits for a free dataset slot before getting [`Busy`].
+pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A unit of work run on a worker thread against its dataset. It carries the
+/// slot permit, released when the job (and the closure inside) is dropped.
 type Job = Box<dyn FnOnce(&mut gdal::Dataset) + Send + 'static>;
 
 pub struct DatasetPool {
-    /// Submit jobs here; one of the worker threads will receive and run it.
     tx: Sender<Job>,
-    /// Number of worker threads / dataset handles held by this pool.
+    slots: Arc<Semaphore>,
     size: usize,
 }
 
 impl DatasetPool {
     /// Open `size` datasets at `uri` (each with `credentials` applied as
     /// scoped open options) and spawn one worker thread per dataset.
-    ///
-    /// `size` must be >= 1.
     pub fn new(uri: &str, credentials: HashMap<String, String>, size: usize) -> Result<Self> {
         if size == 0 {
             return Err(anyhow!("DatasetPool size must be at least 1"));
         }
-
-        // A bounded channel of capacity `size` is enough to avoid unbounded
-        // queueing in pathological burst scenarios; jobs will still queue
-        // up to that depth before backpressure kicks in via `send`.
+        // Capacity == number of permits: a permit holder can always enqueue.
         let (tx, rx) = bounded::<Job>(size);
-
         for slot in 0..size {
             let opened = OpenedDataset::open(uri, &credentials)
                 .with_context(|| format!("opening dataset slot {slot} for '{uri}'"))?;
             let rx = rx.clone();
+            let (uri, credentials) = (uri.to_string(), credentials.clone());
             thread::Builder::new()
                 .name(format!("gdal-pool[{slot}]"))
-                .spawn(move || {
-                    let mut owned = opened;
-                    // Drain jobs until the channel is closed (all senders
-                    // dropped). Each job borrows the dataset mutably.
-                    while let Ok(job) = rx.recv() {
-                        job(&mut owned.dataset);
-                    }
-                    // Ensure the dataset is dropped on this same thread.
-                    drop(owned);
-                })
+                .spawn(move || worker(slot, opened, rx, &uri, &credentials))
                 .with_context(|| format!("spawning gdal-pool worker thread {slot}"))?;
         }
-
-        Ok(Self { tx, size })
+        Ok(Self { tx, slots: Arc::new(Semaphore::new(size)), size })
     }
 
     /// Number of worker threads / dataset handles in this pool.
@@ -72,46 +73,191 @@ impl DatasetPool {
         self.size
     }
 
-    /// Run `f` on one of the pool's worker threads against its owned
-    /// `gdal::Dataset`. The closure runs synchronously on the worker; this
-    /// future resolves when the worker has finished and sent the result back.
+    /// Run `f` on one of the pool's worker threads against its own dataset.
     pub async fn with_dataset<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut gdal::Dataset) -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        let permit: OwnedSemaphorePermit = tokio::time::timeout(QUEUE_TIMEOUT, self.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| Busy)?
+            .context("dataset pool closed")?;
         let (resp_tx, resp_rx) = oneshot::channel::<Result<R>>();
-
-        // SAFETY (Send-safety): `gdal::Dataset` is marked `Send` by the
-        // `gdal` crate, but the underlying GDAL docs require that a dataset
-        // is only touched by one thread at a time. We enforce that by
-        // *never* sharing the Dataset across threads: each worker thread
-        // owns its Dataset for its entire lifetime, and only borrows it
-        // mutably while running a single job. The `Job` closure we ship
-        // through the channel is `Send + 'static`, but the `&mut Dataset`
-        // it receives lives entirely inside the worker thread that runs it.
         let job: Job = Box::new(move |ds: &mut gdal::Dataset| {
-            let out = f(ds);
-            // Receiver may have been dropped (caller future cancelled); the
-            // ignored Result is fine — we just discard the work product.
-            let _ = resp_tx.send(out);
+            let _permit = permit; // released when this job finishes or unwinds
+            // The caller may be gone (cancelled); the result is then dropped.
+            let _ = resp_tx.send(f(ds));
         });
-
-        self.tx
-            .send(job)
-            .map_err(|_| anyhow!("DatasetPool worker channel closed"))?;
-
+        match self.tx.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                return Err(anyhow!("internal: dataset pool channel full while holding a slot"))
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(anyhow!("dataset pool has no workers")),
+        }
         resp_rx
             .await
-            .map_err(|_| anyhow!("DatasetPool worker dropped response channel"))?
+            .map_err(|_| anyhow!("dataset pool job failed (worker panicked or was shut down)"))?
     }
+}
+
+/// Worker loop: run jobs on this thread's dataset until the pool is dropped.
+fn worker(
+    slot: usize,
+    mut dataset: OpenedDataset,
+    rx: crossbeam_channel::Receiver<Job>,
+    uri: &str,
+    credentials: &HashMap<String, String>,
+) {
+    while let Ok(job) = rx.recv() {
+        if catch_unwind(AssertUnwindSafe(|| job(&mut dataset.dataset))).is_ok() {
+            continue;
+        }
+        tracing::error!(slot, uri, "dataset pool job panicked; reopening the dataset");
+        // Don't reuse a dataset a panicking job may have left mid-operation.
+        drop(dataset);
+        match OpenedDataset::open(uri, credentials) {
+            Ok(fresh) => dataset = fresh,
+            Err(e) => {
+                tracing::error!(slot, uri, error = %format_args!("{e:#}"), "cannot reopen dataset; worker exits");
+                return;
+            }
+        }
+    }
+    // Channel closed (pool dropped): `dataset` is dropped here, on its own thread.
 }
 
 impl Drop for DatasetPool {
     fn drop(&mut self) {
-        // Dropping the `tx` end causes every worker's `rx.recv()` to return
-        // `Err`, breaking its loop and letting it drop its Dataset on its
-        // own thread. We don't `join` the threads: they exit promptly and
-        // GDAL's resource cleanup is thread-safe.
+        // Dropping `tx` closes the channel; each worker finishes its current
+        // job, leaves its loop and drops its dataset on its own thread.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn tiny_tif() -> tempfile::NamedTempFile {
+        let tmp = tempfile::Builder::new().suffix(".tif").tempfile().unwrap();
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        driver.create_with_band_type::<u8, _>(tmp.path(), 4, 4, 1).unwrap();
+        tmp
+    }
+
+    /// Submitting to a busy pool must wait *asynchronously*: a blocked
+    /// runtime thread would stall every other task on it (health checks,
+    /// timers, other requests).
+    #[test]
+    fn full_pool_does_not_block_the_async_runtime() {
+        let tif = tiny_tif();
+        let pool = Arc::new(DatasetPool::new(tif.path().to_str().unwrap(), HashMap::new(), 1).unwrap());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let worst_tick = rt.block_on(async {
+            for _ in 0..4 {
+                let p = pool.clone();
+                tokio::spawn(async move {
+                    let _ = p
+                        .with_dataset(|_| {
+                            std::thread::sleep(Duration::from_secs(1));
+                            Ok(())
+                        })
+                        .await;
+                });
+            }
+            // A 10 ms ticker on the same (only) runtime thread.
+            let mut worst = Duration::ZERO;
+            for _ in 0..20 {
+                let t = Instant::now();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                worst = worst.max(t.elapsed());
+            }
+            worst
+        });
+        // A blocking hand-off stalls for at least one job (1 s); allow generous
+        // scheduling noise below that.
+        assert!(worst_tick < Duration::from_millis(250), "runtime thread was blocked for {worst_tick:?}");
+    }
+
+    /// A job that panics must not permanently remove a worker.
+    #[test]
+    fn a_panicking_job_does_not_kill_the_worker() {
+        let tif = tiny_tif();
+        let pool = DatasetPool::new(tif.path().to_str().unwrap(), HashMap::new(), 1).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let first = pool.with_dataset(|_| -> Result<()> { panic!("job bug") }).await;
+            assert!(first.is_err());
+            let second = tokio::time::timeout(
+                Duration::from_secs(2),
+                pool.with_dataset(|ds| Ok(ds.raster_size())),
+            )
+            .await
+            .expect("pool has no live worker after a panic");
+            assert_eq!(second.unwrap(), (4, 4));
+        });
+    }
+
+    /// Many concurrent jobs: never more than `size` run at once (one per
+    /// worker/dataset) and all complete.
+    #[test]
+    fn concurrency_never_exceeds_pool_size() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tif = tiny_tif();
+        let pool = Arc::new(DatasetPool::new(tif.path().to_str().unwrap(), HashMap::new(), 4).unwrap());
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        rt.block_on(async {
+            let mut tasks = Vec::new();
+            for _ in 0..64 {
+                let (pool, running, peak) = (pool.clone(), running.clone(), peak.clone());
+                tasks.push(tokio::spawn(async move {
+                    pool.with_dataset(move |ds| {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(5));
+                        let size = ds.raster_size();
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(size)
+                    })
+                    .await
+                }));
+            }
+            for t in tasks {
+                assert_eq!(t.await.unwrap().unwrap(), (4, 4));
+            }
+        });
+        assert!(peak.load(Ordering::SeqCst) <= 4, "peak {} > pool size", peak.load(Ordering::SeqCst));
+    }
+
+    /// A saturated pool sheds load with `Busy` after the queue timeout
+    /// instead of queueing without bound.
+    #[test]
+    fn saturated_pool_reports_busy() {
+        use crate::pipeline::error::{classify, Disposition};
+        let tif = tiny_tif();
+        let pool = Arc::new(DatasetPool::new(tif.path().to_str().unwrap(), HashMap::new(), 1).unwrap());
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            let p = pool.clone();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let hog = tokio::spawn(async move {
+                p.with_dataset(move |_| {
+                    let _ = started_tx.send(()); // the only slot is now taken
+                    std::thread::sleep(QUEUE_TIMEOUT + Duration::from_secs(1));
+                    Ok(())
+                })
+                .await
+            });
+            started_rx.await.unwrap();
+            let err = pool.with_dataset(|_| Ok(())).await.unwrap_err();
+            assert_eq!(classify(&err), Disposition::Busy);
+            hog.await.unwrap().unwrap();
+        });
     }
 }

@@ -23,119 +23,100 @@
 //! path works either way).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use gdal::raster::{Buffer, GdalDataType, GdalType};
-use gdal::spatial_ref::SpatialRef;
+use gdal::raster::ResampleAlg;
 use gdal::vsi::{create_mem_file, unlink_mem_file};
-use gdal::{Dataset, DriverManager};
+use gdal::Dataset;
 
-use super::render::render_tile;
-use crate::cache::LayeredCache;
-use crate::config::{Config, LayerConfig};
+use super::error::client_error;
+use super::render::{blank_image, layer_resampling, render_grid_tile, Renderer};
 use crate::crs::{Bbox, Crs};
 use crate::encode::{encode, EncodeOpts, GeoRef, OutputFormat};
-use crate::protocol::wms::request::GetMapRequest;
-use crate::source::{PixelBuffer, PixelType, SourceRegistry};
-use crate::tile::grid::lookup_grid;
+use crate::protocol::wms::validate::WmsGetMap;
+use crate::source::gdal::raster::{
+    bbox_to_geotransform, create_georeferenced_mem, gis_order_spatial_ref, pixel_type_from_gdal, read_pixel_buffer,
+    set_nodata, vsimem_path, warp, WarpOptions,
+};
 use crate::tile::{Pyramid, TileCoord, TileGrid};
 
-/// Monotonic counter for minting unique `/vsimem/` paths per request.
-static VSIMEM_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// What the composite produces: owned copies of validated request values,
+/// so it can run on the blocking render pool. `crs` is the catalog's config
+/// token for the requested CRS — never a client string.
+struct Target {
+    crs: Crs,
+    bbox: Bbox,
+    width: u32,
+    height: u32,
+    format: OutputFormat,
+}
 
-/// Handle a parsed WMS GetMap request end-to-end.
-pub async fn serve_get_map(
-    sources: &SourceRegistry,
-    cache: &LayeredCache,
-    config: &Config,
-    req: &GetMapRequest,
-) -> Result<Bytes> {
-    // 1. Resolve the layer. Multi-layer GetMap is out of scope for v1; we
-    //    pick the first listed layer (which must exist).
-    let layer_name = req
-        .layers
-        .first()
-        .ok_or_else(|| anyhow!("GetMap request carried no LAYERS"))?;
-    let layer = config
-        .layers
-        .iter()
-        .find(|l| &l.name == layer_name)
-        .ok_or_else(|| anyhow!("layer `{layer_name}` not found in config"))?;
+/// Serve a validated WMS GetMap end-to-end.
+pub async fn serve_get_map(r: &Renderer, q: &WmsGetMap<'_>) -> Result<Bytes> {
+    let layer = q.layer().config();
+    let grid = q.grid().grid().clone();
+    let (width, height) = q.size();
+    let bbox = q.bbox();
+    let crs = q.crs().crs();
 
-    // 2. Pick the first of the layer's grids whose CRS matches the request.
-    let grid = pick_grid_for_crs(layer, config, &req.crs)?;
+    // BBOX entirely outside the grid: a blank image, not an error.
+    if !q.intersects_grid() {
+        return blank_image(r, layer, crs, bbox, (width, height), q.format()).await;
+    }
 
-    // 3. Build a pyramid and select the pyramid level.
+    // Pyramid level for the requested resolution, then the covering tiles.
+    // Level selection keeps this near (WIDTH/tile_w + 2) x (HEIGHT/tile_h + 2)
+    // tiles; the cap is a backstop so no bbox/size combination can explode it.
     let pyramid = Pyramid {
         grid: grid.clone(),
         max_level: grid.level_count().saturating_sub(1),
     };
-    let level = pyramid.select_level(&req.bbox, (req.width, req.height));
+    let level = pyramid.select_level(&bbox, (width, height));
+    let (tw, th) = grid.tile_size();
+    let across = |px: u32, tile: u32| u64::from(px).div_ceil(u64::from(tile.max(1))).checked_add(2);
+    let max_tiles = across(width, tw)
+        .zip(across(height, th))
+        .and_then(|(a, b)| a.checked_mul(b))
+        .ok_or_else(|| anyhow!("internal: tile budget overflows u64"))?;
+    let coords = tile_coords_for_bbox(&grid, level, &bbox, max_tiles)?;
 
-    // 4. Compute the covering tile rectangle at `level`.
-    let coords = tile_coords_for_bbox(&grid, level, &req.bbox)?;
-    if coords.is_empty() {
-        return Err(anyhow!(
-            "no tiles cover the requested bbox at level {level} for grid `{}`",
-            grid.name()
-        ));
-    }
-
-    // 5. Render (or fetch) every tile.
+    // Render (or fetch) every tile. Coordinates are server-computed and
+    // clamped to the grid.
     let mut tile_bytes: Vec<(TileCoord, Bytes)> = Vec::with_capacity(coords.len());
     for coord in coords {
-        let bytes = render_tile(sources, cache, layer, &grid, coord, req.format).await?;
+        let bytes = render_grid_tile(r, layer, &grid, coord, q.format()).await?;
         tile_bytes.push((coord, bytes));
     }
 
-    // 6. Composite into the destination via GDAL `reproject`.
-    composite_tiles(&grid, &tile_bytes, req)
-}
-
-/// Find a grid whose CRS matches `crs`, walking `layer.grids` in declared
-/// order. Errors if no grid matches.
-fn pick_grid_for_crs(
-    layer: &LayerConfig,
-    config: &Config,
-    crs: &Crs,
-) -> Result<Arc<dyn TileGrid>> {
-    for name in &layer.grids {
-        let grid = lookup_grid(name, &config.grids).ok_or_else(|| {
-            anyhow!(
-                "layer `{}` references unknown grid `{}`",
-                layer.name,
-                name
-            )
-        })?;
-        if grid.crs() == crs {
-            return Ok(grid);
-        }
-    }
-    Err(anyhow!(
-        "no grid declared by layer `{}` matches CRS `{}`",
-        layer.name,
-        crs.as_str()
-    ))
+    // Composite into the destination via GDAL warp — CPU-bound and
+    // blocking, so it runs on the bounded render pool.
+    let resampling = layer_resampling(layer)?;
+    let nodata = r.layer_nodata(layer);
+    let target = Target { crs: crs.clone(), bbox, width, height, format: q.format() };
+    r.cpu
+        .run(move || composite_tiles(&grid, &tile_bytes, &target, resampling, nodata))
+        .await
 }
 
 /// Inclusive `(col, row)` tile rectangle covering `bbox` at `level`.
 ///
-/// We resolve each corner of `bbox` to a fractional tile index using the
-/// grid's level-0 top-left anchor and the per-level resolution, then floor
-/// to integer tiles and clamp to the level's tile grid extent.
+/// Each corner of `bbox` is resolved to a fractional tile index using the
+/// grid's level-0 top-left anchor and the per-level resolution, floored, and
+/// clamped to the level's tile matrix. Errors (as a client error) when the
+/// bbox misses the grid entirely or would need more than `max_tiles` tiles.
 fn tile_coords_for_bbox(
     grid: &Arc<dyn TileGrid>,
     level: u32,
     bbox: &Bbox,
+    max_tiles: u64,
 ) -> Result<Vec<TileCoord>> {
     // Recover the grid's top-left anchor from tile (level, 0, 0).
     let tile00 = grid.tile_bbox(TileCoord::new(level, 0, 0));
     let (tlx, tly) = (tile00.minx, tile00.maxy);
     let res = grid.resolution(level);
     let (tw_px, th_px) = grid.tile_size();
-    if res <= 0.0 || tw_px == 0 || th_px == 0 {
+    if res.is_nan() || res <= 0.0 || tw_px == 0 || th_px == 0 {
         return Err(anyhow!(
             "grid `{}` has degenerate level-{level} parameters: res={res} tile_size=({tw_px},{th_px})",
             grid.name()
@@ -151,132 +132,98 @@ fn tile_coords_for_bbox(
     let row_lo = ((tly - bbox.maxy) / tile_h_units).floor();
     let row_hi = ((tly - bbox.miny) / tile_h_units - 1e-9).floor();
 
-    // Clamp to the level's valid tile range. A `QuadGrid`-style level has
-    // `2^level` tiles per axis on standard powers-of-two grids; we can't
-    // know that for arbitrary `TileGrid`s without an extra trait method, so
-    // we accept negative indices being clamped to 0 and trust the upper end
-    // (GDAL `reproject` will handle out-of-extent tiles as no-ops at edges
-    // if we pre-clamp the lower bound to 0).
-    let col_lo = col_lo.max(0.0) as i64;
-    let col_hi = col_hi.max(0.0) as i64;
-    let row_lo = row_lo.max(0.0) as i64;
-    let row_hi = row_hi.max(0.0) as i64;
+    // Clamp to the level's tile matrix. Float→int casts saturate, and the
+    // matrix bounds are at most u32::MAX here, so nothing can overflow.
+    let (cols, rows) = grid.matrix_size(level);
+    let last_col = cols.min(u64::from(u32::MAX) + 1).saturating_sub(1) as f64;
+    let last_row = rows.min(u64::from(u32::MAX) + 1).saturating_sub(1) as f64;
+    if !(col_lo.is_finite() && col_hi.is_finite() && row_lo.is_finite() && row_hi.is_finite())
+        || col_hi < 0.0
+        || row_hi < 0.0
+        || col_lo > last_col
+        || row_lo > last_row
+    {
+        return Err(client_error("BBOX does not intersect the layer's grid"));
+    }
+    let col_lo = col_lo.max(0.0) as u32;
+    let row_lo = row_lo.max(0.0) as u32;
+    // A bbox thinner than the 1e-9 epsilon sitting on a tile edge can floor
+    // `hi` below `lo`; it still needs the one tile it touches.
+    let col_hi = (col_hi.min(last_col) as u32).max(col_lo);
+    let row_hi = (row_hi.min(last_row) as u32).max(row_lo);
 
-    let mut out = Vec::new();
+    // col_hi >= col_lo and row_hi >= row_lo by construction above.
+    let span = |lo: u32, hi: u32| hi.checked_sub(lo).and_then(|d| u64::from(d).checked_add(1));
+    let count = span(col_lo, col_hi)
+        .zip(span(row_lo, row_hi))
+        .and_then(|(c, r)| c.checked_mul(r))
+        .ok_or_else(|| anyhow!("internal: tile range is inverted or overflows"))?;
+    if count > max_tiles {
+        return Err(client_error("BBOX and image size need too many tiles"));
+    }
+
+    let mut out = Vec::with_capacity(count as usize);
     for y in row_lo..=row_hi {
         for x in col_lo..=col_hi {
-            out.push(TileCoord::new(level, x as u32, y as u32));
+            out.push(TileCoord::new(level, x, y));
         }
     }
     Ok(out)
 }
 
-/// GDAL-side composite: decode each tile, reproject into a single destination
-/// MEM dataset, read back as a `PixelBuffer`, and encode to the request format.
+/// GDAL-side composite: open each encoded tile from `/vsimem/`, georeference
+/// it to its grid cell, and let a single `GDALWarp` call mosaic and resample
+/// all of them into the request's bbox/CRS/size with the layer's kernel and
+/// nodata. Then encode to the requested format.
 fn composite_tiles(
     grid: &Arc<dyn TileGrid>,
     tiles: &[(TileCoord, Bytes)],
-    req: &GetMapRequest,
+    req: &Target,
+    resampling: ResampleAlg,
+    nodata: Option<f64>,
 ) -> Result<Bytes> {
-    // Probe the first tile to discover band count + pixel type. We assume the
-    // tile cache returns homogeneous bands/dtype within one GetMap response,
-    // which is the contract `render_tile` provides for one (layer, format).
-    let (first_coord, first_bytes) = tiles
-        .first()
-        .ok_or_else(|| anyhow!("composite_tiles called with no tiles"))?;
-    let first_vsi = mint_vsimem_path(req.format.extension(), 0);
-    create_mem_file(&first_vsi, first_bytes.to_vec())
-        .with_context(|| format!("composite: write probe tile to {first_vsi}"))?;
-    let probe = Dataset::open(&first_vsi)
-        .with_context(|| format!("composite: open probe tile at {first_vsi}"))?;
-    let bands = probe.raster_count();
-    if bands == 0 {
-        let _ = unlink_mem_file(&first_vsi);
-        return Err(anyhow!("composite: tile dataset has zero bands"));
-    }
-    let band1 = probe
-        .rasterband(1)
-        .context("composite: failed to fetch probe band 1")?;
-    let pixel_type = pixel_type_from_gdal(band1.band_type())?;
-    let nodata = band1.no_data_value();
-    drop(band1);
-    drop(probe);
-    let _ = unlink_mem_file(&first_vsi);
-    let _ = first_coord; // already consumed via tiles[0]; named for clarity above.
-
-    // Build the destination MEM dataset, sized + georeferenced to the request.
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .context("composite: MEM driver not available")?;
-    let mut dst = create_mem_for_type(&mem_driver, pixel_type, req.width, req.height, bands as u32)?;
-    let dst_sr = SpatialRef::from_definition(req.crs.as_str())
-        .with_context(|| format!("composite: invalid request CRS '{}'", req.crs.as_str()))?;
-    dst.set_spatial_ref(&dst_sr)
-        .context("composite: failed to set destination spatial ref")?;
-    dst.set_geo_transform(&bbox_to_geotransform(&req.bbox, req.width, req.height))
-        .context("composite: failed to set destination geotransform")?;
-    // Carry nodata through so reproject treats unwritten edge pixels predictably.
-    if let Some(nd) = nodata {
-        for b in 1..=bands {
-            let mut band = dst
-                .rasterband(b)
-                .with_context(|| format!("composite: failed to fetch dst band {b}"))?;
-            band.set_no_data_value(Some(nd))
-                .with_context(|| format!("composite: failed to set nodata on dst band {b}"))?;
+    // Each `/vsimem/` file is unlinked when its guard drops, on every path.
+    struct MemFile(String);
+    impl Drop for MemFile {
+        fn drop(&mut self) {
+            let _ = unlink_mem_file(&self.0);
         }
     }
 
-    // Reproject each tile into `dst`. Each tile is opened from a fresh
-    // `/vsimem/` path; the path's bytes come from the cache. We set the
-    // tile's georeferencing to the grid's `tile_bbox(coord)` in the grid's
-    // CRS so GDAL can do the placement and any resampling/reprojection.
-    let tile_crs = grid.crs().clone();
-    let tile_sr = SpatialRef::from_definition(tile_crs.as_str())
-        .with_context(|| format!("composite: invalid tile CRS '{}'", tile_crs.as_str()))?;
-    let (tw_px, th_px) = grid.tile_size();
+    let tile_sr = gis_order_spatial_ref(grid.crs()).context("composite: tile CRS")?;
+    let (tw, th) = grid.tile_size();
     let ext = req.format.extension();
-    for (idx, (coord, bytes)) in tiles.iter().enumerate() {
-        // `idx + 1` to keep the probe-tile slot reserved for diagnostics.
-        let vsi_path = mint_vsimem_path(ext, idx as u64 + 1);
-        create_mem_file(&vsi_path, bytes.to_vec())
-            .with_context(|| format!("composite: write tile bytes to {vsi_path}"))?;
-
-        // Some web-tile formats (PNG / JPEG / WebP) are not georeferenced on
-        // the wire — set the SRS + geotransform on the opened dataset so
-        // `reproject` can place it correctly.
-        let mut tile_ds = match Dataset::open(&vsi_path) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = unlink_mem_file(&vsi_path);
-                return Err(anyhow!(e))
-                    .with_context(|| format!("composite: open tile {coord:?} from {vsi_path}"));
-            }
-        };
-        if let Err(e) = tile_ds.set_spatial_ref(&tile_sr) {
-            let _ = unlink_mem_file(&vsi_path);
-            return Err(anyhow!(e)).with_context(|| format!(
-                "composite: set spatial ref on tile {coord:?}"
-            ));
-        }
-        let tile_bbox = grid.tile_bbox(*coord);
-        let gt = bbox_to_geotransform(&tile_bbox, tw_px, th_px);
-        if let Err(e) = tile_ds.set_geo_transform(&gt) {
-            let _ = unlink_mem_file(&vsi_path);
-            return Err(anyhow!(e)).with_context(|| format!(
-                "composite: set geotransform on tile {coord:?}"
-            ));
-        }
-
-        let reproject_result = gdal::raster::reproject(&tile_ds, &dst);
-        // Always unlink, regardless of reproject success/failure.
-        drop(tile_ds);
-        let _ = unlink_mem_file(&vsi_path);
-        reproject_result.with_context(|| format!(
-            "composite: reproject failed for tile {coord:?}"
-        ))?;
+    let mut files = Vec::with_capacity(tiles.len());
+    let mut datasets = Vec::with_capacity(tiles.len());
+    for (coord, bytes) in tiles {
+        let path = vsimem_path("wms-tile", ext);
+        create_mem_file(&path, bytes.to_vec())
+            .with_context(|| format!("composite: stage tile {coord:?}"))?;
+        files.push(MemFile(path.clone()));
+        let mut ds = Dataset::open(&path).with_context(|| format!("composite: open tile {coord:?}"))?;
+        // Web tile formats carry no georeferencing; place each tile on its cell.
+        ds.set_spatial_ref(&tile_sr)
+            .with_context(|| format!("composite: set spatial ref on tile {coord:?}"))?;
+        ds.set_geo_transform(&bbox_to_geotransform(&grid.tile_bbox(*coord), tw, th)?)
+            .with_context(|| format!("composite: set geotransform on tile {coord:?}"))?;
+        set_nodata(&ds, nodata)?;
+        datasets.push(ds);
     }
+    let first = datasets.first().ok_or_else(|| anyhow!("composite_tiles called with no tiles"))?;
+    let bands = u32::try_from(first.raster_count()).context("tile band count overflow")?;
+    let pixel_type = pixel_type_from_gdal(first.rasterband(1).context("composite: tile band 1")?.band_type())?;
 
-    // Read the destination back into a PixelBuffer and encode.
-    let buffer = read_dataset_as_pixelbuffer(&dst, pixel_type, bands as u32, req.width, req.height, nodata)?;
+    let mut dst = create_georeferenced_mem(
+        pixel_type, req.width, req.height, bands, &req.crs, &req.bbox, nodata,
+    )?;
+    let sources: Vec<&Dataset> = datasets.iter().collect();
+    let opts = WarpOptions { resampling, src_nodata: nodata, dst_nodata: nodata };
+    warp(&sources, &mut dst, &opts).context("composite: warping tiles into GetMap extent")?;
+    drop(sources);
+    drop(datasets);
+    drop(files);
+
+    let buffer = read_pixel_buffer(&dst, pixel_type, nodata)?;
     let georef = match req.format {
         OutputFormat::GeoTiff => Some(GeoRef {
             crs: req.crs.clone(),
@@ -285,162 +232,7 @@ fn composite_tiles(
         }),
         _ => None,
     };
-    encode(
-        &buffer,
-        georef.as_ref(),
-        req.format,
-        &EncodeOpts::defaults_for(req.format),
-    )
-}
-
-/// Pull all bands out of `ds` and interleave into a `PixelBuffer`.
-fn read_dataset_as_pixelbuffer(
-    ds: &Dataset,
-    pixel_type: PixelType,
-    bands: u32,
-    width: u32,
-    height: u32,
-    nodata: Option<f64>,
-) -> Result<PixelBuffer> {
-    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(bands as usize);
-    for band_idx in 1..=bands as usize {
-        let band = ds
-            .rasterband(band_idx)
-            .with_context(|| format!("composite: read dst band {band_idx}"))?;
-        let plane = match pixel_type {
-            PixelType::U8 => read_full_band::<u8>(&band)?,
-            PixelType::U16 => read_full_band::<u16>(&band)?,
-            PixelType::I16 => read_full_band::<i16>(&band)?,
-            PixelType::U32 => read_full_band::<u32>(&band)?,
-            PixelType::I32 => read_full_band::<i32>(&band)?,
-            PixelType::F32 => read_full_band::<f32>(&band)?,
-            PixelType::F64 => read_full_band::<f64>(&band)?,
-        };
-        planes.push(plane);
-    }
-    let data = interleave_bands(&planes, width, height, bands, pixel_type)?;
-    Ok(PixelBuffer {
-        width,
-        height,
-        bands,
-        pixel_type,
-        data: Bytes::from(data),
-        nodata,
-    })
-}
-
-fn read_full_band<T: GdalType + Copy>(band: &gdal::raster::RasterBand) -> Result<Vec<u8>> {
-    let buf: Buffer<T> = band
-        .read_band_as::<T>()
-        .context("composite: read_band_as on destination")?;
-    let (_, vec) = buf.into_shape_and_vec();
-    Ok(typed_vec_to_ne_bytes(vec))
-}
-
-fn typed_vec_to_ne_bytes<T: Copy>(vec: Vec<T>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vec.len() * std::mem::size_of::<T>());
-    for v in vec {
-        // SAFETY: `T: Copy` and we only read the bytes of a local for the
-        // duration of this loop iteration. Mirrors the helper in `source/gdal/warp.rs`.
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                (&v as *const T) as *const u8,
-                std::mem::size_of::<T>(),
-            )
-        };
-        out.extend_from_slice(bytes);
-    }
-    out
-}
-
-fn interleave_bands(
-    planes: &[Vec<u8>],
-    width: u32,
-    height: u32,
-    bands: u32,
-    pixel_type: PixelType,
-) -> Result<Vec<u8>> {
-    let elem = pixel_type_bytes(pixel_type);
-    let pixels = (width as usize) * (height as usize);
-    let plane_bytes = pixels * elem;
-    for (i, p) in planes.iter().enumerate() {
-        if p.len() != plane_bytes {
-            return Err(anyhow!(
-                "composite band {} byte length {} != expected {} (w={} h={} elem={})",
-                i + 1,
-                p.len(),
-                plane_bytes,
-                width,
-                height,
-                elem
-            ));
-        }
-    }
-    let mut out = vec![0u8; pixels * (bands as usize) * elem];
-    for pix in 0..pixels {
-        for band_idx in 0..bands as usize {
-            let src = &planes[band_idx][pix * elem..(pix + 1) * elem];
-            let dst_off = (pix * bands as usize + band_idx) * elem;
-            out[dst_off..dst_off + elem].copy_from_slice(src);
-        }
-    }
-    Ok(out)
-}
-
-fn pixel_type_bytes(pt: PixelType) -> usize {
-    match pt {
-        PixelType::U8 => 1,
-        PixelType::U16 | PixelType::I16 => 2,
-        PixelType::U32 | PixelType::I32 | PixelType::F32 => 4,
-        PixelType::F64 => 8,
-    }
-}
-
-fn pixel_type_from_gdal(dt: GdalDataType) -> Result<PixelType> {
-    Ok(match dt {
-        GdalDataType::UInt8 => PixelType::U8,
-        GdalDataType::UInt16 => PixelType::U16,
-        GdalDataType::Int16 => PixelType::I16,
-        GdalDataType::UInt32 => PixelType::U32,
-        GdalDataType::Int32 => PixelType::I32,
-        GdalDataType::Float32 => PixelType::F32,
-        GdalDataType::Float64 => PixelType::F64,
-        other => return Err(anyhow!("composite: unsupported GDAL data type: {other}")),
-    })
-}
-
-fn create_mem_for_type(
-    driver: &gdal::Driver,
-    pt: PixelType,
-    width: u32,
-    height: u32,
-    bands: u32,
-) -> Result<Dataset> {
-    let w = width as usize;
-    let h = height as usize;
-    let b = bands as usize;
-    match pt {
-        PixelType::U8 => driver.create_with_band_type::<u8, _>("kwms-wms-dst", w, h, b),
-        PixelType::U16 => driver.create_with_band_type::<u16, _>("kwms-wms-dst", w, h, b),
-        PixelType::I16 => driver.create_with_band_type::<i16, _>("kwms-wms-dst", w, h, b),
-        PixelType::U32 => driver.create_with_band_type::<u32, _>("kwms-wms-dst", w, h, b),
-        PixelType::I32 => driver.create_with_band_type::<i32, _>("kwms-wms-dst", w, h, b),
-        PixelType::F32 => driver.create_with_band_type::<f32, _>("kwms-wms-dst", w, h, b),
-        PixelType::F64 => driver.create_with_band_type::<f64, _>("kwms-wms-dst", w, h, b),
-    }
-    .context("composite: failed to create MEM destination dataset")
-}
-
-/// `[origin_x, pixel_width, 0, origin_y, 0, -pixel_height]`.
-fn bbox_to_geotransform(bbox: &Bbox, width: u32, height: u32) -> [f64; 6] {
-    let pixel_width = (bbox.maxx - bbox.minx) / (width as f64);
-    let pixel_height = (bbox.maxy - bbox.miny) / (height as f64);
-    [bbox.minx, pixel_width, 0.0, bbox.maxy, 0.0, -pixel_height]
-}
-
-fn mint_vsimem_path(ext: &str, salt: u64) -> String {
-    let id = VSIMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("/vsimem/kwms-wms-{id}-{salt}.{ext}")
+    encode(&buffer, georef.as_ref(), req.format, &EncodeOpts::defaults_for(req.format))
 }
 
 #[cfg(test)]
@@ -463,9 +255,13 @@ mod tests {
     };
     use crate::crs::{Bbox, Crs};
     use crate::encode::{encode, EncodeOpts, GeoRef, OutputFormat};
-    use crate::protocol::wms::request::WmsVersion;
+    use crate::protocol::catalog::Catalog;
+    use crate::protocol::wms::request::parse;
+    use crate::protocol::wms::validate::{validate, WmsQuery};
+    use crate::cache::LayeredCache;
+    use crate::pipeline::cpu::CpuPool;
     use crate::source::gdal::GdalSource;
-    use crate::source::{PixelBuffer, PixelType, Source};
+    use crate::source::{PixelBuffer, PixelType, Source, SourceRegistry};
 
     /// EPSG:3857 RGB GeoTIFF fixture covering the WebMercator world extent.
     /// Using the grid's native CRS lets the tile renderer skip the reprojection
@@ -564,29 +360,19 @@ mod tests {
         );
         registry.insert(uri.clone(), source);
 
-        let cache = fresh_cache();
-        let layer = build_layer("world", &uri);
-        let config = Config {
-            layers: vec![layer.clone()],
-            ..Config::default()
-        };
-
+        let r = Renderer::new(
+            Arc::new(registry),
+            Arc::new(fresh_cache()),
+            CpuPool::new(2, Duration::from_secs(5)),
+            [(uri.clone(), Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>)],
+        )
+        .unwrap();
+        let catalog = world_catalog(&uri);
         // The whole WebMercator world at 256×256.
         let half = 20_037_508.342_789_2_f64;
-        let req = GetMapRequest {
-            version: WmsVersion::V1_3_0,
-            layers: vec!["world".into()],
-            styles: vec![],
-            crs: Crs::new("EPSG:3857"),
-            bbox: Bbox::from([-half, -half, half, half]),
-            width: 256,
-            height: 256,
-            format: OutputFormat::Png,
-            transparent: false,
-            bgcolor: None,
-        };
+        let req = world_request(&catalog, 256, 256, [-half, -half, half, half]);
 
-        let bytes = serve_get_map(&registry, &cache, &config, &req)
+        let bytes = serve_get_map(&r, &req)
             .await
             .expect("serve_get_map");
         assert!(bytes.len() > 8, "PNG too small: {} bytes", bytes.len());
@@ -597,13 +383,207 @@ mod tests {
         );
 
         // Round-trip the response through GDAL via /vsimem/ and confirm size.
-        let id = super::VSIMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!("/vsimem/kwms-wms-test-{id}.png");
+        let path = vsimem_path("wms-test", "png");
         create_mem_file(&path, bytes.to_vec()).expect("vsimem write response");
         let ds = Dataset::open(&path).expect("open response from /vsimem/");
         let (w, h) = ds.raster_size();
         drop(ds);
         let _ = unlink_mem_file(&path);
         assert_eq!((w, h), (256, 256));
+    }
+
+    fn world_catalog(uri: &str) -> Catalog {
+        let config = Config {
+            layers: vec![build_layer("world", uri)],
+            ..Config::default()
+        };
+        Catalog::build(&config).expect("catalog")
+    }
+
+    /// A GetMap for layer `world` in EPSG:3857, through the real stage 1 +
+    /// stage 2 validation (the only way to obtain a `WmsGetMap`).
+    fn world_request(catalog: &Catalog, width: u32, height: u32, bbox: [f64; 4]) -> WmsGetMap<'_> {
+        let q = format!(
+            "SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=world&STYLES=&CRS=EPSG:3857\
+             &BBOX={},{},{},{}&WIDTH={width}&HEIGHT={height}&FORMAT=image/png",
+            bbox[0], bbox[1], bbox[2], bbox[3]
+        );
+        match validate(parse(&q).expect("stage 1"), catalog).expect("stage 2") {
+            WmsQuery::GetMap(m) => m,
+            WmsQuery::GetCapabilities { .. } => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn bbox_outside_the_grid_returns_a_blank_image() {
+        let tmp = write_world_mercator_fixture();
+        let uri = tmp.path().to_string_lossy().into_owned();
+        let mut registry = SourceRegistry::new();
+        registry.insert(
+            uri.clone(),
+            Arc::new(GdalSource::open(&SourceConfig { uri: uri.clone(), credentials: None }).unwrap()),
+        );
+        let r = Renderer::new(
+            Arc::new(registry),
+            Arc::new(fresh_cache()),
+            CpuPool::new(1, Duration::from_secs(5)),
+            [(uri.clone(), Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>)],
+        )
+        .unwrap();
+        let catalog = world_catalog(&uri);
+        let req = world_request(&catalog, 64, 32, [1e9, 1e9, 2e9, 2e9]);
+        assert!(!req.intersects_grid());
+        let bytes = serve_get_map(&r, &req).await.expect("blank image, not an error");
+        let path = vsimem_path("wms-test", "png");
+        create_mem_file(&path, bytes.to_vec()).unwrap();
+        let ds = Dataset::open(&path).unwrap();
+        assert_eq!(ds.raster_size(), (64, 32));
+        drop(ds);
+        let _ = unlink_mem_file(&path);
+    }
+
+    #[test]
+    fn huge_or_skewed_bboxes_are_clamped_to_a_bounded_tile_set() {
+        let grid: Arc<dyn TileGrid> = Arc::new(crate::tile::grid::WebMercator::new());
+        let pyramid = Pyramid { grid: grid.clone(), max_level: 21 };
+        let half = 20_037_508.342_789_2_f64;
+        let cases = [
+            // Used to yield ~i64::MAX tile coordinates and abort the process.
+            ([-1e300, -1e300, 1e300, 1e300], (1, 1)),
+            // Tiny width, full-world height: level must follow the coarser axis.
+            ([0.0, -half, 1e-3, half], (1, 1)),
+            ([0.0, -half, 1e-3, half], (2500, 2500)),
+        ];
+        for (bbox, size) in cases {
+            let bbox = Bbox::from(bbox);
+            let level = pyramid.select_level(&bbox, size);
+            let coords = tile_coords_for_bbox(&grid, level, &bbox, 121).unwrap();
+            assert!(
+                coords.len() <= 121,
+                "{bbox:?} @ {size:?}: {} tiles at level {level}",
+                coords.len()
+            );
+        }
+        // The backstop cap itself is enforced.
+        let bbox = Bbox::from([-half, -half, half, half]);
+        assert!(tile_coords_for_bbox(&grid, 10, &bbox, 121).is_err());
+    }
+
+    /// Property: whatever BBOX/size/version a client sends, GetMap ends in
+    /// an image of the requested size or a client error (400) — never an
+    /// internal error (500). Coordinates mix arbitrary floats (incl. NaN,
+    /// ±inf, subnormals, ±f64::MAX) with values a hair off grid and tile
+    /// edges, where precision trouble lives.
+    #[test]
+    fn hostile_bboxes_never_cause_internal_errors() {
+        use crate::pipeline::error::{classify, Disposition};
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config as PtConfig, TestRunner};
+
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let tmp = write_world_mercator_fixture();
+        let uri = tmp.path().to_string_lossy().into_owned();
+        let mut registry = SourceRegistry::new();
+        registry.insert(uri.clone(), Arc::new(GdalSource::open(&SourceConfig { uri: uri.clone(), credentials: None }).unwrap()));
+        let r = Renderer::new(
+            Arc::new(registry),
+            Arc::new(fresh_cache()),
+            CpuPool::new(2, Duration::from_secs(30)),
+            [(uri.clone(), Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>)],
+        )
+        .unwrap();
+        let mut layer = build_layer("world", &uri);
+        layer.formats.push(OutputFormat::GeoTiff);
+        let catalog = Catalog::build(&Config { layers: vec![layer], ..Config::default() }).unwrap();
+
+        let half = 20_037_508.342_789_2_f64;
+        let edge = prop_oneof![
+            Just(0.0),
+            Just(half),
+            Just(-half),
+            (0u32..20).prop_map(move |z| half / f64::from(1u32 << z)),
+            Just(1e9),
+            Just(1e300),
+            Just(-1e300),
+            Just(f64::MAX),
+            Just(f64::MIN),
+        ];
+        let delta = prop_oneof![
+            Just(0.0),
+            Just(5e-324),
+            Just(-5e-324),
+            Just(f64::MIN_POSITIVE),
+            Just(1e-300),
+            Just(1e-9),
+            Just(-1e-9),
+            Just(1.0),
+            -1e6..1e6f64,
+        ];
+        let coord = prop_oneof![
+            3 => (edge, delta).prop_map(|(e, d)| e + d),
+            1 => any::<f64>(),
+            1 => -3e7..3e7f64,
+        ];
+        let strategy = (
+            [coord.clone(), coord.clone(), coord.clone(), coord],
+            1u32..=300,
+            1u32..=300,
+            any::<bool>(),
+            any::<bool>(),
+        );
+        // How many cases got past validation into the renderer.
+        let rendered = std::sync::atomic::AtomicU32::new(0);
+        let mut runner = TestRunner::new(PtConfig { cases: 128, failure_persistence: None, ..PtConfig::default() });
+        runner
+            .run(&strategy, |([a, b, c, d], w, h, tiff, v111)| {
+                // Mostly well-ordered boxes: an inverted one only tests stage 1.
+                let bbox = [a.min(c), b.min(d), a.max(c), b.max(d)];
+                let (version, key) = if v111 { ("1.1.1", "SRS") } else { ("1.3.0", "CRS") };
+                let format = if tiff { "image/tiff" } else { "image/png" };
+                let q = format!(
+                    "SERVICE=WMS&VERSION={version}&REQUEST=GetMap&LAYERS=world&STYLES=&{key}=EPSG:3857\
+                     &BBOX={:e},{:e},{:e},{:e}&WIDTH={w}&HEIGHT={h}&FORMAT={format}",
+                    bbox[0], bbox[1], bbox[2], bbox[3]
+                );
+                let failure: Option<String> = rt.block_on(async {
+                    let m = match parse(&q).and_then(|p| validate(p, &catalog)) {
+                        Ok(WmsQuery::GetMap(m)) => m,
+                        Ok(WmsQuery::GetCapabilities { .. }) => return Some("parsed as GetCapabilities".into()),
+                        Err(_) => return None, // an OGC exception: 400
+                    };
+                    rendered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    match serve_get_map(&r, &m).await {
+                        Ok(bytes) => {
+                            let path = vsimem_path("wms-prop", "bin");
+                            create_mem_file(&path, bytes.to_vec()).unwrap();
+                            let ds = Dataset::open(&path).unwrap();
+                            let size = ds.raster_size();
+                            let gt = ds.geo_transform().ok();
+                            drop(ds);
+                            let _ = unlink_mem_file(&path);
+                            if size != (w as usize, h as usize) {
+                                return Some(format!("image is {size:?}"));
+                            }
+                            match gt {
+                                Some(gt) if tiff && !gt.iter().all(|v| v.is_finite()) => {
+                                    Some(format!("non-finite geotransform {gt:?}"))
+                                }
+                                _ => None,
+                            }
+                        }
+                        Err(e) => match classify(&e) {
+                            Disposition::Client(_) => None,
+                            _ => Some(format!("internal error: {e:#}")),
+                        },
+                    }
+                });
+                prop_assert!(failure.is_none(), "{q}: {}", failure.unwrap_or_default());
+                Ok(())
+            })
+            .unwrap();
+        // Guard against a generator that only exercises validation.
+        let rendered = rendered.into_inner();
+        println!("hostile bboxes: {rendered}/128 reached the renderer");
+        assert!(rendered >= 32, "only {rendered}/128 cases reached the renderer");
     }
 }

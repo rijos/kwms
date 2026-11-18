@@ -5,44 +5,114 @@
 //! # Single-flight algorithm
 //!
 //! For each `key`, at most one `compute` runs at a time across this process.
-//! Concurrent callers wait on a per-key [`tokio::sync::Notify`] and recheck
-//! the cache after they wake.
 //!
 //! ```text
 //! get_or_compute(key, ttl, compute):
-//!   1. Fast path: if `get(key, ttl)` hits, return immediately.
-//!   2. Take the inflight map lock briefly:
-//!      - If another task already registered a Notify for `key`, clone it,
-//!        drop the map lock, `notified().await`, and go back to step 1.
-//!      - Otherwise insert a new Notify and become the leader.
-//!   3. Leader double-checks the cache (a peer could have populated it
-//!      between step 1 and step 2).
-//!   4. Leader runs `compute`. On success it `put`s the bytes into both
-//!      tiers and on Ok/Err it removes the Notify from the inflight map
-//!      and `notify_waiters()` so followers can recheck the cache.
+//!   loop:
+//!     1. Fast path: if `get(key, ttl)` hits, return it.
+//!     2. Under the in-flight map lock (a std Mutex, never held across an
+//!        await):
+//!        - a leader is registered for `key` → create our `Notified` future
+//!          *while still holding the lock*, release it, wait, and loop;
+//!        - otherwise register ourselves as leader with an `InflightGuard`.
+//!     3. Leader double-checks the cache, runs `compute`, stores the result
+//!        unless `compute` marked it transient, and publishes it in the
+//!        in-flight entry.
+//!     4. The guard's `Drop` unregisters the key and wakes all followers —
+//!        on success, on error, *and when the leader's future is dropped*
+//!        (client gone, request timeout). A follower that wakes to a
+//!        published result returns it; otherwise it loops.
 //! ```
 //!
-//! The Notify pattern is "best-effort wake": followers always recheck the
-//! cache after waking and may legitimately fall through to becoming the
-//! next leader if the previous leader's `compute` failed.
+//! Concurrency properties (see `docs/src/concurrency.md`):
+//! * **No lost wake-up:** tokio guarantees a `Notified` receives every
+//!   `notify_waiters()` issued after it was *created*; followers create it
+//!   under the same lock the leader takes to unregister, so a wake-up can't
+//!   slip between "saw a leader" and "started waiting".
+//! * **No stranded key:** unregistering happens in `Drop`, which also runs
+//!   on cancellation, so a cancelled leader can't block a tile forever.
+//! * **No deadlock:** the map lock is held only for a `HashMap` operation and
+//!   never while awaiting or calling anything else.
+//! * If a leader fails, followers re-run the loop and one becomes the next
+//!   leader (errors are not shared between peers).
+//! * **Transient results** (e.g. all-nodata tiles, which are not cached so
+//!   clients can't fill the cache with them) still reach every follower
+//!   that was waiting, so they are computed once per burst, not once per
+//!   waiter.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use bytesize::ByteSize;
+use tokio::sync::Notify;
 
 use super::hot::HotTier;
 use super::persistent::{build_operator, PersistentTier};
 use super::TileKey;
 use crate::config::model::{Credentials, GlobalCacheConfig};
 
+/// What a `get_or_compute` computation produced.
+pub struct Computed {
+    pub bytes: Bytes,
+    /// Store in the cache tiers (`false`: hand to waiting peers only).
+    pub store: bool,
+}
+
+impl Computed {
+    /// A result to cache.
+    pub fn store(bytes: Bytes) -> Self {
+        Self { bytes, store: true }
+    }
+    /// A result to return (also to waiting peers) but not cache.
+    pub fn transient(bytes: Bytes) -> Self {
+        Self { bytes, store: false }
+    }
+}
+
+/// One in-flight computation: followers wait on `notify`; the leader
+/// publishes its successful result in `result` before waking them.
+struct Inflight {
+    notify: Arc<Notify>,
+    result: OnceLock<Bytes>,
+}
+
+type InflightMap = HashMap<TileKey, Arc<Inflight>>;
+
 pub struct LayeredCache {
     hot: HotTier,
     persistent: PersistentTier,
-    inflight: tokio::sync::Mutex<HashMap<TileKey, Arc<tokio::sync::Notify>>>,
+    inflight: Arc<Mutex<InflightMap>>,
+}
+
+/// Lock the in-flight map. Poisoning is tolerated: the map is only ever
+/// mutated by single `insert`/`remove` calls, so it is always consistent.
+fn lock_inflight(m: &Mutex<InflightMap>) -> MutexGuard<'_, InflightMap> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Held by the single-flight leader. Dropping it — normally, on error, or
+/// because the leader's future was cancelled — unregisters the key and wakes
+/// every follower.
+struct InflightGuard {
+    inflight: Arc<Mutex<InflightMap>>,
+    key: TileKey,
+    entry: Arc<Inflight>,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        {
+            let mut map = lock_inflight(&self.inflight);
+            // Remove only our own registration.
+            if map.get(&self.key).is_some_and(|e| Arc::ptr_eq(e, &self.entry)) {
+                map.remove(&self.key);
+            }
+        }
+        self.entry.notify.notify_waiters();
+    }
 }
 
 impl LayeredCache {
@@ -62,7 +132,7 @@ impl LayeredCache {
         Ok(Self {
             hot,
             persistent,
-            inflight: tokio::sync::Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -72,7 +142,7 @@ impl LayeredCache {
         Self {
             hot,
             persistent,
-            inflight: tokio::sync::Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -100,72 +170,59 @@ impl LayeredCache {
     }
 
     /// Get-or-compute with per-key single-flight. See the module docs for the
-    /// algorithm.
-    pub async fn get_or_compute<F, Fut>(
-        &self,
-        key: TileKey,
-        ttl: Duration,
-        compute: F,
-    ) -> Result<Bytes>
+    /// algorithm and its concurrency properties.
+    pub async fn get_or_compute<F, Fut>(&self, key: TileKey, ttl: Duration, compute: F) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<Bytes>>,
+        Fut: std::future::Future<Output = Result<Computed>>,
     {
-        // 1. Fast path.
-        if let Some(b) = self.get(&key, ttl).await? {
-            return Ok(b);
-        }
-
-        // 2. Register or join the inflight slot.
-        let (is_leader, notify) = {
-            let mut map = self.inflight.lock().await;
-            if let Some(existing) = map.get(&key) {
-                (false, existing.clone())
-            } else {
-                let n = Arc::new(tokio::sync::Notify::new());
-                map.insert(key.clone(), n.clone());
-                (true, n)
-            }
-        };
-
-        if !is_leader {
-            // Wait to be woken, then loop back and recheck the cache.
-            // If the leader's compute failed, the cache will still be a miss
-            // and we may end up running compute ourselves on the next call —
-            // that's acceptable v1 behavior (no error propagation between
-            // single-flight peers).
-            notify.notified().await;
-            if let Some(b) = self.get(&key, ttl).await? {
-                return Ok(b);
-            }
-            // Cache still empty — recursively call ourselves; the leader slot
-            // is gone, so we'll either become the new leader or join the next
-            // one. Box the future to keep `async fn` from inflating in size.
-            return Box::pin(self.get_or_compute(key, ttl, compute)).await;
-        }
-
-        // 3. Leader double-check (a peer could have populated us while we
-        //    grabbed the inflight lock — get() above doesn't hold it).
-        let leader_result: Result<Bytes> = async {
+        let mut compute = Some(compute);
+        loop {
+            // 1. Fast path.
             if let Some(b) = self.get(&key, ttl).await? {
                 return Ok(b);
             }
 
-            // 4. Run compute and populate both tiers.
-            let bytes = compute().await?;
-            self.put(&key, bytes.clone(), ttl).await?;
-            Ok(bytes)
-        }
-        .await;
+            // 2. Join the current leader, or become the leader.
+            let role = {
+                let mut map = lock_inflight(&self.inflight);
+                match map.get(&key) {
+                    // Created under the lock: guaranteed to see the leader's
+                    // notify_waiters(), which happens after it removes the key.
+                    Some(existing) => Err((existing.clone(), existing.notify.clone().notified_owned())),
+                    None => {
+                        let entry = Arc::new(Inflight { notify: Arc::new(Notify::new()), result: OnceLock::new() });
+                        map.insert(key.clone(), entry.clone());
+                        Ok(InflightGuard { inflight: self.inflight.clone(), key: key.clone(), entry })
+                    }
+                }
+            };
+            let guard = match role {
+                Ok(guard) => guard,
+                Err((entry, wait)) => {
+                    wait.await;
+                    // The leader published before waking us: take its result.
+                    if let Some(bytes) = entry.result.get() {
+                        return Ok(bytes.clone());
+                    }
+                    continue;
+                }
+            };
 
-        // 5. Unregister and wake waiters, regardless of success/failure.
-        {
-            let mut map = self.inflight.lock().await;
-            map.remove(&key);
+            // 3. Leader: double-check (a peer may have stored it meanwhile),
+            //    then compute and store. `guard` unregisters on every exit.
+            if let Some(b) = self.get(&key, ttl).await? {
+                return Ok(b);
+            }
+            let compute = compute.take().expect("compute is used at most once: a leader returns");
+            let Computed { bytes, store } = compute().await?;
+            if store {
+                self.put(&key, bytes.clone(), ttl).await?;
+            }
+            // Set at most once: this guard's entry has a single leader.
+            let _ = guard.entry.result.set(bytes.clone());
+            return Ok(bytes);
         }
-        notify.notify_waiters();
-
-        leader_result
     }
 }
 
@@ -255,7 +312,7 @@ mod tests {
                     .get_or_compute(k, Duration::from_secs(60), || async {
                         counter.fetch_add(1, Ordering::SeqCst);
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                        Ok(Bytes::from_static(b"v"))
+                        Ok(Computed::store(Bytes::from_static(b"v")))
                     })
                     .await
             }));
@@ -271,5 +328,138 @@ mod tests {
             1,
             "compute should have run exactly once under single-flight"
         );
+    }
+
+    /// A leader whose request is cancelled (client gone, request timeout)
+    /// must not leave its key registered: followers and later requests for
+    /// the same tile would otherwise wait forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_leader_does_not_strand_followers() {
+        let op = Operator::new(services::Memory::default()).unwrap().finish();
+        let cache = Arc::new(LayeredCache::from_parts(HotTier::new(1024 * 1024), PersistentTier::new(op)));
+        let ttl = Duration::from_secs(60);
+
+        let (c, k) = (cache.clone(), key("cancel"));
+        let leader = tokio::spawn(async move {
+            c.get_or_compute(k, ttl, || async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                Ok(Computed::store(Bytes::from_static(b"never")))
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (c, k) = (cache.clone(), key("cancel"));
+        let follower = tokio::spawn(async move {
+            c.get_or_compute(k, ttl, || async { Ok(Computed::store(Bytes::from_static(b"fresh"))) }).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        leader.abort();
+
+        let out = tokio::time::timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("follower stranded after the leader was cancelled");
+        assert_eq!(out.unwrap().unwrap(), Bytes::from_static(b"fresh"));
+        let again = tokio::time::timeout(
+            Duration::from_secs(2),
+            cache.get_or_compute(key("cancel"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"other"))) }),
+        )
+        .await
+        .expect("key stuck in the in-flight map");
+        assert!(again.is_ok());
+    }
+
+    /// Many rounds of many concurrent misses on a fresh key: every caller
+    /// must finish (a lost wake-up would hang a follower) and each round
+    /// must compute exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn single_flight_stress_never_hangs_and_computes_once() {
+        let cache = Arc::new(fresh_cache());
+        let ttl = Duration::from_secs(60);
+        for round in 0..300 {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for _ in 0..32 {
+                let (cache, calls) = (cache.clone(), calls.clone());
+                tasks.push(tokio::spawn(async move {
+                    cache
+                        .get_or_compute(key(&format!("stress-{round}")), ttl, || async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Ok(Computed::store(Bytes::from_static(b"v")))
+                        })
+                        .await
+                }));
+            }
+            for t in tasks {
+                let r = tokio::time::timeout(Duration::from_secs(5), t)
+                    .await
+                    .unwrap_or_else(|_| panic!("round {round}: a caller hung"));
+                assert_eq!(r.unwrap().unwrap(), Bytes::from_static(b"v"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "round {round}: computed more than once");
+        }
+    }
+
+    /// When the leader fails, a waiting follower becomes the next leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failed_leader_hands_over_to_a_follower() {
+        let cache = Arc::new(fresh_cache());
+        let ttl = Duration::from_secs(60);
+        let (c, k) = (cache.clone(), key("fail"));
+        let leader = tokio::spawn(async move {
+            c.get_or_compute(k, ttl, || async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err(anyhow!("source down"))
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let follower = cache.get_or_compute(key("fail"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"ok"))) });
+        let out = tokio::time::timeout(Duration::from_secs(2), follower).await.expect("follower hung");
+        assert_eq!(out.unwrap(), Bytes::from_static(b"ok"));
+        assert!(leader.await.unwrap().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transient_results_reach_waiters_but_are_not_stored() {
+        let cache = Arc::new(fresh_cache());
+        let ttl = Duration::from_secs(60);
+        let computed = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let compute = |computed: Arc<AtomicUsize>, release: Arc<Notify>| {
+            move || async move {
+                computed.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok(Computed::transient(Bytes::from_static(b"empty")))
+            }
+        };
+        let leader = tokio::spawn({
+            let (cache, computed, release) = (cache.clone(), computed.clone(), release.clone());
+            async move { cache.get_or_compute(key("transient"), ttl, compute(computed, release)).await }
+        });
+        // Wait until the leader is computing, then queue followers behind it.
+        while computed.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let followers: Vec<_> = (0..16)
+            .map(|_| {
+                let (cache, computed, release) = (cache.clone(), computed.clone(), release.clone());
+                tokio::spawn(async move { cache.get_or_compute(key("transient"), ttl, compute(computed, release)).await })
+            })
+            .collect();
+        // All 16 followers hold the entry (map + leader + 16) — each created
+        // its wait future under the lock, so none can miss the wake-up.
+        let holders = || lock_inflight(&cache.inflight).get(&key("transient")).map(Arc::strong_count);
+        while holders() != Some(18) {
+            tokio::task::yield_now().await;
+        }
+        release.notify_waiters();
+        assert_eq!(leader.await.unwrap().unwrap(), Bytes::from_static(b"empty"));
+        for f in followers {
+            let out = tokio::time::timeout(Duration::from_secs(5), f).await.expect("follower hung");
+            assert_eq!(out.unwrap().unwrap(), Bytes::from_static(b"empty"));
+        }
+        assert_eq!(computed.load(Ordering::SeqCst), 1, "one computation for the whole burst");
+        assert!(cache.get(&key("transient"), ttl).await.unwrap().is_none(), "transient result was stored");
     }
 }

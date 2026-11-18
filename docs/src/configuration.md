@@ -41,6 +41,11 @@ server:
   bind: "0.0.0.0:8080"
   max_request_pixels: [2500, 2500]   # WMS GetMap dimension cap (matches PDOK's default)
   log_level: info
+  metrics_bind: "0.0.0.0:9091"       # /metrics listener; keep it off the public network. null = disabled
+  request_timeout: 30s               # per WMS/WMTS/TMS request; exceeded → 503
+  max_concurrent_requests: 512       # in-flight protocol requests; excess shed with 429
+  # render_concurrency: 8            # parallel encode/composite jobs; default = CPU count
+  render_queue_timeout: 5s           # max wait for a render slot before 429
 
 # ---- cache backend (shared by all layers; per-layer policy lives on the layer) ----
 cache:
@@ -75,10 +80,11 @@ cache:
 # ---- custom grids (omit if you only use well-known grids) ----
 # Well-known grids shipped in v1 (usable as bare strings in a layer's grids: list):
 #   webmercator           — OGC:1.0:GoogleMapsCompatible (EPSG:3857, 256px tiles)
-#   global_geodetic       — WMTS GoogleCRS84Quad (EPSG:4326)
+#   global_geodetic       — WorldCRS84Quad (EPSG:4326, 2x1 tiles at level 0; TMS global-geodetic).
+#                           WMTS requests for the old name GoogleCRS84Quad are still accepted.
 #   rd_new_quad           — NetherlandsRDNewQuad (EPSG:28992)
 #   etrs89_laea_quad      — EuropeanETRS89_LAEAQuad (EPSG:3035)
-#   utm_31n_quad, utm_32n_quad — power-of-2 UTM pyramids
+# The list lives in `tile::grid::WELL_KNOWN_GRIDS`; custom grids may not reuse these names.
 grids:
   my_local:                          # custom grid; can be referenced by name from layers
     crs: EPSG:31370

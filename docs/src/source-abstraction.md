@@ -24,6 +24,20 @@ Each configured source keeps a bounded pool of open GDAL datasets. Requests chec
 
 GDAL operations are blocking; pool checkouts and reads run on `tokio::task::spawn_blocking` (or a dedicated blocking thread pool). The `gdal` crate's `Dataset` is not `Send`-safe across arbitrary threads in all configurations — the pool holds handles in slots that are only ever touched while owned by the caller, never shared mid-flight.
 
+### Overviews or bail (source-read budget)
+
+Every tile reads its source through `GDALWarp` with `-ovr AUTO`: GDAL reads the coarsest overview whose decimation suits the tile, or the full-resolution raster when none does. Without overviews a coarse tile therefore reads the whole source: one z0 tile from a 40000×40000 GeoTIFF took 12 s and 7 GB of RAM (0.08 s with overviews). Tile coordinates are client-chosen, so this would let any client stall a source.
+
+At startup, for every layer and every level of every grid it is served in, kwms estimates what the worst tile reads — mirroring GDAL's overview choice (`pipeline/read_budget.rs`) — and **refuses to start** if any tile would read more than 4096² source pixels per band:
+
+```text
+source `ortho.tif` lacks overviews: a tile of grid `webmercator` at level 0 would read
+about 1600000000 source pixels (limit 16777216); it needs an overview decimated at
+least 10x (e.g. `gdaladdo -r average <file> 2 4 8 16 …`)
+```
+
+Small sources (≤ 4096² pixels) need no overviews. Large ones need a pyramid down to about tile size: `gdaladdo -r average <file> 2 4 8 16 32 64 128 256` (or COG/VRT with overviews). Measured with such a pyramid, the slowest tile at any level of the PDOK grid set was 45 ms.
+
 ### Credentials & VSI configuration
 
 GDAL open options are scoped **per source**, not process-wide. `secrets.yaml` declares named credentials blocks; a layer's source references one by name. At dataset open time those become GDAL config options on that specific dataset (e.g. `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`, …). This lets one server host layers from multiple accounts/buckets/tenants without bleeding credentials across them.

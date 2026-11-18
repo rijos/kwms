@@ -12,26 +12,18 @@
 //! convention is interpreted XY end-to-end — otherwise the same four numbers
 //! would mean different things depending on the CRS's authority axis order.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
-use gdal::spatial_ref::{
-    AxisMappingStrategy, AxisOrientationType, CoordTransform, SpatialRef,
-};
+use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
 
-use super::{AxisOrder, Bbox, Crs};
-
-// `AxisOrientationType` is a C-style integer alias (`gdal_sys::OGRAxisOrientation::Type`).
-// We don't depend on `gdal-sys` directly, so we mirror the few enum values
-// we care about. These values are stable across GDAL versions (defined in
-// `ogr_core.h` / `OGRAxisOrientation`).
-const OAO_NORTH: AxisOrientationType = 1;
-const OAO_SOUTH: AxisOrientationType = 2;
-const OAO_EAST: AxisOrientationType = 3;
-const OAO_WEST: AxisOrientationType = 4;
+use super::{AxisOrder, Bbox, Coord, Crs};
+use crate::ffi;
 
 /// Build a `SpatialRef` from an opaque `Crs` token. Accepts anything
 /// `OSRSetFromUserInput` understands (EPSG codes, `AUTH:CODE`, WKT, PROJ.4,
-/// `urn:ogc:def:crs:...`, ...).
+/// `urn:ogc:def:crs:...`, ...) — including file paths and URLs, which GDAL
+/// will read/fetch. Only ever call this with config-derived CRSes: request
+/// CRSes are resolved by `protocol::catalog`, never parsed here.
 fn spatial_ref(crs: &Crs) -> Result<SpatialRef> {
     SpatialRef::from_definition(crs.as_str())
         .with_context(|| format!("invalid or unknown CRS '{}'", crs.as_str()))
@@ -41,92 +33,134 @@ pub fn is_geographic(crs: &Crs) -> Result<bool> {
     Ok(spatial_ref(crs)?.is_geographic())
 }
 
+/// The CRS's authority axis order, as GDAL sees it.
+///
+/// Asks GDAL rather than inspecting axes ourselves: with the traditional GIS
+/// mapping strategy, GDAL maps data axes to CRS axes as `[2, 1]` exactly
+/// when the authority order is northing/latitude first (EPSG:4326, but also
+/// projected CRSes such as EPSG:3035).
 pub fn native_axis_order(crs: &Crs) -> Result<AxisOrder> {
-    let sr = spatial_ref(crs)?;
-    // GDAL's `OSRGetAxis` requires the WKT node key under which the axes
-    // live: "PROJCS" for projected, "GEOGCS" for geographic. (An empty key
-    // is rejected with "Axis not found".) Pick the right one based on the
-    // CRS classification, falling back through both for unusual cases.
-    let candidates: &[&str] = if sr.is_projected() {
-        &["PROJCS", "GEOGCS"]
-    } else if sr.is_geographic() {
-        &["GEOGCS", "PROJCS"]
-    } else {
-        &["PROJCS", "GEOGCS", "GEOCCS"]
-    };
+    let mut sr = spatial_ref(crs)?;
+    sr.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    let mapping = ffi::data_axis_mapping(&sr).with_context(|| format!("axis mapping of CRS '{crs}'"))?;
+    // Exactly the two mappings a 2D CRS can have under the traditional GIS
+    // strategy; anything else (e.g. inverted axes) is an error, never a guess.
+    match mapping.get(..2) {
+        Some([1, 2]) => Ok(AxisOrder::XY),
+        Some([2, 1]) => Ok(AxisOrder::YX),
+        _ => bail!("unexpected axis mapping {mapping:?} for CRS '{crs}'"),
+    }
+}
 
-    let mut last_err: Option<anyhow::Error> = None;
-    for key in candidates {
-        match sr.axis_orientation(key, 0) {
-            Ok(o) => return Ok(axis_order_from_first(o)),
-            Err(e) => last_err = Some(e.into()),
+/// Whether two CRS tokens denote the same CRS, per GDAL (`OSRIsSame`, which
+/// ignores geographic axis order — so `CRS:84` ≡ `EPSG:4326`). A token GDAL
+/// can't parse is an error, not "different".
+pub fn same_crs(a: &Crs, b: &Crs) -> Result<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    Ok(spatial_ref(a)? == spatial_ref(b)?)
+}
+
+/// Canonical `AUTH:CODE` for a CRS definition (e.g. ESRI WKT for RD New →
+/// `EPSG:28992`), using GDAL's `OSRFindMatches` (via `crate::ffi`).
+///
+/// * `Ok` with the input unchanged when GDAL finds no exact (100%) match —
+///   that is an answer, not a failure;
+/// * `Err` when GDAL itself fails (unparseable definition, or an error
+///   raised while matching). Never a silent fallback on failure.
+pub fn identify_crs(crs: &Crs) -> Result<Crs> {
+    let sr = spatial_ref(crs)?;
+    if let (Ok(name), Ok(code)) = (sr.auth_name(), sr.auth_code()) {
+        if !name.is_empty() {
+            return Ok(Crs::new(format!("{name}:{code}")));
         }
     }
-
-    Err(last_err
-        .unwrap_or_else(|| anyhow::anyhow!("no axes reported"))
-        .context(format!("could not read axis 0 of CRS '{}'", crs.as_str())))
+    for (candidate, confidence) in ffi::find_matches(&sr).with_context(|| format!("matching CRS '{crs}'"))? {
+        if confidence < 100 {
+            continue;
+        }
+        if let (Ok(name), Ok(code)) = (candidate.auth_name(), candidate.auth_code()) {
+            return Ok(Crs::new(format!("{name}:{code}")));
+        }
+    }
+    Ok(crs.clone())
 }
 
-fn axis_order_from_first(o: AxisOrientationType) -> AxisOrder {
-    match o {
-        OAO_EAST | OAO_WEST => AxisOrder::XY,
-        OAO_NORTH | OAO_SOUTH => AxisOrder::YX,
-        // OAO_Up / OAO_Down / OAO_Other are not meaningful as a horizontal
-        // first axis; fall back to XY (the WMS-1.1.1-style assumption) so we
-        // don't panic on exotic compound CRSes.
-        _ => AxisOrder::XY,
+/// Metres per CRS unit, for OGC scale denominators. Projected CRSes report
+/// their linear unit; geographic ones use the length of one unit of arc on
+/// the ellipsoid's equator (the convention in OGC WMTS Annex E).
+pub fn meters_per_unit(crs: &Crs) -> Result<f64> {
+    let sr = spatial_ref(crs)?;
+    if sr.is_geographic() {
+        let a = sr.semi_major().context("CRS has no semi-major axis")?;
+        Ok(a * sr.angular_units())
+    } else {
+        Ok(sr.linear_units())
     }
 }
 
-pub fn transform_bbox(bbox: &Bbox, from: &Crs, to: &Crs) -> Result<Bbox> {
+/// Points sampled per bbox edge by [`transform_bbox`]. GDAL's recommended
+/// default for `OCTTransformBounds` (and what `gdalwarp`/rasterio use).
+const DENSIFY_POINTS: i32 = 21;
+
+/// Build a transform that reads and writes coordinates in traditional GIS
+/// (x = easting/longitude, y = northing/latitude) order, regardless of the
+/// CRS's authority axis order. Every transform in kwms goes through here so
+/// the `Bbox`/`Coord` numeric convention means the same thing end-to-end.
+fn gis_order_transform(from: &Crs, to: &Crs) -> Result<CoordTransform> {
     let mut src = spatial_ref(from)?;
     let mut dst = spatial_ref(to)?;
-    // Force traditional GIS (lon, lat) ordering on both ends so the
-    // numeric (minx, miny) / (maxx, maxy) inputs are always interpreted as
-    // (east, north) regardless of the CRS's authority axis order.
     src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
     dst.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+    CoordTransform::new(&src, &dst)
+        .with_context(|| format!("could not build coordinate transform from '{from}' to '{to}'"))
+}
 
-    let ct = CoordTransform::new(&src, &dst).with_context(|| {
-        format!(
-            "could not build coordinate transform from '{}' to '{}'",
-            from.as_str(),
-            to.as_str()
-        )
-    })?;
-
-    // Transform the four corners of the bbox and take the axis-aligned hull
-    // of the results. For non-linear transforms this under-covers along the
-    // edges, but the spec explicitly asks for the four-corner approach; the
-    // pipeline is expected to densify when it needs tight bounds.
-    let mut xs = [bbox.minx, bbox.maxx, bbox.maxx, bbox.minx];
-    let mut ys = [bbox.miny, bbox.miny, bbox.maxy, bbox.maxy];
-    let mut zs: [f64; 0] = [];
-
-    ct.transform_coords(&mut xs, &mut ys, &mut zs)
-        .with_context(|| {
-            format!(
-                "failed to transform bbox from '{}' to '{}'",
-                from.as_str(),
-                to.as_str()
-            )
-        })?;
-
-    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min);
-    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-
-    if !(minx.is_finite() && maxx.is_finite() && miny.is_finite() && maxy.is_finite()) {
-        anyhow::bail!(
-            "bbox transform from '{}' to '{}' produced non-finite coordinates",
-            from.as_str(),
-            to.as_str()
-        );
+/// Reproject a bbox, delegating to GDAL's `OCTTransformBounds`: it densifies
+/// every edge (so curved edges aren't under-covered), and copes with poles
+/// and points outside the target projection's domain.
+///
+/// When the target CRS is geographic and the box crosses the antimeridian,
+/// GDAL signals it with `minx > maxx`. `Bbox` can't represent a wrapped box,
+/// so we widen x to the full −180..180 range: a superset, never an
+/// under-cover.
+pub fn transform_bbox(bbox: &Bbox, from: &Crs, to: &Crs) -> Result<Bbox> {
+    let ct = gis_order_transform(from, to)?;
+    let [minx, miny, maxx, maxy] = ct
+        .transform_bounds(&[bbox.minx, bbox.miny, bbox.maxx, bbox.maxy], DENSIFY_POINTS)
+        .with_context(|| format!("failed to transform bbox from '{from}' to '{to}'"))?;
+    if ![minx, miny, maxx, maxy].iter().all(|v| v.is_finite()) {
+        anyhow::bail!("bbox transform from '{from}' to '{to}' produced non-finite coordinates");
     }
-
+    let (minx, maxx) = if minx > maxx { (-180.0, 180.0) } else { (minx, maxx) };
     Ok(Bbox { minx, miny, maxx, maxy })
+}
+
+/// Reproject a single coordinate.
+pub fn transform_coord(coord: Coord, from: &Crs, to: &Crs) -> Result<Coord> {
+    let ct = gis_order_transform(from, to)?;
+    let (mut xs, mut ys, mut zs) = ([coord.x], [coord.y], [0.0f64; 0]);
+    ct.transform_coords(&mut xs, &mut ys, &mut zs)
+        .with_context(|| format!("failed to transform coordinate from '{from}' to '{to}'"))?;
+    if !(xs[0].is_finite() && ys[0].is_finite()) {
+        anyhow::bail!("coordinate transform from '{from}' to '{to}' produced non-finite values");
+    }
+    Ok(Coord { x: xs[0], y: ys[0] })
+}
+
+/// Forbid PROJ from fetching transformation grids over the network, for
+/// the whole process. With network access on (`PROJ_NETWORK=ON` or
+/// `network = on` in `proj.ini`), a coordinate transform inside a request
+/// could block on an outbound HTTP download. kwms uses only locally
+/// installed grids. Call once at startup, before any transform; errors if
+/// GDAL doesn't report the setting as applied.
+pub fn disable_proj_network() -> Result<()> {
+    ffi::disable_proj_network();
+    if ffi::proj_network_enabled() {
+        bail!("could not disable PROJ network access");
+    }
+    Ok(())
 }
 
 pub fn validate(crs: &Crs) -> Result<()> {
@@ -139,6 +173,15 @@ mod tests {
 
     fn epsg(code: u32) -> Crs {
         Crs::new(format!("EPSG:{code}"))
+    }
+
+    #[test]
+    fn proj_network_access_is_disabled() {
+        disable_proj_network().unwrap();
+        assert!(!ffi::proj_network_enabled());
+        // Idempotent: a second call (e.g. a second AppState) is fine.
+        disable_proj_network().unwrap();
+        assert!(!ffi::proj_network_enabled());
     }
 
     #[test]
@@ -202,6 +245,70 @@ mod tests {
             "maxy out of plausible range: {}",
             out.maxy
         );
+    }
+
+    #[test]
+    fn transform_bbox_covers_curved_edges() {
+        // LAEA's northern edge bulges far past its corners in lon/lat: the
+        // corners alone reach ~66.99°N, the true edge ~72.66°N.
+        let laea = Bbox::from([2_500_000.0, 1_400_000.0, 6_500_000.0, 5_500_000.0]);
+        let out = transform_bbox(&laea, &epsg(3035), &epsg(4326)).unwrap();
+        assert!(out.maxy > 72.5, "northern edge under-covered: {out:?}");
+    }
+
+    #[test]
+    fn transform_bbox_whole_world_to_webmercator_is_finite() {
+        let world = Bbox::from([-180.0, -90.0, 180.0, 90.0]);
+        let out = transform_bbox(&world, &epsg(4326), &epsg(3857)).unwrap();
+        assert!(out.minx <= -20_037_508.0 && out.maxx >= 20_037_508.0, "{out:?}");
+    }
+
+    #[test]
+    fn transform_bbox_antimeridian_widens_to_full_longitude() {
+        // EPSG:3832 is centred on 150°E; this box spans ~105°E..195°E.
+        let pacific = Bbox::from([-5_000_000.0, -3_000_000.0, 5_000_000.0, 3_000_000.0]);
+        let out = transform_bbox(&pacific, &epsg(3832), &epsg(4326)).unwrap();
+        assert_eq!((out.minx, out.maxx), (-180.0, 180.0), "{out:?}");
+        assert!(out.miny < -26.0 && out.maxy > 26.0, "{out:?}");
+    }
+
+    #[test]
+    fn transform_coord_amsterdam_to_webmercator() {
+        let c = transform_coord(Coord { x: 4.9, y: 52.37 }, &epsg(4326), &epsg(3857)).unwrap();
+        assert!((c.x - 545_465.5).abs() < 1.0 && (c.y - 6_867_304.7).abs() < 1.0, "{c:?}");
+    }
+
+    #[test]
+    fn axis_order_comes_from_gdal_for_geographic_and_projected() {
+        assert_eq!(native_axis_order(&epsg(4326)).unwrap(), AxisOrder::YX);
+        assert_eq!(native_axis_order(&epsg(3035)).unwrap(), AxisOrder::YX, "LAEA is northing-first");
+        assert_eq!(native_axis_order(&epsg(3857)).unwrap(), AxisOrder::XY);
+        assert_eq!(native_axis_order(&epsg(28992)).unwrap(), AxisOrder::XY);
+        assert_eq!(native_axis_order(&Crs::new("CRS:84")).unwrap(), AxisOrder::XY);
+        assert!(native_axis_order(&Crs::new("not-a-crs")).is_err());
+    }
+
+    #[test]
+    fn same_crs_uses_gdal_identity() {
+        assert!(same_crs(&epsg(4326), &Crs::new("CRS:84")).unwrap());
+        assert!(!same_crs(&epsg(4326), &epsg(3857)).unwrap());
+        assert!(same_crs(&Crs::new("garbage"), &epsg(3857)).is_err(), "parse failure is an error");
+    }
+
+    #[test]
+    fn identify_crs_maps_esri_wkt_to_epsg() {
+        let sr = SpatialRef::from_epsg(28992).unwrap();
+        sr.morph_to_esri().unwrap();
+        let esri = Crs::new(sr.to_wkt().unwrap());
+        assert_eq!(identify_crs(&esri).unwrap(), epsg(28992));
+        assert_eq!(identify_crs(&epsg(3857)).unwrap(), epsg(3857));
+        assert!(identify_crs(&Crs::new("not-a-crs")).is_err(), "GDAL failure is an error, not a fallback");
+    }
+
+    #[test]
+    fn meters_per_unit_for_degrees_and_metres() {
+        assert!((meters_per_unit(&epsg(4326)).unwrap() - 111_319.490_793).abs() < 1e-3);
+        assert_eq!(meters_per_unit(&epsg(3857)).unwrap(), 1.0);
     }
 
     #[test]

@@ -9,4 +9,4 @@ pub mod persistent;
 pub mod policy;
 
 pub use self::key::TileKey;
-pub use self::layered::LayeredCache;
+pub use self::layered::{Computed, LayeredCache};

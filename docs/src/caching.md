@@ -28,10 +28,15 @@ cache:
 
 `cache` writes to both tiers on miss. `passthrough` reads/writes neither — rendered from source every request. No DSL beyond level ranges in v1.
 
+**Empty tiles are never cached.** Clients choose tile coordinates, so nothing they request may fill the cache with tiles that hold no data:
+
+- a tile outside the source's coverage is served as a fill tile without reading the source or touching the cache;
+- a tile inside the coverage that comes back entirely nodata (or entirely 0 when the source has no nodata) is served but not stored. The coverage is the source extent reprojected to the grid's CRS, a superset of the data that can be far larger than it (an Antarctic source covers 7×10⁸ m around RD New), so without this the guard above would only hold for same-CRS sources. A genuinely black tile without nodata is also re-rendered each time; that only costs a render, which the source-read budget bounds (`source-abstraction.md`).
+
 ## Invalidation
 
 TTL per layer (and optionally per level rule). Expired entries are treated as misses and re-rendered. No source-mtime checks (too expensive on remote sources), no manual purge endpoint in v1 — operators wanting forced invalidation drop the TTL or clear the backend out-of-band.
 
 ## Stampede protection
 
-Single-flight per cache key: concurrent requests for the same missing tile coalesce onto one render. In-process locking is sufficient for v1 (no cross-instance coordination).
+Single-flight per cache key: concurrent requests for the same missing tile coalesce onto one render. Requests that were waiting get the render's result directly, so an empty tile (not cached, above) is still rendered once per burst, not once per waiter. In-process locking is sufficient for v1 (no cross-instance coordination). See `concurrency.md`.

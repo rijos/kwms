@@ -9,7 +9,10 @@
 
 mod gdal;
 
-pub use self::gdal::{is_geographic, native_axis_order, transform_bbox, validate};
+pub use self::gdal::{
+    disable_proj_network, identify_crs, is_geographic, meters_per_unit, native_axis_order, same_crs, transform_bbox,
+    transform_coord, validate,
+};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

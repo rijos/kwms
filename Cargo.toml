@@ -11,8 +11,8 @@ tokio = { version = "1", features = ["full"] }
 
 # http
 axum = "0.7"
-tower = "0.5"
-tower-http = { version = "0.5", features = ["trace"] }
+tower = { version = "0.5", features = ["limit", "load-shed", "timeout", "util"] }
+tower-http = { version = "0.5", features = ["trace", "catch-panic"] }
 
 # serde
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +22,9 @@ schemars = "0.8"
 
 # gdal / geo
 gdal = "0.17"
+# Direct FFI for GDAL APIs the safe crate does not wrap (GDALWarp,
+# OSRFindMatches, axis mapping). Must stay on the version `gdal` uses.
+gdal-sys = "0.10"
 crossbeam-channel = "0.5"
 
 # storage / cache
@@ -45,6 +48,16 @@ async-trait = "0.1"
 humantime-serde = "1"
 bytesize = { version = "1", features = ["serde"] }
 quick-xml = { version = "0.36", features = ["serialize"] }
+percent-encoding = "2"
+
+[features]
+# Generate GDAL bindings at build time (needed for GDAL versions newer than
+# gdal-sys's prebuilt bindings, e.g. 3.11): `cargo test --features bindgen`.
+bindgen = ["gdal/bindgen"]
+
+[lints.rust]
+# `cfg(fuzzing)` is set by cargo-fuzz; see fuzz/ and protocol::fuzz_harness.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [dev-dependencies]
 proptest = "1"
@@ -54,3 +67,6 @@ pretty_assertions = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Panic on integer overflow instead of silently wrapping (debug/test builds
+# already do). A panic in a handler becomes a 500 via CatchPanicLayer.
+overflow-checks = true

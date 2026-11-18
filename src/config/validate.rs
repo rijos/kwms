@@ -9,26 +9,20 @@ use anyhow::{anyhow, bail, Context, Result};
 use gdal::errors::GdalError;
 use gdal::raster::ResampleAlg;
 
-use super::model::{Config, LayerConfig, LevelRule};
-
-/// Well-known grid names recognised without an entry in `config.grids`.
-///
-/// Mirrors the list in `docs/src/configuration.md`.
-const WELL_KNOWN_GRIDS: &[&str] = &[
-    "webmercator",
-    "global_geodetic",
-    "rd_new_quad",
-    "etrs89_laea_quad",
-    "utm_31n_quad",
-    "utm_32n_quad",
-];
+use super::model::{Config, LayerConfig, LevelRule, ServerConfig};
+use crate::tile::grid::well_known_grid;
 
 /// Run all validation rules. Returns the first error encountered, with context
 /// naming the offending layer/field where possible.
 pub fn validate(config: &Config) -> Result<()> {
+    validate_server(&config.server).context("server")?;
+
     // Validate any custom grids' CRS via the crs module. This is the only
     // place we call into `crs::validate` and is exercised by integration tests.
     for (name, grid) in &config.grids {
+        if well_known_grid(name).is_some() {
+            bail!("grid '{name}' would shadow the built-in grid of the same name; rename it");
+        }
         crate::crs::validate(&grid.crs)
             .with_context(|| format!("grid '{}': invalid crs '{}'", name, grid.crs))?;
     }
@@ -64,7 +58,7 @@ fn validate_layer(layer: &LayerConfig, config: &Config) -> Result<()> {
         bail!("grids must be non-empty");
     }
     for g in &layer.grids {
-        let is_well_known = WELL_KNOWN_GRIDS.contains(&g.as_str());
+        let is_well_known = well_known_grid(g).is_some();
         let is_custom = config.grids.contains_key(g);
         if !is_well_known && !is_custom {
             bail!(
@@ -88,11 +82,33 @@ fn validate_layer(layer: &LayerConfig, config: &Config) -> Result<()> {
     // `ResampleAlg::from_str` for the exact list. `GdalError`'s Display impl
     // omits the descriptive payload, so we unwrap the `BadArgument` variant
     // to keep the kernel list in the user-facing message.
-    ResampleAlg::from_str(&layer.resampling).map_err(|e| match e {
+    let alg = ResampleAlg::from_str(&layer.resampling).map_err(|e| match e {
         GdalError::BadArgument(msg) => anyhow!("resampling {}", msg),
         other => anyhow!("resampling '{}': {other:?}", layer.resampling),
     })?;
+    // All reads go through the GDAL warper, which has no Gauss kernel.
+    crate::source::gdal::raster::warp_resampling_name(alg)?;
 
+    Ok(())
+}
+
+fn validate_server(server: &ServerConfig) -> Result<()> {
+    let [w, h] = server.max_request_pixels;
+    if w == 0 || h == 0 {
+        bail!("max_request_pixels must be positive, got [{w}, {h}]");
+    }
+    if server.max_concurrent_requests == 0 {
+        bail!("max_concurrent_requests must be positive");
+    }
+    if server.render_concurrency == Some(0) {
+        bail!("render_concurrency must be positive");
+    }
+    if server.request_timeout.is_zero() || server.render_queue_timeout.is_zero() {
+        bail!("request_timeout and render_queue_timeout must be positive");
+    }
+    if server.metrics_bind.as_deref() == Some(server.bind.as_str()) {
+        bail!("metrics_bind must differ from bind ('{}')", server.bind);
+    }
     Ok(())
 }
 
@@ -148,6 +164,7 @@ fn ranges_overlap(a: &RangeInclusive<u32>, b: &RangeInclusive<u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tile::grid::WELL_KNOWN_GRIDS;
     use crate::config::model::{
         CacheMode, Config, LayerCacheConfig, LayerConfig, LevelRule, MaxResolution, SourceConfig,
     };
@@ -237,9 +254,9 @@ mod tests {
     fn all_well_known_grids_pass() {
         // Sanity: every name in our list should validate. Use one layer per
         // name to keep names unique.
-        for (i, name) in WELL_KNOWN_GRIDS.iter().enumerate() {
+        for (i, g) in WELL_KNOWN_GRIDS.iter().enumerate() {
             let mut l = good_layer(&format!("layer{i}"));
-            l.grids = vec![(*name).into()];
+            l.grids = vec![g.name.into()];
             validate(&cfg(vec![l])).expect("well-known grid must pass");
         }
     }
@@ -273,16 +290,37 @@ mod tests {
 
     #[test]
     fn each_supported_resampling_passes() {
-        // Source of truth: whatever GDAL's `ResampleAlg::from_str` accepts.
-        // We exercise every variant by spelling it the way GDAL expects
-        // (lowercase, no separators).
+        // Source of truth: whatever GDAL's `ResampleAlg::from_str` accepts,
+        // minus kernels the GDAL warper lacks (only `gauss`).
         for (i, alg) in ResampleAlg::iter().enumerate() {
             let token = alg.to_string().to_lowercase();
             let mut l = good_layer(&format!("l{i}"));
             l.resampling = token.clone();
-            validate(&cfg(vec![l]))
-                .unwrap_or_else(|e| panic!("token `{token}` must validate: {e:#}"));
+            let result = validate(&cfg(vec![l]));
+            if alg == ResampleAlg::Gauss {
+                let err = format!("{:#}", result.unwrap_err());
+                assert!(err.contains("not supported by the GDAL warper"), "{err}");
+            } else {
+                result.unwrap_or_else(|e| panic!("token `{token}` must validate: {e:#}"));
+            }
         }
+    }
+
+    #[test]
+    fn custom_grid_cannot_shadow_a_built_in() {
+        let mut c = cfg(vec![good_layer("a")]);
+        c.grids.insert(
+            "webmercator".into(),
+            crate::config::GridConfig {
+                crs: crate::crs::Crs::new("EPSG:3857"),
+                top_left: [0.0, 0.0],
+                tile_size: [256, 256],
+                base_resolution: 1.0,
+                origin: Default::default(),
+            },
+        );
+        let err = format!("{:#}", validate(&c).unwrap_err());
+        assert!(err.contains("shadow the built-in"), "{err}");
     }
 
     #[test]

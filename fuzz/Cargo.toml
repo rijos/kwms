@@ -1,0 +1,55 @@
+[package]
+name = "kwms-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kwms = { path = ".." }
+
+[features]
+# Needed when the system GDAL is newer than gdal-sys's prebuilt bindings.
+bindgen = ["kwms/bindgen"]
+
+# Kept out of the main workspace: fuzz targets build on nightly only.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "kvp"
+path = "fuzz_targets/kvp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wms"
+path = "fuzz_targets/wms.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wmts_kvp"
+path = "fuzz_targets/wmts_kvp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wmts_rest"
+path = "fuzz_targets/wmts_rest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tms"
+path = "fuzz_targets/tms.rs"
+test = false
+doc = false
+bench = false

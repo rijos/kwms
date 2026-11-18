@@ -4,7 +4,7 @@
 
 - Triggered whenever the request CRS differs from the source's native CRS.
 - Performed inside the GDAL source implementation via GDAL's warp API.
-- Each layer declares a single resampling kernel applied uniformly to all reprojection and level-driven resampling (no separate up/down kernels in v1). Tokens are delegated to GDAL's `ResampleAlg::from_str`: `nearestneighbour`, `bilinear`, `cubic`, `cubicspline`, `lanczos`, `average`, `mode`, `gauss`. Default: `bilinear`.
+- Each layer declares a single resampling kernel applied uniformly to all reprojection and level-driven resampling (no separate up/down kernels in v1). Tokens are delegated to GDAL's `ResampleAlg::from_str`: `nearestneighbour`, `bilinear`, `cubic`, `cubicspline`, `lanczos`, `average`, `mode`. Default: `bilinear`. (`gauss` is rejected: every read goes through the GDAL warper, which has no Gauss kernel.) All reads — same-CRS or reprojected, tiles and WMS composites — use `GDALWarp` with this kernel and GDAL's automatic overview selection.
 
 ## Bounding box & out-of-coverage requests
 
@@ -18,4 +18,4 @@
 ## NoData
 
 - Defaults to the source's NoData as reported by GDAL.
-- Optionally overridden per layer (single scalar or per-band list). Useful when the source omits NoData metadata or when additional sentinel values should be masked.
+- Optionally overridden per layer (single scalar; per-band lists are not implemented yet). The override is applied as the source nodata when warping and to fill tiles. Useful when the source omits NoData metadata or when additional sentinel values should be masked.

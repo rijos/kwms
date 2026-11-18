@@ -82,7 +82,8 @@ fn env_overlay_value() -> Result<Value> {
             continue;
         }
         let parsed_value: Value = serde_yaml::from_str(&v).with_context(|| {
-            format!("parsing env-var '{k}' value as YAML scalar (got '{v}')")
+            // Don't echo the value: env vars routinely carry secrets.
+            format!("parsing env-var '{k}' value as YAML scalar")
         })?;
         let nested = nest(&path, parsed_value);
         overlay = merge(overlay, nested)?;

@@ -3,17 +3,17 @@
 //! Pipeline:
 //!
 //! 1. Transform `(x, y)` from `crs` into the dataset's native CRS using
-//!    `crate::crs::transform_bbox` on a degenerate (zero-area) bbox.
-//! 2. Convert to pixel space via the dataset's geotransform.
+//!    `crate::crs::transform_coord`.
+//! 2. Convert to pixel space via GDAL's inverse geotransform.
 //! 3. Read a 1×1 window from each band (always with nearest-neighbour —
 //!    sampling a single pixel doesn't have a meaningful kernel choice) and
 //!    convert the value to `f64` for the `PixelValue` API.
 
 use anyhow::{anyhow, Context, Result};
 use gdal::raster::ResampleAlg;
-use gdal::Dataset;
+use gdal::{Dataset, GeoTransformEx};
 
-use crate::crs::{transform_bbox, Bbox, Coord, Crs};
+use crate::crs::{same_crs, transform_coord, Coord, Crs};
 use crate::source::PixelValue;
 
 pub fn sample(
@@ -23,36 +23,29 @@ pub fn sample(
     crs: Crs,
 ) -> Result<Vec<PixelValue>> {
     // Step 1: get the coordinate in the dataset's native CRS.
-    let (nx, ny) = if crs.as_str() == native_crs.as_str() {
+    let (nx, ny) = if same_crs(&crs, native_crs)? {
         (coord.x, coord.y)
     } else {
-        let degenerate = Bbox {
-            minx: coord.x,
-            miny: coord.y,
-            maxx: coord.x,
-            maxy: coord.y,
-        };
-        let transformed = transform_bbox(&degenerate, &crs, native_crs).with_context(|| {
+        let transformed = transform_coord(coord, &crs, native_crs).with_context(|| {
             format!(
                 "failed to transform sample coord from '{}' to '{}'",
                 crs.as_str(),
                 native_crs.as_str()
             )
         })?;
-        (transformed.minx, transformed.miny)
+        (transformed.x, transformed.y)
     };
 
-    // Step 2: pixel space.
+    // Step 2: pixel space, via GDAL's inverse geotransform (handles rotated
+    // and sheared geotransforms too).
     let gt = dataset
         .geo_transform()
         .context("dataset has no geotransform; cannot sample")?;
-    let (ox, dx, oy, dy) = (gt[0], gt[1], gt[3], gt[5]);
-    if gt[2] != 0.0 || gt[4] != 0.0 {
-        return Err(anyhow!("rotated/sheared geotransform not supported for sample"));
-    }
-
-    let px = ((nx - ox) / dx).floor() as isize;
-    let py = ((ny - oy) / dy).floor() as isize;
+    let (pxf, pyf) = gt
+        .invert()
+        .context("dataset geotransform is not invertible")?
+        .apply(nx, ny);
+    let (px, py) = (pxf.floor() as isize, pyf.floor() as isize);
 
     let (raster_w, raster_h) = dataset.raster_size();
     if px < 0 || py < 0 || px as usize >= raster_w || py as usize >= raster_h {

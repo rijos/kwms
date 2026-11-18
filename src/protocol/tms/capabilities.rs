@@ -10,8 +10,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use crate::config::{Config, LayerConfig};
-use crate::tile::coord::TileCoord;
-use crate::tile::grid::lookup_grid;
+use crate::crs::{transform_bbox, Crs};
+use crate::tile::grid::{lookup_grid, tms_profile};
 
 // ---------------------------------------------------------------------------
 // /tms/ — root document
@@ -144,12 +144,14 @@ pub fn generate_tile_map(
     write_text(&mut writer, "Abstract", &layer.abstract_)?;
     write_text(&mut writer, "SRS", grid.crs().as_str())?;
 
-    // BoundingBox from layer.bbox if present, otherwise fall back to the
-    // grid's level-0 tile bbox — the only ground-truth extent we can pull
-    // out of `TileGrid` without adding new methods.
-    let bbox = layer
-        .bbox
-        .unwrap_or_else(|| grid.tile_bbox(TileCoord::new(0, 0, 0)));
+    // BoundingBox is in the TileMap's SRS (the grid CRS). `layer.bbox` is
+    // WGS84, so reproject it (GDAL) — a failure is an error, not a silent
+    // fallback; without a layer bbox, use the grid's extent.
+    let bbox = match layer.bbox {
+        Some(b) => transform_bbox(&b, &Crs::new("EPSG:4326"), grid.crs())
+            .with_context(|| format!("BoundingBox of layer `{}` in {}", layer.name, grid.crs()))?,
+        None => grid.extent(),
+    };
     let mut bbox_el = BytesStart::new("BoundingBox");
     let (minx, miny, maxx, maxy) = (bbox.minx, bbox.miny, bbox.maxx, bbox.maxy);
     let minx_s = minx.to_string();
@@ -164,10 +166,10 @@ pub fn generate_tile_map(
         .write_event(Event::Empty(bbox_el))
         .context("write BoundingBox")?;
 
-    // Origin = top-left of (0,0,0). For BottomLeft-origin grids the same
-    // call already returns the appropriate corner.
-    let origin_bbox = grid.tile_bbox(TileCoord::new(0, 0, 0));
-    let (ox, oy) = (origin_bbox.minx, origin_bbox.maxy);
+    // TMS addresses rows bottom-up, so its Origin is the lower-left corner
+    // of the tile matrix (not the top-left that WMTS uses).
+    let extent = grid.extent();
+    let (ox, oy) = (extent.minx, extent.miny);
     let mut origin_el = BytesStart::new("Origin");
     let ox_s = ox.to_string();
     let oy_s = oy.to_string();
@@ -229,17 +231,6 @@ pub fn generate_tile_map(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Map a kwms grid name to a TMS `profile=` attribute. TMS's standard
-/// profiles are `none`, `global-geodetic`, and `global-mercator`; everything
-/// else is `local`.
-fn tms_profile(grid_name: &str) -> &str {
-    match grid_name {
-        "webmercator" => "global-mercator",
-        "global_geodetic" => "global-geodetic",
-        _ => "local",
-    }
-}
 
 fn write_text<W: std::io::Write>(
     writer: &mut Writer<W>,

@@ -2,8 +2,8 @@
 //!
 //! WMS 1.1.1 historically interpreted every BBOX as `minx,miny,maxx,maxy`
 //! (XY), regardless of CRS. WMS 1.3.0 honors each CRS's *authority* axis
-//! order — so geographic CRSes like `EPSG:4326` use `lat,lon` (YX) on the
-//! wire.
+//! order — so `EPSG:4326` uses `lat,lon` and northing-first projected CRSes
+//! such as `EPSG:3035` use `northing,easting` (YX) on the wire.
 //!
 //! This module exposes a single predicate, [`should_swap_axes`], that the
 //! request parser and capabilities writer consult to decide whether the
@@ -12,7 +12,7 @@
 
 use anyhow::Result;
 
-use crate::crs::{is_geographic, native_axis_order, AxisOrder, Crs};
+use crate::crs::{native_axis_order, AxisOrder, Crs};
 
 use super::request::WmsVersion;
 
@@ -21,17 +21,12 @@ use super::request::WmsVersion;
 /// kwms's XY-internal [`crate::crs::Bbox`]).
 ///
 /// - WMS 1.1.1 → always `false` (the spec mandates `minx,miny,maxx,maxy`).
-/// - WMS 1.3.0 → `true` iff the CRS is geographic *and* its authority axis
-///   order is YX. Projected CRSes are XY in both versions.
+/// - WMS 1.3.0 → `true` iff the CRS's authority axis order is YX, as
+///   reported by GDAL — geographic or projected.
 pub fn should_swap_axes(crs: &Crs, version: WmsVersion) -> Result<bool> {
     match version {
         WmsVersion::V1_1_1 => Ok(false),
-        WmsVersion::V1_3_0 => {
-            if !is_geographic(crs)? {
-                return Ok(false);
-            }
-            Ok(matches!(native_axis_order(crs)?, AxisOrder::YX))
-        }
+        WmsVersion::V1_3_0 => Ok(matches!(native_axis_order(crs)?, AxisOrder::YX)),
     }
 }
 
@@ -56,8 +51,17 @@ mod tests {
         let v130 = should_swap_axes(&epsg(4326), WmsVersion::V1_3_0).unwrap();
         assert_eq!(v130, native == AxisOrder::YX);
 
-        // EPSG:3857 is projected → never swap under either version.
+        // EPSG:3857 is easting-first → never swap under either version.
         assert!(!should_swap_axes(&epsg(3857), WmsVersion::V1_1_1).unwrap());
         assert!(!should_swap_axes(&epsg(3857), WmsVersion::V1_3_0).unwrap());
+    }
+
+    #[test]
+    fn northing_first_projected_crs_swaps_in_130() {
+        // EPSG:3035 (ETRS89-LAEA, the `etrs89_laea_quad` grid) lists
+        // Northing first, so 1.3.0 BBOXes arrive as (N, E).
+        assert!(should_swap_axes(&epsg(3035), WmsVersion::V1_3_0).unwrap());
+        assert!(!should_swap_axes(&epsg(3035), WmsVersion::V1_1_1).unwrap());
+        assert!(!should_swap_axes(&Crs::new("CRS:84"), WmsVersion::V1_3_0).unwrap());
     }
 }

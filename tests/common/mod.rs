@@ -75,12 +75,10 @@ pub fn load_fixture(name: &str) -> (Config, Secrets) {
 /// raster on disk.
 pub fn state_without_sources(name: &str) -> Arc<AppState> {
     let (config, _secrets) = load_fixture(name);
-    Arc::new(AppState {
-        config: Arc::new(config),
-        sources: Arc::new(SourceRegistry::new()),
-        cache: Arc::new(memory_cache()),
-        source_count: 0,
-    })
+    Arc::new(
+        AppState::from_parts(config, SourceRegistry::new(), memory_cache(), 0)
+            .unwrap_or_else(|e| panic!("building state for fixture `{name}`: {e:#}")),
+    )
 }
 
 /// Build an `AppState` with **real** GDAL-backed sources. The fixture's
@@ -113,12 +111,10 @@ pub fn state_with_sources(name: &str) -> Arc<AppState> {
     }
     let source_count = seen.len();
     let _ = secrets;
-    Arc::new(AppState {
-        config: Arc::new(config),
-        sources: Arc::new(registry),
-        cache: Arc::new(cache),
-        source_count,
-    })
+    Arc::new(
+        AppState::from_parts(config, registry, cache, source_count)
+            .unwrap_or_else(|e| panic!("building state for fixture `{name}`: {e:#}")),
+    )
 }
 
 /// An in-memory `LayeredCache` — backed by opendal's `Memory` service for

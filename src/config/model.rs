@@ -37,6 +37,25 @@ pub struct ServerConfig {
     pub max_request_pixels: [u32; 2],
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Separate listener for `/metrics`, kept off the public port so it can
+    /// be firewalled independently. `null` disables the metrics endpoint.
+    #[serde(default = "default_metrics_bind")]
+    pub metrics_bind: Option<String>,
+    /// Wall-clock budget for one WMS/WMTS/TMS request; exceeded → 503.
+    #[serde(default = "default_request_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub request_timeout: Duration,
+    /// Protocol requests in flight at once; excess requests are shed with 429.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    /// CPU-bound render jobs (encode, WMS compositing) running at once.
+    /// Defaults to the number of available CPUs.
+    #[serde(default)]
+    pub render_concurrency: Option<usize>,
+    /// How long a request may wait for a render slot before getting 429.
+    #[serde(default = "default_render_queue_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub render_queue_timeout: Duration,
 }
 
 impl Default for ServerConfig {
@@ -45,12 +64,40 @@ impl Default for ServerConfig {
             bind: default_bind(),
             max_request_pixels: default_max_request_pixels(),
             log_level: default_log_level(),
+            metrics_bind: default_metrics_bind(),
+            request_timeout: default_request_timeout(),
+            max_concurrent_requests: default_max_concurrent_requests(),
+            render_concurrency: None,
+            render_queue_timeout: default_render_queue_timeout(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// Effective render concurrency (`render_concurrency` or the CPU count).
+    pub fn effective_render_concurrency(&self) -> usize {
+        self.render_concurrency.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
     }
 }
 
 fn default_bind() -> String {
     "0.0.0.0:8080".into()
+}
+fn default_metrics_bind() -> Option<String> {
+    Some("0.0.0.0:9091".into())
+}
+fn default_request_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_max_concurrent_requests() -> usize {
+    512
+}
+fn default_render_queue_timeout() -> Duration {
+    Duration::from_secs(5)
 }
 fn default_max_request_pixels() -> [u32; 2] {
     [2500, 2500]
@@ -291,9 +338,20 @@ pub struct LevelRule {
 
 /// Credentials block — a flat map of GDAL config options, applied at dataset
 /// open time as scoped open options (not process-wide env).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Credentials(pub HashMap<String, String>);
+
+/// Prints keys only — values are secrets and must never reach logs.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut keys: Vec<&String> = self.0.keys().collect();
+        keys.sort();
+        f.debug_map()
+            .entries(keys.into_iter().map(|k| (k, "<redacted>")))
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

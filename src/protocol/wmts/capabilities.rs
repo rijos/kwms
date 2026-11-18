@@ -17,8 +17,9 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use crate::config::{Config, LayerConfig};
+use crate::crs::{meters_per_unit, native_axis_order, AxisOrder};
 use crate::tile::coord::TileCoord;
-use crate::tile::grid::{lookup_grid, TileGrid};
+use crate::tile::grid::{lookup_grid, tile_matrix_set_name, TileGrid, OGC_PIXEL_SIZE_M};
 
 /// Generate a WMTS 1.0.0 `<Capabilities>` document.
 ///
@@ -184,10 +185,12 @@ fn write_layer<W: std::io::Write>(
 
     // ---- ResourceURL templates (one per format) ----
     for fmt in &layer.formats {
+        // Same grammar `request::parse_rest` accepts — one definition.
         let template = format!(
-            "{base}/wmts/{layer}/default/{{TileMatrixSet}}/{{TileMatrix}}/{{TileCol}}/{{TileRow}}.{ext}",
+            "{base}/wmts/{layer}/{tile}.{ext}",
             base = base_url.trim_end_matches('/'),
             layer = layer.name,
+            tile = super::request::REST_TILE_TEMPLATE,
             ext = fmt.extension(),
         );
         let mut el = BytesStart::new("ResourceURL");
@@ -219,23 +222,28 @@ fn write_tile_matrix_set<W: std::io::Write>(
 
     let (tile_w, tile_h) = grid.tile_size();
     let top_left = grid.tile_bbox(TileCoord::new(0, 0, 0));
-    // Top-left corner: (minx, maxy) of the (0,0,0) tile.
-    let tl_x = top_left.minx;
-    let tl_y = top_left.maxy;
+    // TopLeftCorner is written in the axis order of the SupportedCRS URN,
+    // e.g. "lat lon" for urn:ogc:def:crs:EPSG::4326 and "N E" for ::3035.
+    let corner = match native_axis_order(grid.crs()).context("TileMatrixSet CRS axis order")? {
+        AxisOrder::XY => format!("{} {}", top_left.minx, top_left.maxy),
+        AxisOrder::YX => format!("{} {}", top_left.maxy, top_left.minx),
+    };
+    // ScaleDenominator = resolution in metres / 0.28 mm (OGC standard pixel);
+    // degree-based CRSes convert via the ellipsoid (GDAL), not assumed metres.
+    let metres_per_unit = meters_per_unit(grid.crs()).context("TileMatrixSet CRS units")?;
 
     let levels = grid.level_count();
     for level in 0..levels {
         let res = grid.resolution(level);
-        // OGC standard pixel size — 0.28 mm → scale denominator = res / 0.28e-3.
-        let scale_denom = res / 0.28e-3;
-        let (matrix_width, matrix_height) = matrix_dims(tms_name, level);
+        let scale_denom = res * metres_per_unit / OGC_PIXEL_SIZE_M;
+        let (matrix_width, matrix_height) = grid.matrix_size(level);
 
         writer
             .write_event(Event::Start(BytesStart::new("TileMatrix")))
             .context("start TileMatrix")?;
         write_text(writer, "ows:Identifier", &level.to_string())?;
         write_text(writer, "ScaleDenominator", &format!("{scale_denom}"))?;
-        write_text(writer, "TopLeftCorner", &format!("{tl_x} {tl_y}"))?;
+        write_text(writer, "TopLeftCorner", &corner)?;
         write_text(writer, "TileWidth", &tile_w.to_string())?;
         write_text(writer, "TileHeight", &tile_h.to_string())?;
         write_text(writer, "MatrixWidth", &matrix_width.to_string())?;
@@ -255,18 +263,6 @@ fn write_tile_matrix_set<W: std::io::Write>(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Map a kwms grid name (the config-level key) to its canonical WMTS
-/// TileMatrixSet identifier. Custom grids surface under their config name.
-fn tile_matrix_set_name(grid_name: &str) -> &str {
-    match grid_name {
-        "webmercator" => "GoogleMapsCompatible",
-        "global_geodetic" => "GoogleCRS84Quad",
-        "rd_new_quad" => "NetherlandsRDNewQuad",
-        "etrs89_laea_quad" => "EuropeanETRS89_LAEAQuad",
-        other => other,
-    }
-}
-
 /// Convert an `EPSG:NNNN`-style identifier into the URN form WMTS prefers
 /// in `<ows:SupportedCRS>` (`urn:ogc:def:crs:EPSG::NNNN`). Anything that's
 /// not an `EPSG:` code passes through unchanged.
@@ -275,25 +271,6 @@ fn supported_crs_urn(crs: &str) -> String {
         format!("urn:ogc:def:crs:EPSG::{code}")
     } else {
         crs.to_string()
-    }
-}
-
-/// `(MatrixWidth, MatrixHeight)` for a given TileMatrixSet at the given level.
-///
-/// The `TileGrid` trait does not expose a world-extent accessor, so we apply
-/// the documented relationship for the built-in quad ladders:
-///
-/// - All single-square quad grids (WebMercator, RDNewQuad, EuropeanETRS89_LAEAQuad,
-///   custom power-of-two grids) are 1 tile at level 0 and double per level
-///   → `1 << level` in each dimension.
-/// - `GoogleCRS84Quad` (`global_geodetic`) starts with two tiles east-west
-///   and one tile north-south at level 0, then doubles → width = `2 << level`,
-///   height = `1 << level`.
-fn matrix_dims(tms_name: &str, level: u32) -> (u64, u64) {
-    let pow = 1u64 << level;
-    match tms_name {
-        "GoogleCRS84Quad" => (2 * pow, pow),
-        _ => (pow, pow),
     }
 }
 
@@ -410,7 +387,7 @@ mod tests {
         );
         assert!(
             xml.contains(
-                "https://example.org/wmts/ortho2024/default/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.png"
+                "https://example.org/wmts/ortho2024/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.png"
             ),
             "expected template substitution placeholders; got:\n{xml}"
         );
@@ -434,14 +411,38 @@ mod tests {
             ..Default::default()
         };
         let xml = generate(&cfg, "https://example.org").unwrap();
-        // GoogleCRS84Quad has 2 tiles east-west at level 0.
+        // WorldCRS84Quad has 2 tiles east-west at level 0.
         assert!(
             xml.contains("<MatrixWidth>2</MatrixWidth>"),
-            "expected MatrixWidth=2 for GoogleCRS84Quad level 0; got:\n{xml}"
+            "expected MatrixWidth=2 for WorldCRS84Quad level 0; got:\n{xml}"
         );
         assert!(
             xml.contains("<MatrixHeight>1</MatrixHeight>"),
-            "expected MatrixHeight=1 for GoogleCRS84Quad level 0; got:\n{xml}"
+            "expected MatrixHeight=1 for WorldCRS84Quad level 0; got:\n{xml}"
         );
+    }
+
+    #[test]
+    fn geographic_matrix_set_uses_ogc_scale_and_lat_lon_corner() {
+        let mut layer = minimal_layer();
+        layer.grids = vec!["global_geodetic".into()];
+        let cfg = Config { layers: vec![layer], ..Default::default() };
+        let xml = generate(&cfg, "https://example.org").unwrap();
+        assert!(xml.contains("<ows:Identifier>WorldCRS84Quad</ows:Identifier>"), "{xml}");
+        // OGC WorldCRS84Quad level 0: 279541132.0143589 (degrees → metres
+        // via the WGS84 equator), not 0.703125 / 0.00028 = 2511.16.
+        let start = xml.find("<ScaleDenominator>").unwrap() + "<ScaleDenominator>".len();
+        let end = start + xml[start..].find('<').unwrap();
+        let scale: f64 = xml[start..end].parse().unwrap();
+        assert!((scale - 279_541_132.014).abs() < 1.0, "scale {scale}");
+        // EPSG:4326 is lat/lon: the corner is "90 -180".
+        assert!(xml.contains("<TopLeftCorner>90 -180</TopLeftCorner>"), "{xml}");
+    }
+
+    #[test]
+    fn projected_matrix_set_keeps_metre_scale_and_xy_corner() {
+        let xml = generate(&minimal_config(), "https://example.org").unwrap();
+        assert!(xml.contains("<ScaleDenominator>559082264.0287"), "{xml}");
+        assert!(xml.contains("<TopLeftCorner>-20037508.3427892 20037508.3427892</TopLeftCorner>"));
     }
 }

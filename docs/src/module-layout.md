@@ -19,6 +19,7 @@ src/
 │   ├── merge.rs           # deep-merge maps, replace lists
 │   ├── validate.rs        # full validation pass (structural + CRS-aware)
 │   └── schema.rs          # emit_json_schema()
+├── ffi.rs                 # the only module allowed `unsafe`: raw GDAL calls behind safe fns (see unsafe-audit.md)
 ├── crs/
 │   ├── mod.rs             # Crs newtype, AxisOrder, Bbox; free functions (is_geographic, native_axis_order, transform_bbox, validate, …)
 │   └── gdal.rs            # GDAL/PROJ-backed implementations of the above (pub(crate))
@@ -33,7 +34,8 @@ src/
 │       ├── mod.rs         # GdalSource: impl Source
 │       ├── dataset.rs     # gdal::Dataset wrapper + per-source open options (credentials, VSI tweaks)
 │       ├── pool.rs        # bounded dataset-handle pool; checkouts via spawn_blocking
-│       ├── warp.rs        # GDAL warp wrapper implementing read_window
+│       ├── warp.rs        # read_window: one GDALWarp path for every read
+│       ├── raster.rs      # shared MEM/geotransform/interleave helpers + the single GDALWarp entry point
 │       └── sample.rs      # pixel sampling for GetFeatureInfo
 ├── cache/
 │   ├── mod.rs             # Cache facade

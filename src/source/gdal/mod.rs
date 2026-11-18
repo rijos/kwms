@@ -6,6 +6,7 @@
 pub mod dataset;
 pub mod pool;
 pub mod sample;
+pub(crate) mod raster;
 pub mod warp;
 
 use std::collections::HashMap;
@@ -13,10 +14,13 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::SourceConfig;
-use crate::crs::{Bbox, Coord, Crs};
+use gdal::GeoTransformEx;
+
+use crate::crs::{identify_crs, Bbox, Coord, Crs};
 
 use self::pool::DatasetPool;
-use self::warp::{pixel_type_from_gdal, read_window as warp_read_window};
+use self::raster::pixel_type_from_gdal;
+use self::warp::read_window as warp_read_window;
 
 use super::{PixelBuffer, PixelValue, Source, SourceMetadata, WindowRequest};
 
@@ -103,41 +107,43 @@ async fn probe_metadata(pool: &DatasetPool) -> Result<SourceMetadata> {
         let band1 = ds.rasterband(1).context("failed to get band 1")?;
         let pixel_type = pixel_type_from_gdal(band1.band_type())?;
         let nodata = band1.no_data_value();
+        let count = usize::try_from(band1.overview_count().context("counting overviews")?)
+            .context("negative overview count")?;
+        let to_u32 = |(w, h): (usize, usize)| -> Result<(u32, u32)> {
+            Ok((u32::try_from(w).context("raster too wide")?, u32::try_from(h).context("raster too tall")?))
+        };
+        let overviews = (0..count)
+            .map(|i| to_u32(band1.overview(i).context("reading an overview")?.size()))
+            .collect::<Result<Vec<_>>>()?;
         drop(band1);
 
-        // Native CRS: prefer authority-coded form if available, otherwise
-        // fall back to WKT. The crate's `Crs` is opaque — anything
-        // `OSRSetFromUserInput` understands is fine, and WKT qualifies.
-        let native_crs = match ds.spatial_ref() {
-            Ok(sr) => {
-                let auth_name = sr.auth_name().ok();
-                let auth_code = sr.auth_code().ok();
-                match (auth_name, auth_code) {
-                    (Some(name), Some(code)) if !name.is_empty() => {
-                        Crs::new(format!("{name}:{code}"))
-                    }
-                    _ => Crs::new(sr.to_wkt().context("dataset has no usable projection")?),
-                }
-            }
-            Err(_) => {
-                let proj = ds.projection();
-                if proj.is_empty() {
-                    return Err(anyhow!("dataset has no spatial reference / projection"));
-                }
-                Crs::new(proj)
-            }
-        };
+        // Native CRS: let GDAL identify it (e.g. an ESRI-WKT RD New becomes
+        // `EPSG:28992`), so it compares equal to grid CRSes; unidentifiable
+        // definitions stay as WKT.
+        let wkt = ds.projection();
+        if wkt.is_empty() {
+            return Err(anyhow!("dataset has no spatial reference / projection"));
+        }
+        let native_crs = identify_crs(&Crs::new(wkt)).context("identifying the dataset's CRS")?;
 
+        // Extent from all four corners through the geotransform, so rotated
+        // or sheared geotransforms are covered too.
         let gt = ds.geo_transform().context("dataset has no geotransform")?;
-        let (raster_w, raster_h) = ds.raster_size();
-        let (ox, dx, oy, dy) = (gt[0], gt[1], gt[3], gt[5]);
-        let native_bbox = Bbox {
-            minx: ox.min(ox + dx * raster_w as f64),
-            maxx: ox.max(ox + dx * raster_w as f64),
-            miny: oy.min(oy + dy * raster_h as f64),
-            maxy: oy.max(oy + dy * raster_h as f64),
+        let (w, h) = ds.raster_size();
+        let (w, h) = (w as f64, h as f64);
+        let corners = [gt.apply(0.0, 0.0), gt.apply(w, 0.0), gt.apply(0.0, h), gt.apply(w, h)];
+        let fold = |f: fn(f64, f64) -> f64, init: f64, pick: fn(&(f64, f64)) -> f64| {
+            corners.iter().map(pick).fold(init, f)
         };
-        let native_resolution = dx.abs();
+        let native_bbox = Bbox {
+            minx: fold(f64::min, f64::INFINITY, |c| c.0),
+            maxx: fold(f64::max, f64::NEG_INFINITY, |c| c.0),
+            miny: fold(f64::min, f64::INFINITY, |c| c.1),
+            maxy: fold(f64::max, f64::NEG_INFINITY, |c| c.1),
+        };
+        // Ground size of one pixel along the raster's x axis.
+        let native_resolution = gt[1].hypot(gt[4]);
+        let size = to_u32(ds.raster_size())?;
 
         Ok(SourceMetadata {
             native_crs,
@@ -146,6 +152,8 @@ async fn probe_metadata(pool: &DatasetPool) -> Result<SourceMetadata> {
             pixel_type,
             native_resolution,
             nodata,
+            size,
+            overviews,
         })
     })
     .await
@@ -158,9 +166,8 @@ impl Source for GdalSource {
     }
 
     async fn read_window(&self, req: WindowRequest) -> Result<PixelBuffer> {
-        let native_crs = self.metadata.native_crs.clone();
         self.pool
-            .with_dataset(move |ds| warp_read_window(ds, &native_crs, &req))
+            .with_dataset(move |ds| warp_read_window(ds, &req))
             .await
     }
 
@@ -183,7 +190,8 @@ mod tests {
 
     use crate::crs::{Bbox, Coord, Crs};
     use crate::encode::{encode, EncodeOpts, GeoRef, OutputFormat};
-    use crate::source::{PixelBuffer, PixelType, Resampling, Source, WindowRequest};
+    use crate::source::{PixelBuffer, PixelType, Source, WindowRequest};
+    use gdal::raster::ResampleAlg;
 
     /// Build a small RGB u8 GeoTIFF fixture at a temp path and return the
     /// path. Bbox is EPSG:4326 [0, 0, 1, 1]; size 32x32; values encode
@@ -306,7 +314,8 @@ mod tests {
             crs,
             width,
             height,
-            resampling: Resampling::Nearest,
+            resampling: ResampleAlg::NearestNeighbour,
+            nodata: None,
         };
         let pixels = src.read_window(req).await.expect("read_window");
         assert_eq!(pixels.width, width);
@@ -341,7 +350,8 @@ mod tests {
             crs: target_crs,
             width: target_w,
             height: target_h,
-            resampling: Resampling::Bilinear,
+            resampling: ResampleAlg::Bilinear,
+            nodata: None,
         };
         let pixels = src.read_window(req).await.expect("warped read_window");
         assert_eq!(pixels.width, target_w);

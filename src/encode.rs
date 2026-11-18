@@ -3,18 +3,17 @@
 //! See `docs/src/output-encoding.md`. One of three modules permitted to call
 //! into the `gdal` crate directly (alongside `crs/gdal.rs` and `source/gdal/`).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use gdal::raster::{Buffer, GdalType, RasterCreationOptions};
+use gdal::raster::RasterCreationOptions;
 use gdal::vsi::{get_vsi_mem_file_bytes_owned, unlink_mem_file};
-use gdal::{Dataset, DriverManager};
+use gdal::DriverManager;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::crs::{Bbox, Crs};
-use crate::source::{PixelBuffer, PixelType};
+use crate::source::gdal::raster::{bbox_to_geotransform, mem_from_pixel_buffer, set_nodata, vsimem_path};
+use crate::source::PixelBuffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -127,10 +126,11 @@ impl EncodeOpts {
     }
 }
 
-/// Monotonically increasing counter used to mint unique `/vsimem/` paths.
-static VSIMEM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Encode a pixel buffer to bytes via GDAL `CreateCopy` into `/vsimem/`.
+///
+/// `buffer.nodata` is set on every band for every format: GeoTIFF records
+/// it, and the PNG driver writes it as a `tRNS` chunk so nodata pixels come
+/// out transparent. Drivers without a nodata concept (JPEG) ignore it.
 pub fn encode(
     buffer: &PixelBuffer,
     georef: Option<&GeoRef>,
@@ -138,26 +138,16 @@ pub fn encode(
     opts: &EncodeOpts,
 ) -> Result<Bytes> {
     // 1) Build an in-memory MEM dataset of the appropriate dtype.
-    let mut mem = create_mem_dataset(buffer)
-        .context("failed to create in-memory MEM dataset")?;
+    let mut mem = mem_from_pixel_buffer(buffer).context("failed to create in-memory MEM dataset")?;
 
-    // 2) Apply georeferencing if provided.
+    // 2) Georeferencing (GeoTIFF) and nodata (all formats).
     if let Some(gr) = georef {
         mem.set_projection(gr.crs.as_str())
             .context("failed to set projection on MEM dataset")?;
-        let geo_transform = bbox_to_geotransform(&gr.bbox, buffer.width, buffer.height);
-        mem.set_geo_transform(&geo_transform)
+        mem.set_geo_transform(&bbox_to_geotransform(&gr.bbox, buffer.width, buffer.height)?)
             .context("failed to set geotransform on MEM dataset")?;
-        if let Some(nd) = gr.nodata {
-            for band_idx in 1..=buffer.bands as usize {
-                let mut band = mem
-                    .rasterband(band_idx)
-                    .with_context(|| format!("failed to fetch band {band_idx} for nodata"))?;
-                band.set_no_data_value(Some(nd))
-                    .with_context(|| format!("failed to set nodata on band {band_idx}"))?;
-            }
-        }
     }
+    set_nodata(&mem, georef.and_then(|g| g.nodata).or(buffer.nodata))?;
 
     // 3) Pick the target driver and assemble its creation options.
     let driver = DriverManager::get_driver_by_name(format.gdal_driver())
@@ -167,8 +157,7 @@ pub fn encode(
         RasterCreationOptions::from_iter(kv_strings.iter().map(|s| s.as_str()));
 
     // 4) CreateCopy into a unique /vsimem/ path.
-    let id = VSIMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let vsi_path = format!("/vsimem/kwms-encode-{id}.{}", format.extension());
+    let vsi_path = vsimem_path("encode", format.extension());
 
     let copy_result = mem.create_copy(&driver, &vsi_path, &creation_options);
     // Always attempt to clean up the /vsimem/ entry, even on error.
@@ -201,114 +190,12 @@ pub fn encode(
 /// Compute a standard north-up geotransform from a bbox + raster size.
 ///
 /// `[origin_x, pixel_width, 0, origin_y, 0, -pixel_height]`
-fn bbox_to_geotransform(bbox: &Bbox, width: u32, height: u32) -> [f64; 6] {
-    let pixel_width = (bbox.maxx - bbox.minx) / (width as f64);
-    let pixel_height = (bbox.maxy - bbox.miny) / (height as f64);
-    [bbox.minx, pixel_width, 0.0, bbox.maxy, 0.0, -pixel_height]
-}
-
-/// Create an in-memory MEM dataset matching `buffer`'s shape and dtype, and
-/// populate its bands from the row-major band-interleaved `buffer.data`.
-fn create_mem_dataset(buffer: &PixelBuffer) -> Result<Dataset> {
-    match buffer.pixel_type {
-        PixelType::U8 => build_mem::<u8>(buffer),
-        PixelType::U16 => build_mem::<u16>(buffer),
-        PixelType::I16 => build_mem::<i16>(buffer),
-        PixelType::U32 => build_mem::<u32>(buffer),
-        PixelType::I32 => build_mem::<i32>(buffer),
-        PixelType::F32 => build_mem::<f32>(buffer),
-        PixelType::F64 => build_mem::<f64>(buffer),
-    }
-}
-
-/// Trait to read a fixed-size little-endian element of type `T` from raw bytes.
-///
-/// `PixelBuffer.data` stores values in host byte order (the same order GDAL
-/// will read on a raster I/O write call against the same architecture), so we
-/// use `from_ne_bytes` here to preserve that.
-trait FromNeBytes: Sized {
-    const SIZE: usize;
-    fn from_ne_bytes_slice(bytes: &[u8]) -> Self;
-}
-
-macro_rules! impl_from_ne_bytes {
-    ($($t:ty),*) => {
-        $(
-            impl FromNeBytes for $t {
-                const SIZE: usize = std::mem::size_of::<$t>();
-                fn from_ne_bytes_slice(bytes: &[u8]) -> Self {
-                    let mut arr = [0u8; std::mem::size_of::<$t>()];
-                    arr.copy_from_slice(bytes);
-                    <$t>::from_ne_bytes(arr)
-                }
-            }
-        )*
-    };
-}
-impl_from_ne_bytes!(u8, u16, i16, u32, i32, f32, f64);
-
-fn build_mem<T>(buffer: &PixelBuffer) -> Result<Dataset>
-where
-    T: GdalType + Copy + FromNeBytes,
-{
-    let width = buffer.width as usize;
-    let height = buffer.height as usize;
-    let bands = buffer.bands as usize;
-    let pixel_count = width.checked_mul(height).context("width*height overflow")?;
-    let total_elems = pixel_count.checked_mul(bands).context("pixel*bands overflow")?;
-    let expected_bytes = total_elems
-        .checked_mul(T::SIZE)
-        .context("byte-size overflow")?;
-    if buffer.data.len() != expected_bytes {
-        return Err(anyhow!(
-            "PixelBuffer.data length {} does not match expected {} (w={} h={} b={} elem={})",
-            buffer.data.len(),
-            expected_bytes,
-            width,
-            height,
-            bands,
-            T::SIZE,
-        ));
-    }
-
-    let raw = buffer.data.as_ref();
-
-    let mem_driver = DriverManager::get_driver_by_name("MEM")
-        .context("MEM driver not available")?;
-    let ds = mem_driver
-        .create_with_band_type::<T, _>("kwms-mem", width, height, bands)
-        .context("failed to create MEM dataset")?;
-
-    // De-interleave each band into its own row-major Vec<T> and write it.
-    // data is band-interleaved, row-major:
-    // data[(row * width + col) * bands + band] in element units;
-    // in bytes: offset = ((row * width + col) * bands + band) * T::SIZE.
-    for band_idx in 0..bands {
-        let mut plane: Vec<T> = Vec::with_capacity(pixel_count);
-        for row in 0..height {
-            for col in 0..width {
-                let elem_index = (row * width + col) * bands + band_idx;
-                let byte_off = elem_index * T::SIZE;
-                let slice = &raw[byte_off..byte_off + T::SIZE];
-                plane.push(T::from_ne_bytes_slice(slice));
-            }
-        }
-        let mut buf = Buffer::new((width, height), plane);
-        let mut band = ds
-            .rasterband(band_idx + 1)
-            .with_context(|| format!("failed to fetch MEM band {}", band_idx + 1))?;
-        band.write::<T>((0, 0), (width, height), &mut buf)
-            .with_context(|| format!("failed to write MEM band {}", band_idx + 1))?;
-    }
-
-    Ok(ds)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crs::{Bbox, Crs};
-    use crate::source::{PixelBuffer, PixelType};
+    use crate::source::PixelType;
+    use gdal::Dataset;
     use bytes::Bytes;
     use gdal::vsi::{create_mem_file, unlink_mem_file};
 
@@ -427,8 +314,7 @@ mod tests {
 
         // Round-trip: write the bytes to another /vsimem/ path, open via GDAL,
         // and assert the projection metadata mentions WGS 84 / EPSG:4326.
-        let id = VSIMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!("/vsimem/kwms-encode-test-{id}.tif");
+        let path = vsimem_path("encode-test", "tif");
         create_mem_file(&path, bytes.to_vec()).expect("write vsimem file");
         let ds = Dataset::open(&path).expect("open GeoTIFF from vsimem");
         let projection = ds.projection();
@@ -439,5 +325,19 @@ mod tests {
             projection.contains("4326") || projection.contains("WGS 84"),
             "projection metadata missing expected token: {projection}"
         );
+    }
+
+    #[test]
+    fn png_carries_nodata_as_transparency() {
+        let buffer = PixelBuffer::filled(4, 4, 3, crate::source::PixelType::U8, 0.0, Some(0.0)).unwrap();
+        let bytes = encode(&buffer, None, OutputFormat::Png, &EncodeOpts::defaults_for(OutputFormat::Png))
+            .expect("png encode");
+        let path = vsimem_path("encode-test", "png");
+        create_mem_file(&path, bytes.to_vec()).unwrap();
+        let ds = Dataset::open(&path).unwrap();
+        let nd = ds.rasterband(1).unwrap().no_data_value();
+        drop(ds);
+        let _ = unlink_mem_file(&path);
+        assert_eq!(nd, Some(0.0), "PNG should round-trip nodata via tRNS");
     }
 }

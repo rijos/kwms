@@ -7,7 +7,8 @@ All tile and image encoding goes through GDAL. The same crate that drives source
 For each rendered tile, the pipeline holds:
 
 - A pixel buffer (rows × cols × bands, at the appropriate dtype).
-- Optional georeferencing (CRS + affine geotransform + NoData) — populated for GeoTIFF / raw float output, ignored for PNG / JPEG / WebP.
+- Optional georeferencing (CRS + affine geotransform) — populated for GeoTIFF / raw float output, ignored for PNG / JPEG / WebP.
+- NoData is set on the output bands for every format: GeoTIFF records it, PNG writes it as a `tRNS` chunk (nodata pixels become transparent), JPEG has no equivalent and ignores it.
 
 To encode:
 

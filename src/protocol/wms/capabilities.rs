@@ -15,7 +15,7 @@
 //! Everything else (`<Service>`, `<Capability><Request>`, per-layer
 //! `<BoundingBox>`s) is shared.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
@@ -256,14 +256,11 @@ fn write_layer<W: std::io::Write>(
         {
             wgs84_bbox
         } else {
-            // Best-effort transform. If GDAL/PROJ can't transform (e.g.
-            // a misconfigured CRS), we skip this CRS's BoundingBox rather
-            // than fail the whole capabilities document — the client can
-            // still issue requests against the advertised CRS code.
-            match transform_bbox(&wgs84_bbox, &wgs84, crs) {
-                Ok(b) => b,
-                Err(_) => continue,
-            }
+            // Built once at startup: a CRS GDAL/PROJ can't transform into is
+            // a configuration error, reported — never a silently missing
+            // BoundingBox.
+            transform_bbox(&wgs84_bbox, &wgs84, crs)
+                .with_context(|| format!("BoundingBox of layer `{}` in {crs}", layer.name))?
         };
         write_bounding_box(w, crs, &target_bbox, version)?;
     }
@@ -338,10 +335,10 @@ fn write_bounding_box<W: std::io::Write>(
 
     // 1.3.0: for geographic-YX CRSes, emit attributes in YX order
     // (minimum-latitude first), matching the wire-format BBOX convention.
-    let swap = match should_swap_axes(crs, version) {
-        Ok(b) => b,
-        Err(_) => false, // unknown CRS — fall back to XY ordering
-    };
+    // A CRS whose axis order GDAL can't report is an error, never a guess:
+    // a wrong order would advertise a transposed BoundingBox.
+    let swap = should_swap_axes(crs, version)
+        .with_context(|| format!("axis order of advertised CRS '{crs}'"))?;
 
     let mut el = BytesStart::new("BoundingBox");
     el.push_attribute((crs_attr, crs.as_str()));

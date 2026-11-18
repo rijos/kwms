@@ -39,10 +39,23 @@ fn route_label(path: &str) -> &'static str {
     }
 }
 
+/// Method label from a fixed set: clients choose the method token freely,
+/// and every distinct label value is a new Prometheus series kept forever.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::POST => "POST",
+        _ => "other",
+    }
+}
+
 /// `axum::middleware::from_fn`-compatible handler. Wraps every request
 /// in a stopwatch and emits a counter + histogram on completion.
 pub async fn middleware(req: Request<Body>, next: Next) -> Response {
-    let method = req.method().clone();
+    let method = method_label(req.method());
     let path = req.uri().path().to_string();
     let route = route_label(&path);
 
@@ -52,11 +65,10 @@ pub async fn middleware(req: Request<Body>, next: Next) -> Response {
 
     let status: StatusCode = response.status();
     let status_label = status.as_u16().to_string();
-    let method_label = method.as_str().to_string();
 
     metrics::counter!(
         "kwms_http_requests_total",
-        "method" => method_label.clone(),
+        "method" => method,
         "path" => route,
         "status" => status_label.clone(),
     )
@@ -64,7 +76,7 @@ pub async fn middleware(req: Request<Body>, next: Next) -> Response {
 
     metrics::histogram!(
         "kwms_http_request_duration_seconds",
-        "method" => method_label,
+        "method" => method,
         "path" => route,
         "status" => status_label,
     )
@@ -76,6 +88,14 @@ pub async fn middleware(req: Request<Body>, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_label_is_bounded() {
+        use axum::http::Method;
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::from_bytes(b"AAAAAAAAAAAAA1").unwrap()), "other");
+        assert_eq!(method_label(&Method::DELETE), "other");
+    }
 
     #[test]
     fn route_label_buckets_protocols() {
