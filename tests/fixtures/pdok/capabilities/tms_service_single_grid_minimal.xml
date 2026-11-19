@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><TileMapService version="1.0.0" services="."><Title>kwms TMS</Title><Abstract>kwms — TMS 1.0.0 service</Abstract><TileMaps><TileMap href="https://example.org/tms/1.0.0/ortho" srs="EPSG:3857" title="Ortho (minimal)" profile="global-mercator"/></TileMaps></TileMapService>

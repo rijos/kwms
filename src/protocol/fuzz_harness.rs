@@ -207,23 +207,49 @@ mod tests {
             Just("VERSION=1.0.0".to_string()),
             prop::sample::select(vec!["ortho", "laea", "local", "nope", ""]).prop_map(|l| format!("LAYERS={l}")),
             prop::sample::select(vec!["ortho", "laea", "local"]).prop_map(|l| format!("LAYER={l}")),
-            prop::sample::select(vec!["", "default", "fancy", ",", "default,default"]).prop_map(|s| format!("STYLES={s}")),
+            prop::sample::select(vec!["", "default", "fancy", ",", "default,default"])
+                .prop_map(|s| format!("STYLES={s}")),
             prop::sample::select(vec![
-                "EPSG:3857", "EPSG:28992", "EPSG:4326", "EPSG:3035", "epsg:03857", "CRS:84",
-                "urn:ogc:def:crs:EPSG::4326", "http://www.opengis.net/def/crs/EPSG/0/3035",
-                "/etc/passwd", "http://169.254.169.254/", "EPSG%3A3857", "",
+                "EPSG:3857",
+                "EPSG:28992",
+                "EPSG:4326",
+                "EPSG:3035",
+                "epsg:03857",
+                "CRS:84",
+                "urn:ogc:def:crs:EPSG::4326",
+                "http://www.opengis.net/def/crs/EPSG/0/3035",
+                "/etc/passwd",
+                "http://169.254.169.254/",
+                "EPSG%3A3857",
+                "",
             ])
             .prop_flat_map(|c| prop::sample::select(vec!["CRS", "SRS"]).prop_map(move |k| format!("{k}={c}"))),
             (any::<[f64; 4]>()).prop_map(|b| format!("BBOX={},{},{},{}", b[0], b[1], b[2], b[3])),
-            (-1e7f64..1e7, -1e7f64..1e7, 1f64..1e6, 1f64..1e6)
-                .prop_map(|(x, y, w, h)| format!("BBOX={x},{y},{},{}", x + w, y + h)),
+            (-1e7f64..1e7, -1e7f64..1e7, 1f64..1e6, 1f64..1e6).prop_map(|(x, y, w, h)| format!(
+                "BBOX={x},{y},{},{}",
+                x + w,
+                y + h
+            )),
             (0u32..5000).prop_map(|w| format!("WIDTH={w}")),
             (0u32..5000).prop_map(|h| format!("HEIGHT={h}")),
-            prop::sample::select(vec!["image/png", "image/jpeg", "image%2Fjpeg", "image/gif", "image/tiff"])
-                .prop_map(|f| format!("FORMAT={f}")),
-            prop::sample::select(vec!["GoogleMapsCompatible", "NetherlandsRDNewQuad", "WorldCRS84Quad",
-                "GoogleCRS84Quad", "EuropeanETRS89_LAEAQuad", "local_bl", "webmercator"])
-                .prop_map(|t| format!("TILEMATRIXSET={t}")),
+            prop::sample::select(vec![
+                "image/png",
+                "image/jpeg",
+                "image%2Fjpeg",
+                "image/gif",
+                "image/tiff"
+            ])
+            .prop_map(|f| format!("FORMAT={f}")),
+            prop::sample::select(vec![
+                "GoogleMapsCompatible",
+                "NetherlandsRDNewQuad",
+                "WorldCRS84Quad",
+                "GoogleCRS84Quad",
+                "EuropeanETRS89_LAEAQuad",
+                "local_bl",
+                "webmercator"
+            ])
+            .prop_map(|t| format!("TILEMATRIXSET={t}")),
             (0u32..30).prop_map(|z| format!("TILEMATRIX={z:02}")),
             (0u32..5000).prop_map(|r| format!("TILEROW={r}")),
             (0u32..5000).prop_map(|c| format!("TILECOL={c}")),
@@ -246,8 +272,17 @@ mod tests {
             prop::sample::select(vec!["ortho", "ortho", "ortho", "ortho", "laea", "local", "nope"]),
             prop::sample::select(vec!["", "", "default", "fancy"]),
             prop::sample::select(vec![
-                "EPSG:3857", "EPSG:28992", "EPSG:4326", "urn:ogc:def:crs:EPSG::4326", "epsg:3857",
-                "EPSG:3857", "EPSG:28992", "EPSG:4326", "EPSG:3035", "CRS:84", "/etc/passwd",
+                "EPSG:3857",
+                "EPSG:28992",
+                "EPSG:4326",
+                "urn:ogc:def:crs:EPSG::4326",
+                "epsg:3857",
+                "EPSG:3857",
+                "EPSG:28992",
+                "EPSG:4326",
+                "EPSG:3035",
+                "CRS:84",
+                "/etc/passwd",
             ]),
             (-2e7f64..2e7, -2e7f64..2e7, 1e-3f64..5e6, 1e-3f64..5e6),
             (1u32..2700, 1u32..2700),
@@ -282,8 +317,12 @@ mod tests {
         (
             prop::sample::select(vec!["ortho", "ortho", "local", "laea", "nope", ""]),
             prop::sample::select(vec![
-                "GoogleMapsCompatible", "NetherlandsRDNewQuad", "local_bl", "EuropeanETRS89_LAEAQuad",
-                "WorldCRS84Quad", "x",
+                "GoogleMapsCompatible",
+                "NetherlandsRDNewQuad",
+                "local_bl",
+                "EuropeanETRS89_LAEAQuad",
+                "WorldCRS84Quad",
+                "x",
             ]),
             level_and_indices(),
             prop::sample::select(vec!["png", "png", "jpeg", "jpg", "tif", "gif", ""]),
@@ -341,7 +380,10 @@ mod tests {
                 maps += 1;
             }
             let p = tile_path().new_tree(&mut runner).unwrap().current();
-            if wmts::request::parse_rest(&p).and_then(|r| wmts::validate::validate(r, cat)).is_ok() {
+            if wmts::request::parse_rest(&p)
+                .and_then(|r| wmts::validate::validate(r, cat))
+                .is_ok()
+            {
                 tiles += 1;
             }
         }
@@ -363,7 +405,11 @@ mod tests {
             check_wms(q);
             check_wmts_kvp(q);
         }
-        for p in ["%01/t/0/0/0.png", "\u{1}/GoogleMapsCompatible/0/0/0.png", &format!("{long}/t/0/0/0.png")] {
+        for p in [
+            "%01/t/0/0/0.png",
+            "\u{1}/GoogleMapsCompatible/0/0/0.png",
+            &format!("{long}/t/0/0/0.png"),
+        ] {
             check_wmts_rest(p);
         }
         check_tms("/1.0.0/\u{1}");
@@ -374,10 +420,12 @@ mod tests {
     fn harness_accepts_known_good_requests() {
         // Guards against a harness that only ever sees rejections.
         let cat = catalog();
-        let ok = |q: &str| matches!(
-            wms::request::parse(q).and_then(|r| wms::validate::validate(r, cat)),
-            Ok(wms::validate::WmsQuery::GetMap(_))
-        );
+        let ok = |q: &str| {
+            matches!(
+                wms::request::parse(q).and_then(|r| wms::validate::validate(r, cat)),
+                Ok(wms::validate::WmsQuery::GetMap(_))
+            )
+        };
         assert!(ok("SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=ortho&STYLES=&CRS=EPSG:4326&BBOX=50,3,54,7&WIDTH=256&HEIGHT=256&FORMAT=image/jpeg"));
         assert!(wmts::request::parse_rest("local/local_bl/3/1/2.png")
             .and_then(|r| wmts::validate::validate(r, cat))

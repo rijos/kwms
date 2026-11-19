@@ -64,7 +64,11 @@ impl DatasetPool {
                 .spawn(move || worker(slot, opened, rx, &uri, &open_options))
                 .with_context(|| format!("spawning gdal-pool worker thread {slot}"))?;
         }
-        Ok(Self { tx, slots: Arc::new(Semaphore::new(size)), size })
+        Ok(Self {
+            tx,
+            slots: Arc::new(Semaphore::new(size)),
+            size,
+        })
     }
 
     /// Number of worker threads / dataset handles in this pool.
@@ -160,7 +164,10 @@ mod tests {
     fn full_pool_does_not_block_the_async_runtime() {
         let tif = tiny_tif();
         let pool = Arc::new(DatasetPool::new(tif.path().to_str().unwrap(), &[], 1).unwrap());
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let worst_tick = rt.block_on(async {
             for _ in 0..4 {
                 let p = pool.clone();
@@ -184,7 +191,10 @@ mod tests {
         });
         // A blocking hand-off stalls for at least one job (1 s); allow generous
         // scheduling noise below that.
-        assert!(worst_tick < Duration::from_millis(250), "runtime thread was blocked for {worst_tick:?}");
+        assert!(
+            worst_tick < Duration::from_millis(250),
+            "runtime thread was blocked for {worst_tick:?}"
+        );
     }
 
     /// A job that panics must not permanently remove a worker.
@@ -192,16 +202,16 @@ mod tests {
     fn a_panicking_job_does_not_kill_the_worker() {
         let tif = tiny_tif();
         let pool = DatasetPool::new(tif.path().to_str().unwrap(), &[], 1).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let first = pool.with_dataset(|_| -> Result<()> { panic!("job bug") }).await;
             assert!(first.is_err());
-            let second = tokio::time::timeout(
-                Duration::from_secs(2),
-                pool.with_dataset(|ds| Ok(ds.raster_size())),
-            )
-            .await
-            .expect("pool has no live worker after a panic");
+            let second = tokio::time::timeout(Duration::from_secs(2), pool.with_dataset(|ds| Ok(ds.raster_size())))
+                .await
+                .expect("pool has no live worker after a panic");
             assert_eq!(second.unwrap(), (4, 4));
         });
     }
@@ -215,7 +225,11 @@ mod tests {
         let pool = Arc::new(DatasetPool::new(tif.path().to_str().unwrap(), &[], 4).unwrap());
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let mut tasks = Vec::new();
             for _ in 0..64 {
@@ -236,7 +250,11 @@ mod tests {
                 assert_eq!(t.await.unwrap().unwrap(), (4, 4));
             }
         });
-        assert!(peak.load(Ordering::SeqCst) <= 4, "peak {} > pool size", peak.load(Ordering::SeqCst));
+        assert!(
+            peak.load(Ordering::SeqCst) <= 4,
+            "peak {} > pool size",
+            peak.load(Ordering::SeqCst)
+        );
     }
 
     /// A saturated pool sheds load with `Busy` after the queue timeout
@@ -246,7 +264,11 @@ mod tests {
         use crate::pipeline::error::{classify, Disposition};
         let tif = tiny_tif();
         let pool = Arc::new(DatasetPool::new(tif.path().to_str().unwrap(), &[], 1).unwrap());
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let p = pool.clone();
             let (started_tx, started_rx) = tokio::sync::oneshot::channel();

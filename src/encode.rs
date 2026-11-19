@@ -66,10 +66,22 @@ pub struct GeoRef {
 /// Per-format encoder options. Flattens to GDAL `KEY=VALUE` strings at call time.
 #[derive(Debug, Clone)]
 pub enum EncodeOpts {
-    Png { z_level: u8 },
-    Jpeg { quality: u8, progressive: bool },
-    Webp { quality: u8, lossless: bool },
-    GeoTiff { compress: GtCompress, predictor: u8, tiled: bool },
+    Png {
+        z_level: u8,
+    },
+    Jpeg {
+        quality: u8,
+        progressive: bool,
+    },
+    Webp {
+        quality: u8,
+        lossless: bool,
+    },
+    GeoTiff {
+        compress: GtCompress,
+        predictor: u8,
+        tiled: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,9 +108,17 @@ impl EncodeOpts {
     pub fn from_config(format: OutputFormat, cfg: &crate::config::OutputFormatsConfig) -> Self {
         use crate::config::GeoTiffCompression as C;
         match format {
-            OutputFormat::Png => EncodeOpts::Png { z_level: cfg.png.compression },
-            OutputFormat::Jpeg => EncodeOpts::Jpeg { quality: cfg.jpeg.quality, progressive: cfg.jpeg.progressive },
-            OutputFormat::Webp => EncodeOpts::Webp { quality: cfg.webp.quality, lossless: cfg.webp.lossless },
+            OutputFormat::Png => EncodeOpts::Png {
+                z_level: cfg.png.compression,
+            },
+            OutputFormat::Jpeg => EncodeOpts::Jpeg {
+                quality: cfg.jpeg.quality,
+                progressive: cfg.jpeg.progressive,
+            },
+            OutputFormat::Webp => EncodeOpts::Webp {
+                quality: cfg.webp.quality,
+                lossless: cfg.webp.lossless,
+            },
             OutputFormat::GeoTiff => EncodeOpts::GeoTiff {
                 compress: match cfg.geotiff.compress {
                     C::None => GtCompress::None,
@@ -117,8 +137,14 @@ impl EncodeOpts {
     pub fn defaults_for(format: OutputFormat) -> Self {
         match format {
             OutputFormat::Png => EncodeOpts::Png { z_level: 6 },
-            OutputFormat::Jpeg => EncodeOpts::Jpeg { quality: 85, progressive: false },
-            OutputFormat::Webp => EncodeOpts::Webp { quality: 80, lossless: false },
+            OutputFormat::Jpeg => EncodeOpts::Jpeg {
+                quality: 85,
+                progressive: false,
+            },
+            OutputFormat::Webp => EncodeOpts::Webp {
+                quality: 80,
+                lossless: false,
+            },
             OutputFormat::GeoTiff => EncodeOpts::GeoTiff {
                 compress: GtCompress::Deflate,
                 predictor: 2,
@@ -138,7 +164,11 @@ impl EncodeOpts {
                 format!("QUALITY={quality}"),
                 format!("LOSSLESS={}", if *lossless { "TRUE" } else { "FALSE" }),
             ],
-            EncodeOpts::GeoTiff { compress, predictor, tiled } => vec![
+            EncodeOpts::GeoTiff {
+                compress,
+                predictor,
+                tiled,
+            } => vec![
                 format!("COMPRESS={}", compress.as_str()),
                 format!("PREDICTOR={predictor}"),
                 format!("TILED={}", if *tiled { "YES" } else { "NO" }),
@@ -158,9 +188,13 @@ fn supports_alpha(format: OutputFormat) -> bool {
 /// whether its last band is alpha.
 fn apply_alpha(buffer: &PixelBuffer, format: OutputFormat) -> Result<(std::borrow::Cow<'_, PixelBuffer>, bool)> {
     use std::borrow::Cow;
-    let Some(alpha) = &buffer.alpha else { return Ok((Cow::Borrowed(buffer), false)) };
+    let Some(alpha) = &buffer.alpha else {
+        return Ok((Cow::Borrowed(buffer), false));
+    };
     let bands = buffer.bands as usize;
-    let pixels = (buffer.width as usize).checked_mul(buffer.height as usize).context("image size overflows")?;
+    let pixels = (buffer.width as usize)
+        .checked_mul(buffer.height as usize)
+        .context("image size overflows")?;
     if alpha.len() != pixels {
         anyhow::bail!("internal: alpha has {} entries for {pixels} pixels", alpha.len());
     }
@@ -185,7 +219,13 @@ fn apply_alpha(buffer: &PixelBuffer, format: OutputFormat) -> Result<(std::borro
             data.extend_from_slice(&to_sample(*a).unwrap_or_default());
         }
         let bands = buffer.bands.checked_add(1).context("band count overflows")?;
-        let out = PixelBuffer { bands, data: Bytes::from(data), nodata: None, alpha: None, ..buffer.clone() };
+        let out = PixelBuffer {
+            bands,
+            data: Bytes::from(data),
+            nodata: None,
+            alpha: None,
+            ..buffer.clone()
+        };
         return Ok((Cow::Owned(out), true));
     }
     // No alpha channel: blend onto white (JPEG is 8-bit).
@@ -198,11 +238,21 @@ fn apply_alpha(buffer: &PixelBuffer, format: OutputFormat) -> Result<(std::borro
         let white = 255u32.saturating_mul(255u32.saturating_sub(a));
         for v in px.iter_mut() {
             // (v*a + 255*(255-a) + 127) / 255: stays within 0..=255.
-            let blended = u32::from(*v).saturating_mul(a).saturating_add(white).saturating_add(127).checked_div(255).unwrap_or(255);
+            let blended = u32::from(*v)
+                .saturating_mul(a)
+                .saturating_add(white)
+                .saturating_add(127)
+                .checked_div(255)
+                .unwrap_or(255);
             *v = u8::try_from(blended).unwrap_or(u8::MAX);
         }
     }
-    let out = PixelBuffer { data: Bytes::from(data), nodata: None, alpha: None, ..buffer.clone() };
+    let out = PixelBuffer {
+        data: Bytes::from(data),
+        nodata: None,
+        alpha: None,
+        ..buffer.clone()
+    };
     Ok((Cow::Owned(out), false))
 }
 
@@ -212,12 +262,7 @@ fn apply_alpha(buffer: &PixelBuffer, format: OutputFormat) -> Result<(std::borro
 /// GeoTIFF (transparent where there is no data) and white for JPEG.
 /// Without alpha, `buffer.nodata` is set on every band: GeoTIFF records it,
 /// and the PNG driver writes it as a `tRNS` chunk.
-pub fn encode(
-    buffer: &PixelBuffer,
-    georef: Option<&GeoRef>,
-    format: OutputFormat,
-    opts: &EncodeOpts,
-) -> Result<Bytes> {
+pub fn encode(buffer: &PixelBuffer, georef: Option<&GeoRef>, format: OutputFormat, opts: &EncodeOpts) -> Result<Bytes> {
     let (buffer, has_alpha_band) = apply_alpha(buffer, format)?;
     let buffer = buffer.as_ref();
     // 1) Build an in-memory MEM dataset of the appropriate dtype.
@@ -248,8 +293,7 @@ pub fn encode(
     let driver = DriverManager::get_driver_by_name(format.gdal_driver())
         .with_context(|| format!("GDAL driver `{}` not available", format.gdal_driver()))?;
     let kv_strings = opts.to_kv_strings();
-    let creation_options =
-        RasterCreationOptions::from_iter(kv_strings.iter().map(|s| s.as_str()));
+    let creation_options = RasterCreationOptions::from_iter(kv_strings.iter().map(|s| s.as_str()));
 
     // 4) CreateCopy into a unique /vsimem/ path.
     let vsi_path = vsimem_path("encode", format.extension());
@@ -261,8 +305,7 @@ pub fn encode(
             // Drop the output dataset before reading its bytes, so GDAL flushes
             // any buffered writes to the in-memory file.
             drop(out_ds);
-            let raw = get_vsi_mem_file_bytes_owned(&vsi_path)
-                .context("failed to read encoded bytes from /vsimem/")?;
+            let raw = get_vsi_mem_file_bytes_owned(&vsi_path).context("failed to read encoded bytes from /vsimem/")?;
             // `get_vsi_mem_file_bytes_owned` already frees the underlying buffer,
             // but the directory entry may linger; explicitly unlink (ignore err).
             let _ = unlink_mem_file(&vsi_path);
@@ -270,12 +313,8 @@ pub fn encode(
         }
         Err(e) => {
             let _ = unlink_mem_file(&vsi_path);
-            return Err(anyhow!(e)).with_context(|| {
-                format!(
-                    "GDAL CreateCopy failed for driver `{}`",
-                    format.gdal_driver()
-                )
-            });
+            return Err(anyhow!(e))
+                .with_context(|| format!("GDAL CreateCopy failed for driver `{}`", format.gdal_driver()));
         }
     };
 
@@ -290,9 +329,9 @@ mod tests {
     use super::*;
     use crate::crs::{Bbox, Crs};
     use crate::source::PixelType;
-    use gdal::Dataset;
     use bytes::Bytes;
     use gdal::vsi::{create_mem_file, unlink_mem_file};
+    use gdal::Dataset;
 
     fn make_rgba_u8_16x16() -> PixelBuffer {
         let width = 16u32;
@@ -329,11 +368,7 @@ mod tests {
         )
         .expect("PNG encode succeeded");
         assert!(bytes.len() > 8, "PNG output too short: {} bytes", bytes.len());
-        assert_eq!(
-            &bytes[..4],
-            &[0x89, 0x50, 0x4E, 0x47],
-            "PNG output missing PNG magic"
-        );
+        assert_eq!(&bytes[..4], &[0x89, 0x50, 0x4E, 0x47], "PNG output missing PNG magic");
     }
 
     /// No-data pixels: an alpha band in PNG, white in JPEG.
@@ -353,17 +388,42 @@ mod tests {
             create_mem_file(&path, bytes.to_vec()).unwrap();
             let ds = Dataset::open(&path).unwrap();
             let bands: Vec<Vec<u8>> = (1..=ds.raster_count())
-                .map(|b| ds.rasterband(b).unwrap().read_band_as::<u8>().unwrap().into_shape_and_vec().1)
+                .map(|b| {
+                    ds.rasterband(b)
+                        .unwrap()
+                        .read_band_as::<u8>()
+                        .unwrap()
+                        .into_shape_and_vec()
+                        .1
+                })
                 .collect();
             drop(ds);
             let _ = unlink_mem_file(&path);
             bands
         };
-        let png = decode(encode(&buffer, None, OutputFormat::Png, &EncodeOpts::defaults_for(OutputFormat::Png)).unwrap(), "png");
+        let png = decode(
+            encode(
+                &buffer,
+                None,
+                OutputFormat::Png,
+                &EncodeOpts::defaults_for(OutputFormat::Png),
+            )
+            .unwrap(),
+            "png",
+        );
         assert_eq!(png.len(), 4, "RGBA");
         assert_eq!(png[3], vec![255, 0]);
         assert_eq!((png[0][0], png[1][0], png[2][0]), (10, 20, 30));
-        let jpeg = decode(encode(&buffer, None, OutputFormat::Jpeg, &EncodeOpts::defaults_for(OutputFormat::Jpeg)).unwrap(), "jpg");
+        let jpeg = decode(
+            encode(
+                &buffer,
+                None,
+                OutputFormat::Jpeg,
+                &EncodeOpts::defaults_for(OutputFormat::Jpeg),
+            )
+            .unwrap(),
+            "jpg",
+        );
         assert_eq!(jpeg.len(), 3);
         // The no-data pixel is white (JPEG is lossy: allow a little).
         assert!(jpeg.iter().all(|band| band[1] >= 240), "{jpeg:?}");
@@ -400,11 +460,7 @@ mod tests {
         )
         .expect("JPEG encode succeeded");
         assert!(bytes.len() > 3, "JPEG output too short");
-        assert_eq!(
-            &bytes[..3],
-            &[0xFF, 0xD8, 0xFF],
-            "JPEG output missing SOI marker"
-        );
+        assert_eq!(&bytes[..3], &[0xFF, 0xD8, 0xFF], "JPEG output missing SOI marker");
     }
 
     #[test]
@@ -461,8 +517,13 @@ mod tests {
     #[test]
     fn png_carries_nodata_as_transparency() {
         let buffer = PixelBuffer::filled(4, 4, 3, crate::source::PixelType::U8, 0.0, Some(0.0)).unwrap();
-        let bytes = encode(&buffer, None, OutputFormat::Png, &EncodeOpts::defaults_for(OutputFormat::Png))
-            .expect("png encode");
+        let bytes = encode(
+            &buffer,
+            None,
+            OutputFormat::Png,
+            &EncodeOpts::defaults_for(OutputFormat::Png),
+        )
+        .expect("png encode");
         let path = vsimem_path("encode-test", "png");
         create_mem_file(&path, bytes.to_vec()).unwrap();
         let ds = Dataset::open(&path).unwrap();

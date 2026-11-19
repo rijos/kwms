@@ -48,18 +48,13 @@ pub fn load(config_path: &Path, secrets_path: &Path) -> Result<(Config, Secrets)
 
     // -- env-var overrides (config side only) --
     let env_overlay = env_overlay_value()?;
-    let config_value =
-        merge(config_value, env_overlay).context("applying KWMS_* env-var overrides")?;
+    let config_value = merge(config_value, env_overlay).context("applying KWMS_* env-var overrides")?;
 
     // -- deserialize into typed structs --
     let config: Config = serde_yaml::from_value(config_value)
         .with_context(|| format!("validating shape of '{}'", config_path.display()))?;
-    let secrets: Secrets = serde_yaml::from_value(secrets_value).with_context(|| {
-        format!(
-            "validating shape of '{}'",
-            secrets_path.display()
-        )
-    })?;
+    let secrets: Secrets = serde_yaml::from_value(secrets_value)
+        .with_context(|| format!("validating shape of '{}'", secrets_path.display()))?;
 
     validate(&config).context("config validation failed")?;
     crate::source::gdal::credentials::plan(&config, &secrets).context("config validation failed")?;
@@ -71,7 +66,11 @@ pub fn load(config_path: &Path, secrets_path: &Path) -> Result<(Config, Secrets)
     }
     for (i, tier) in config.cache.tiers.iter().enumerate() {
         if let crate::config::TierConfig::Store(st) = tier {
-            if let Some(name) = st.credentials.as_ref().filter(|n| !secrets.credentials.contains_key(*n)) {
+            if let Some(name) = st
+                .credentials
+                .as_ref()
+                .filter(|n| !secrets.credentials.contains_key(*n))
+            {
                 bail!("config validation failed: cache.tiers[{i}].credentials '{name}' is not defined in secrets.yaml");
             }
         }
@@ -177,8 +176,7 @@ layers:
         // Ensure it really doesn't exist.
         let _ = std::fs::remove_file(&missing_secrets);
 
-        let (config, secrets) =
-            load(cfg_file.path(), &missing_secrets).expect("load should succeed");
+        let (config, secrets) = load(cfg_file.path(), &missing_secrets).expect("load should succeed");
         assert_eq!(config.server.bind, "0.0.0.0:8080");
         assert_eq!(config.layers.len(), 1);
         assert_eq!(config.layers[0].name, "ortho2024");
@@ -224,12 +222,8 @@ credentials:
     AZURE_STORAGE_ACCESS_KEY: "abc"
 "#;
         let sec_file = write_tmp(secrets_text);
-        let (_config, secrets) =
-            load(cfg_file.path(), sec_file.path()).expect("load with secrets");
-        let creds = secrets
-            .credentials
-            .get("pdok_blob")
-            .expect("pdok_blob present");
+        let (_config, secrets) = load(cfg_file.path(), sec_file.path()).expect("load with secrets");
+        let creds = secrets.credentials.get("pdok_blob").expect("pdok_blob present");
         assert_eq!(
             creds.0.get("AZURE_STORAGE_ACCOUNT").map(String::as_str),
             Some("luchtfoto")
@@ -281,12 +275,8 @@ layers:
 
     #[test]
     fn nest_builds_nested_mapping() {
-        let v = nest(
-            &["server".into(), "bind".into()],
-            Value::String("x".into()),
-        );
-        let expected: Value =
-            serde_yaml::from_str("server:\n  bind: x\n").unwrap();
+        let v = nest(&["server".into(), "bind".into()], Value::String("x".into()));
+        let expected: Value = serde_yaml::from_str("server:\n  bind: x\n").unwrap();
         assert_eq!(v, expected);
     }
 }

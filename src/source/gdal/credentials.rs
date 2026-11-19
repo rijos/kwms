@@ -31,7 +31,11 @@ pub fn plan<'a>(config: &Config, secrets: &'a Secrets) -> Result<BTreeMap<String
         for source in &layer.sources {
             let Some(name) = &source.credentials else {
                 if source.credentials_prefix.is_some() {
-                    bail!("layer '{}': source '{}' sets credentials_prefix without credentials", layer.name, source.uri);
+                    bail!(
+                        "layer '{}': source '{}' sets credentials_prefix without credentials",
+                        layer.name,
+                        source.uri
+                    );
                 }
                 continue;
             };
@@ -41,7 +45,9 @@ pub fn plan<'a>(config: &Config, secrets: &'a Secrets) -> Result<BTreeMap<String
                 .get(name)
                 .ok_or_else(|| anyhow!("credentials '{name}' are not defined in secrets.yaml"))
                 .with_context(ctx)?;
-            check_block(block).with_context(|| format!("credentials '{name}'")).with_context(ctx)?;
+            check_block(block)
+                .with_context(|| format!("credentials '{name}'"))
+                .with_context(ctx)?;
             let prefix = prefix_for(source).with_context(ctx)?;
             match scopes.get(&prefix) {
                 Some((other, _)) if other != name => bail!(
@@ -69,7 +75,9 @@ pub fn register(config: &Config, secrets: &Secrets) -> Result<()> {
     static REGISTERED: Mutex<BTreeMap<(String, String), String>> = Mutex::new(BTreeMap::new());
 
     let scopes = plan(config, secrets)?;
-    let mut registered = REGISTERED.lock().map_err(|_| anyhow!("credentials registry poisoned"))?;
+    let mut registered = REGISTERED
+        .lock()
+        .map_err(|_| anyhow!("credentials registry poisoned"))?;
     for (prefix, (name, block)) in scopes {
         // Sorted, so the order of GDAL calls doesn't depend on hashing.
         let options: BTreeMap<&String, &String> = block.0.iter().collect();
@@ -102,7 +110,11 @@ fn prefix_for(source: &SourceConfig) -> Result<String> {
         if !handler.chars().all(|c| c.is_ascii_lowercase() || c == '_') || bucket.is_empty() {
             bail!("credentials_prefix '{prefix}' must look like /vsiXXX/<bucket>/…");
         }
-        return Ok(if prefix.ends_with('/') { prefix.clone() } else { format!("{prefix}/") });
+        return Ok(if prefix.ends_with('/') {
+            prefix.clone()
+        } else {
+            format!("{prefix}/")
+        });
     }
     match split_vsi(&source.uri) {
         Some((handler, bucket)) if BUCKET_HANDLERS.contains(&handler) && !bucket.is_empty() => {
@@ -158,9 +170,21 @@ mod tests {
 
     #[test]
     fn prefix_is_derived_from_bucket_uris_only() {
-        assert_eq!(prefix_for(&source("/vsiaz/photos/a/b.tif", Some("c"), None)).unwrap(), "/vsiaz/photos/");
-        assert_eq!(prefix_for(&source("/vsis3/bkt/x.vrt", Some("c"), None)).unwrap(), "/vsis3/bkt/");
-        for uri in ["data/tiles.shp", "GTI:data/tiles.shp", "/vsicurl/https://h/x.tif", "/vsiaz/", "/vsi/x/y"] {
+        assert_eq!(
+            prefix_for(&source("/vsiaz/photos/a/b.tif", Some("c"), None)).unwrap(),
+            "/vsiaz/photos/"
+        );
+        assert_eq!(
+            prefix_for(&source("/vsis3/bkt/x.vrt", Some("c"), None)).unwrap(),
+            "/vsis3/bkt/"
+        );
+        for uri in [
+            "data/tiles.shp",
+            "GTI:data/tiles.shp",
+            "/vsicurl/https://h/x.tif",
+            "/vsiaz/",
+            "/vsi/x/y",
+        ] {
             assert!(prefix_for(&source(uri, Some("c"), None)).is_err(), "{uri}");
         }
     }
@@ -201,7 +225,10 @@ layers:
 
     #[test]
     fn plan_rejects_missing_blocks_and_conflicting_prefixes() {
-        let sec = secrets(&[("a", &[("AZURE_STORAGE_ACCOUNT", "x")]), ("b", &[("AZURE_STORAGE_ACCOUNT", "y")])]);
+        let sec = secrets(&[
+            ("a", &[("AZURE_STORAGE_ACCOUNT", "x")]),
+            ("b", &[("AZURE_STORAGE_ACCOUNT", "y")]),
+        ]);
 
         let missing = config_with(vec![source("/vsiaz/c/x.tif", Some("nope"), None)]);
         let err = format!("{:#}", plan(&missing, &sec).unwrap_err());
@@ -248,7 +275,10 @@ layers:
         // What GDAL's VSI handlers see (falls back to the process-wide
         // config option, unset here).
         let get = |path| crate::ffi::vsi_get_path_specific_option(path, "azure_storage_account").unwrap();
-        assert_eq!(get("/vsiaz/kwms-credentials-test/a/b.tif").as_deref(), Some("kwmstestacct"));
+        assert_eq!(
+            get("/vsiaz/kwms-credentials-test/a/b.tif").as_deref(),
+            Some("kwmstestacct")
+        );
         assert_eq!(get("/vsiaz/kwms-credentials-test-other/b.tif"), None);
 
         let changed = secrets(&[("a", &[("AZURE_STORAGE_ACCOUNT", "other")])]);

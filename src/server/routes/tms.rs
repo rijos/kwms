@@ -48,34 +48,27 @@ pub async fn handle(
     };
     match doc {
         Some(xml) => xml_response(xml, StatusCode::OK),
-        None => pipeline_error(&anyhow::anyhow!("internal: no TileMap document for a catalog layer"), "TMS document", &rid),
+        None => pipeline_error(
+            &anyhow::anyhow!("internal: no TileMap document for a catalog layer"),
+            "TMS document",
+            &rid,
+        ),
     }
 }
 
 fn request_error(err: &OgcError) -> Response {
     let (status, xml) = exception::for_error(err);
-    xml_response(
-        xml,
-        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
-    )
+    xml_response(xml, StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
 }
 
 fn pipeline_error(err: &anyhow::Error, operation: &str, rid: &RequestId) -> Response {
     let reply = error_reply(err, operation, rid);
     with_retry_after(
         reply.status,
-        xml_response(
-            exception::error_document(reply.code, &reply.message),
-            reply.status,
-        ),
+        xml_response(exception::error_document(reply.code, &reply.message), reply.status),
     )
 }
 
 fn xml_response(body: String, status: StatusCode) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
-        body,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "text/xml; charset=utf-8")], body).into_response()
 }

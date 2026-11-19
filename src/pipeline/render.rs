@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::str::FromStr;
 
 use anyhow::{anyhow, Context, Result};
-use gdal::raster::ResampleAlg;
 use bytes::Bytes;
+use gdal::raster::ResampleAlg;
 
 use super::cpu::CpuPool;
 use super::read_budget;
@@ -143,7 +143,12 @@ impl Renderer {
     /// Reprojected once per (layer, CRS), off the async workers.
     pub(crate) async fn coverage_parts(&self, layer: &LayerConfig, crs: &Crs) -> Result<Arc<Vec<Area>>> {
         let key = (layer.name.clone(), crs.clone());
-        if let Some(parts) = self.coverage_parts.lock().map_err(|_| anyhow!("coverage cache poisoned"))?.get(&key) {
+        if let Some(parts) = self
+            .coverage_parts
+            .lock()
+            .map_err(|_| anyhow!("coverage cache poisoned"))?
+            .get(&key)
+        {
             return Ok(parts.clone());
         }
         let source_area = layer
@@ -151,10 +156,16 @@ impl Renderer {
             .first()
             .and_then(|s| self.sources.get(&s.uri))
             .and_then(|s| s.coverage_area());
-        let areas: Vec<Area> = source_area.into_iter().chain(self.masks.get(&layer.name).cloned()).collect();
+        let areas: Vec<Area> = source_area
+            .into_iter()
+            .chain(self.masks.get(&layer.name).cloned())
+            .collect();
         let target = crs.clone();
         let parts = tokio::task::spawn_blocking(move || -> Result<Vec<Area>> {
-            areas.iter().map(|a| crate::source::gdal::mask::reproject(a, &target)).collect()
+            areas
+                .iter()
+                .map(|a| crate::source::gdal::mask::reproject(a, &target))
+                .collect()
         })
         .await
         .context("reprojecting coverage areas")??;
@@ -183,7 +194,9 @@ impl Renderer {
     /// deepest durably cached level of `layer` — beyond the cached pyramid.
     /// Always `false` for a pair without a limit.
     pub fn finer_than_cached(&self, layer: &str, grid: &dyn TileGrid, bbox: &Bbox, size: (u32, u32)) -> bool {
-        let Some((max, _)) = self.cache_limit(layer, grid.name()) else { return false };
+        let Some((max, _)) = self.cache_limit(layer, grid.name()) else {
+            return false;
+        };
         match max {
             None => true,
             // A hair of tolerance: a request exactly at that level's
@@ -197,7 +210,9 @@ impl Renderer {
     /// sizes are client-chosen, so a source with sparse overviews must not
     /// turn one GetMap into a huge read; such requests use tiles instead.
     pub fn direct_read_fits(&self, layer: &LayerConfig, crs: &Crs, bbox: &Bbox, size: (u32, u32)) -> Result<bool> {
-        let Some(source) = layer.sources.first().and_then(|s| self.sources.get(&s.uri)) else { return Ok(false) };
+        let Some(source) = layer.sources.first().and_then(|s| self.sources.get(&s.uri)) else {
+            return Ok(false);
+        };
         Ok(read_budget::window_read_pixels(source.metadata(), crs, bbox, size)? <= read_budget::MAX_DIRECT_READ_PIXELS)
     }
 
@@ -300,7 +315,9 @@ pub(crate) async fn render_grid_tile(
         CacheMode::Memory => Scope::InProcess,
     };
     r.cache
-        .get_or_compute_in(scope, key, layer.cache.ttl, || compute_tile(r, source.clone(), layer, grid, bbox, format))
+        .get_or_compute_in(scope, key, layer.cache.ttl, || {
+            compute_tile(r, source.clone(), layer, grid, bbox, format)
+        })
         .await
 }
 
@@ -320,7 +337,11 @@ pub(crate) async fn render_window(
     size: (u32, u32),
     format: OutputFormat,
 ) -> Result<Bytes> {
-    let uri = &layer.sources.first().ok_or_else(|| anyhow!("layer `{}` has no sources", layer.name))?.uri;
+    let uri = &layer
+        .sources
+        .first()
+        .ok_or_else(|| anyhow!("layer `{}` has no sources", layer.name))?
+        .uri;
     let source = r
         .sources
         .get(uri)
@@ -375,7 +396,11 @@ pub async fn seed_grid_tile(
 ) -> Result<SeedOutcome> {
     grid.check_coord(coord)
         .map_err(|e| anyhow!("tile outside grid `{}`: {e}", grid.name()))?;
-    let uri = &layer.sources.first().ok_or_else(|| anyhow!("layer `{}` has no sources", layer.name))?.uri;
+    let uri = &layer
+        .sources
+        .first()
+        .ok_or_else(|| anyhow!("layer `{}` has no sources", layer.name))?
+        .uri;
     let source = r
         .sources
         .get(uri)
@@ -437,7 +462,11 @@ async fn compute_tile(
     let make = move || crate::source::gdal::mask::apply(buffer, &parts, &bbox);
     let opts = r.encode_opts(layer, format);
     let encoded = encode_on_pool(r, make, grid.crs().clone(), bbox, format, opts).await?;
-    Ok(if encoded.all_fill { Computed::transient(encoded.bytes) } else { Computed::store(encoded.bytes) })
+    Ok(if encoded.all_fill {
+        Computed::transient(encoded.bytes)
+    } else {
+        Computed::store(encoded.bytes)
+    })
 }
 
 /// A `size` image with no data in the layer's band layout (transparent in
@@ -518,7 +547,10 @@ where
                 _ => None,
             };
             let bytes = encode(&buffer, georef.as_ref(), format, &opts)?;
-            Ok(Encoded { bytes, all_fill: buffer.is_all_fill() })
+            Ok(Encoded {
+                bytes,
+                all_fill: buffer.is_all_fill(),
+            })
         })
         .await
 }
@@ -526,8 +558,7 @@ where
 /// The layer's resampling kernel as GDAL's enum. Validation already ran
 /// `ResampleAlg::from_str` on it, so failure here means a config bypassed it.
 pub(crate) fn layer_resampling(layer: &LayerConfig) -> Result<ResampleAlg> {
-    ResampleAlg::from_str(&layer.resampling)
-        .map_err(|e| anyhow!("layer `{}`: invalid resampling: {e}", layer.name))
+    ResampleAlg::from_str(&layer.resampling).map_err(|e| anyhow!("layer `{}`: invalid resampling: {e}", layer.name))
 }
 
 #[cfg(test)]
@@ -540,11 +571,9 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::cache::memory::MemoryTier;
-    use crate::pipeline::cpu::CpuPool;
-    use crate::config::model::{
-        LayerCacheConfig, MaxResolution, MaxResolutionMode, SourceConfig,
-    };
+    use crate::config::model::{LayerCacheConfig, MaxResolution, MaxResolutionMode, SourceConfig};
     use crate::crs::{Bbox, Crs};
+    use crate::pipeline::cpu::CpuPool;
     use crate::source::gdal::GdalSource;
     use crate::source::{PixelBuffer, PixelType, Source};
     use crate::tile::grid::WebMercator;
@@ -688,11 +717,7 @@ mod tests {
             .await
             .expect("first render");
         assert!(first.len() > 8, "PNG output too short: {} bytes", first.len());
-        assert_eq!(
-            &first[..4],
-            &[0x89, 0x50, 0x4E, 0x47],
-            "PNG magic missing"
-        );
+        assert_eq!(&first[..4], &[0x89, 0x50, 0x4E, 0x47], "PNG magic missing");
 
         // Second call should hit the cache and return identical bytes.
         let second = render_grid_tile(&r, &layer, &grid, coord, OutputFormat::Png)
@@ -736,11 +761,7 @@ mod tests {
             format: OutputFormat::Png,
             grid_dir: grid_dir(grid.name(), grid.crs()),
         };
-        let got = r
-            .cache
-            .get(&key, Duration::from_secs(60))
-            .await
-            .expect("cache get ok");
+        let got = r.cache.get(&key, Duration::from_secs(60)).await.expect("cache get ok");
         assert!(got.is_none(), "passthrough must not populate the cache");
     }
 
@@ -757,7 +778,11 @@ mod tests {
         let layer = build_layer("world", &uri);
         let grid: Arc<dyn TileGrid> = Arc::new(WebMercator::new());
 
-        for coord in [TileCoord::new(22, 0, 0), TileCoord::new(64, 0, 0), TileCoord::new(1, 2, 0)] {
+        for coord in [
+            TileCoord::new(22, 0, 0),
+            TileCoord::new(64, 0, 0),
+            TileCoord::new(1, 2, 0),
+        ] {
             let err = render_grid_tile(&r, &layer, &grid, coord, OutputFormat::Png)
                 .await
                 .unwrap_err();
@@ -817,21 +842,38 @@ mod tests {
             let mut ds = drv.create_with_band_type::<u8, _>(&path, 64, 32, 1).unwrap();
             ds.set_spatial_ref(&crate::source::gdal::raster::gis_order_spatial_ref(&Crs::new("EPSG:4326")).unwrap())
                 .unwrap();
-            ds.set_geo_transform(&[-180.0, 360.0 / 64.0, 0.0, 90.0, 0.0, -180.0 / 32.0]).unwrap();
+            ds.set_geo_transform(&[-180.0, 360.0 / 64.0, 0.0, 90.0, 0.0, -180.0 / 32.0])
+                .unwrap();
             let mut band = ds.rasterband(1).unwrap();
             band.set_no_data_value(Some(0.0)).unwrap();
-            let pixels: Vec<u8> = (0..32).flat_map(|_| (0..64).map(|x| if x < 32 { 0 } else { 200 })).collect();
-            band.write((0, 0), (64, 32), &mut gdal::raster::Buffer::new((64, 32), pixels)).unwrap();
+            let pixels: Vec<u8> = (0..32)
+                .flat_map(|_| (0..64).map(|x| if x < 32 { 0 } else { 200 }))
+                .collect();
+            band.write((0, 0), (64, 32), &mut gdal::raster::Buffer::new((64, 32), pixels))
+                .unwrap();
         }
         let uri = path.to_string_lossy().into_owned();
         let r = test_renderer(open_registry(&uri), &uri);
         let layer = build_layer("east", &uri);
         let grid: Arc<dyn TileGrid> = Arc::new(WebMercator::new());
-        let key = |x| TileKey { layer: "east".into(), coord: TileCoord::new(1, x, 0), format: OutputFormat::Png, grid_dir: grid_dir(grid.name(), grid.crs()) };
+        let key = |x| TileKey {
+            layer: "east".into(),
+            coord: TileCoord::new(1, x, 0),
+            format: OutputFormat::Png,
+            grid_dir: grid_dir(grid.name(), grid.crs()),
+        };
         for x in [0, 1] {
-            render_grid_tile(&r, &layer, &grid, TileCoord::new(1, x, 0), OutputFormat::Png).await.unwrap();
+            render_grid_tile(&r, &layer, &grid, TileCoord::new(1, x, 0), OutputFormat::Png)
+                .await
+                .unwrap();
         }
-        assert!(r.cache.get(&key(0), layer.cache.ttl).await.unwrap().is_none(), "empty tile was cached");
-        assert!(r.cache.get(&key(1), layer.cache.ttl).await.unwrap().is_some(), "data tile was not cached");
+        assert!(
+            r.cache.get(&key(0), layer.cache.ttl).await.unwrap().is_none(),
+            "empty tile was cached"
+        );
+        assert!(
+            r.cache.get(&key(1), layer.cache.ttl).await.unwrap().is_some(),
+            "data tile was not cached"
+        );
     }
 }

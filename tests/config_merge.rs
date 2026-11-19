@@ -205,8 +205,7 @@ serverr:  # typo
 #[test]
 fn json_schema_export_is_valid_json() {
     let schema_text = emit_json_schema().expect("emit schema");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&schema_text).expect("schema is valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(&schema_text).expect("schema is valid JSON");
 
     // Top-level shape from schemars: $schema, title, type, properties, definitions.
     let obj = parsed.as_object().expect("top-level object");

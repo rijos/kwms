@@ -115,8 +115,7 @@ mod tests {
 
     #[test]
     fn decodes_once_and_matches_keys_case_insensitively() {
-        let kvp = Kvp::parse("?SERVICE=WMS&crs=EPSG%3A3857&Layers=a%2Cb&Format=image%2Fpng+x&TRANSPARENT")
-            .unwrap();
+        let kvp = Kvp::parse("?SERVICE=WMS&crs=EPSG%3A3857&Layers=a%2Cb&Format=image%2Fpng+x&TRANSPARENT").unwrap();
         assert_eq!(kvp.get(Param::Service), Some("WMS"));
         assert_eq!(kvp.get(Param::Crs), Some("EPSG:3857"));
         assert_eq!(kvp.get(Param::Layers), Some("a,b"));
@@ -140,7 +139,10 @@ mod tests {
     #[test]
     fn rejects_duplicates_in_any_case() {
         let e = Kvp::parse("LAYERS=a&layers=b").unwrap_err();
-        assert_eq!((e.code, e.locator), (OgcCode::InvalidParameterValue, Some(Param::Layers)));
+        assert_eq!(
+            (e.code, e.locator),
+            (OgcCode::InvalidParameterValue, Some(Param::Layers))
+        );
         // Duplicates that only differ by encoding are duplicates too.
         assert!(Kvp::parse("crs=a&%63rs=b").is_err());
         // Unknown keys too — and their name is not echoed as a locator.

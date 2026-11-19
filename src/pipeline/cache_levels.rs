@@ -20,13 +20,20 @@ use crate::tile::TileGrid;
 
 /// The deepest durably cached level of `layer` in `grid` (`None`: no
 /// level), with a human-readable reason.
-pub fn layer_max_level(layer: &LayerConfig, grid: &dyn TileGrid, meta: &SourceMetadata) -> Result<(Option<u32>, String)> {
+pub fn layer_max_level(
+    layer: &LayerConfig,
+    grid: &dyn TileGrid,
+    meta: &SourceMetadata,
+) -> Result<(Option<u32>, String)> {
     let last = grid.level_count().saturating_sub(1);
     match layer.cache.max_level {
         CacheMaxLevel::Level(n) => Ok((Some(n.min(last)), format!("cache.max_level {n}"))),
         CacheMaxLevel::Mode(CacheMaxLevelMode::All) => Ok((Some(last), "cache.max_level all".into())),
         CacheMaxLevel::Mode(CacheMaxLevelMode::Auto) => {
-            let source = layer.sources.first().ok_or_else(|| anyhow!("layer '{}' has no sources", layer.name))?;
+            let source = layer
+                .sources
+                .first()
+                .ok_or_else(|| anyhow!("layer '{}' has no sources", layer.name))?;
             let fp = file_footprint(source, meta).context("measuring the source files for cache.max_level auto")?;
             auto_max_level(grid, meta, &fp)
         }
@@ -39,7 +46,12 @@ pub fn layer_max_level(layer: &LayerConfig, grid: &dyn TileGrid, meta: &SourceMe
 pub fn auto_max_level(grid: &dyn TileGrid, meta: &SourceMetadata, fp: &Footprint) -> Result<(Option<u32>, String)> {
     let b = meta.native_bbox;
     let (cx, cy) = ((b.minx + b.maxx) / 2.0, (b.miny + b.maxy) / 2.0);
-    let file = Bbox { minx: cx - fp.width / 2.0, miny: cy - fp.height / 2.0, maxx: cx + fp.width / 2.0, maxy: cy + fp.height / 2.0 };
+    let file = Bbox {
+        minx: cx - fp.width / 2.0,
+        miny: cy - fp.height / 2.0,
+        maxx: cx + fp.width / 2.0,
+        maxy: cy + fp.height / 2.0,
+    };
     let file = if meta.native_crs == *grid.crs() {
         file
     } else {
@@ -48,8 +60,14 @@ pub fn auto_max_level(grid: &dyn TileGrid, meta: &SourceMetadata, fp: &Footprint
     let (fw, fh) = (file.maxx - file.minx, file.maxy - file.miny);
     let (tw, th) = grid.tile_size();
     let tile = |l: u32| (f64::from(tw) * grid.resolution(l), f64::from(th) * grid.resolution(l));
-    let max = (0..grid.level_count()).rev().find(|&l| tile(l).0 > fw || tile(l).1 > fh);
-    let files = if fp.files == 1 { "the source is one file".to_string() } else { format!("{} source files", fp.files) };
+    let max = (0..grid.level_count())
+        .rev()
+        .find(|&l| tile(l).0 > fw || tile(l).1 > fh);
+    let files = if fp.files == 1 {
+        "the source is one file".to_string()
+    } else {
+        format!("{} source files", fp.files)
+    };
     let reason = match max {
         Some(l) => format!(
             "auto: {files} of ~{:.0} x {:.0} grid units; level {l} tiles are {:.0}, level {} tiles {:.0}",
@@ -74,7 +92,12 @@ mod tests {
     fn meta_2026() -> SourceMetadata {
         SourceMetadata {
             native_crs: Crs::new("EPSG:28992"),
-            native_bbox: Bbox { minx: 10_000.0, miny: 300_000.0, maxx: 290_000.0, maxy: 630_000.0 },
+            native_bbox: Bbox {
+                minx: 10_000.0,
+                miny: 300_000.0,
+                maxx: 290_000.0,
+                maxy: 630_000.0,
+            },
             band_count: 3,
             pixel_type: PixelType::U8,
             native_resolution: 0.08,
@@ -89,7 +112,11 @@ mod tests {
     #[test]
     fn auto_level_for_10km_tiles_in_rd() {
         let grid = lookup_grid("rd_new_quad", &Default::default()).unwrap();
-        let fp = Footprint { width: 10_000.0, height: 10_000.0, files: 498 };
+        let fp = Footprint {
+            width: 10_000.0,
+            height: 10_000.0,
+            files: 498,
+        };
         let (max, reason) = auto_max_level(grid.as_ref(), &meta_2026(), &fp).unwrap();
         assert_eq!(max, Some(6), "{reason}");
     }
@@ -99,7 +126,11 @@ mod tests {
     #[test]
     fn auto_level_reprojects_the_file_size() {
         let grid = lookup_grid("webmercator", &Default::default()).unwrap();
-        let fp = Footprint { width: 10_000.0, height: 10_000.0, files: 498 };
+        let fp = Footprint {
+            width: 10_000.0,
+            height: 10_000.0,
+            files: 498,
+        };
         let (max, reason) = auto_max_level(grid.as_ref(), &meta_2026(), &fp).unwrap();
         assert_eq!(max, Some(11), "{reason}");
     }
@@ -112,9 +143,15 @@ mod tests {
         layer.cache.max_level = CacheMaxLevel::Level(8);
         assert_eq!(layer_max_level(&layer, grid.as_ref(), &meta_2026()).unwrap().0, Some(8));
         layer.cache.max_level = CacheMaxLevel::Level(99);
-        assert_eq!(layer_max_level(&layer, grid.as_ref(), &meta_2026()).unwrap().0, Some(grid.level_count() - 1));
+        assert_eq!(
+            layer_max_level(&layer, grid.as_ref(), &meta_2026()).unwrap().0,
+            Some(grid.level_count() - 1)
+        );
         layer.cache.max_level = CacheMaxLevel::Mode(CacheMaxLevelMode::All);
-        assert_eq!(layer_max_level(&layer, grid.as_ref(), &meta_2026()).unwrap().0, Some(grid.level_count() - 1));
+        assert_eq!(
+            layer_max_level(&layer, grid.as_ref(), &meta_2026()).unwrap().0,
+            Some(grid.level_count() - 1)
+        );
         let auto: LayerConfig = serde_yaml::from_str(&format!("{yaml}cache: {{max_level: auto}}\n")).unwrap();
         assert_eq!(auto.cache.max_level, CacheMaxLevel::Mode(CacheMaxLevelMode::Auto));
     }

@@ -4,9 +4,9 @@
 //! with `mod common;`. Files under `tests/common/` aren't compiled as
 //! binaries by themselves, so this file just provides helpers.
 //!
-//! Capabilities tests bootstrap their golden XML on first run by setting
-//! `UPDATE_GOLDEN=1`. CI runs without the env var, so any future drift
-//! against the checked-in golden files fails the build.
+//! Capabilities tests bootstrap their pdok XML on first run by setting
+//! `UPDATE_PDOK=1`. CI runs without the env var, so any future drift
+//! against the checked-in pdok files fails the build.
 
 #![allow(dead_code)]
 
@@ -19,8 +19,8 @@ use axum::Router;
 use bytes::Bytes;
 use tower::ServiceExt;
 
-use kwms::cache::memory::MemoryTier;
 use kwms::cache::layered::LayeredCache;
+use kwms::cache::memory::MemoryTier;
 use kwms::config::load::load;
 use kwms::config::{Config, Secrets};
 use kwms::server::{router, AppState};
@@ -39,13 +39,11 @@ pub fn fixture_config_path(name: &str) -> PathBuf {
 }
 
 pub fn fixture_secrets_path(name: &str) -> PathBuf {
-    fixtures_dir()
-        .join("config")
-        .join(format!("{name}.secrets.yaml"))
+    fixtures_dir().join("config").join(format!("{name}.secrets.yaml"))
 }
 
-pub fn golden_path(rel: impl AsRef<Path>) -> PathBuf {
-    fixtures_dir().join("golden").join(rel)
+pub fn pdok_path(rel: impl AsRef<Path>) -> PathBuf {
+    fixtures_dir().join("pdok").join(rel)
 }
 
 pub fn sources_dir() -> PathBuf {
@@ -101,10 +99,7 @@ pub fn state_with_sources(name: &str) -> Arc<AppState> {
                     source_cfg.uri
                 )
             });
-            registry.insert(
-                source_cfg.uri.clone(),
-                Arc::new(src) as Arc<dyn kwms::source::Source>,
-            );
+            registry.insert(source_cfg.uri.clone(), Arc::new(src) as Arc<dyn kwms::source::Source>);
         }
     }
     let source_count = seen.len();
@@ -132,14 +127,9 @@ pub fn app(state: Arc<AppState>) -> Router {
 // ---------------------------------------------------------------------------
 
 pub async fn get(app: Router, uri: &str) -> Response<Body> {
-    app.oneshot(
-        Request::builder()
-            .uri(uri)
-            .body(Body::empty())
-            .expect("build request"),
-    )
-    .await
-    .expect("oneshot")
+    app.oneshot(Request::builder().uri(uri).body(Body::empty()).expect("build request"))
+        .await
+        .expect("oneshot")
 }
 
 pub async fn body_string(resp: Response<Body>) -> String {
@@ -162,33 +152,33 @@ pub fn content_type(resp: &Response<Body>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Golden-file workflow
+// Pdok-file workflow
 // ---------------------------------------------------------------------------
 
-/// Compare `produced` XML against the golden file at
-/// `tests/fixtures/golden/<rel>` (after whitespace normalization).
+/// Compare `produced` XML against the pdok file at
+/// `tests/fixtures/pdok/<rel>` (after whitespace normalization).
 ///
-/// Bootstrap / update workflow: set `UPDATE_GOLDEN=1` and re-run the
-/// test. The produced (normalized) output is written over the golden file
+/// Bootstrap / update workflow: set `UPDATE_PDOK=1` and re-run the
+/// test. The produced (normalized) output is written over the pdok file
 /// and the assertion is skipped. Commit the resulting diff after review.
-pub fn assert_xml_matches_golden(produced: &str, rel: &str) {
-    let golden = golden_path(rel);
+pub fn assert_xml_matches_pdok(produced: &str, rel: &str) {
+    let pdok = pdok_path(rel);
     let produced_norm = normalize_xml(produced);
 
-    if std::env::var("UPDATE_GOLDEN").is_ok() {
-        if let Some(parent) = golden.parent() {
-            std::fs::create_dir_all(parent).expect("create golden parent dir");
+    if std::env::var("UPDATE_PDOK").is_ok() {
+        if let Some(parent) = pdok.parent() {
+            std::fs::create_dir_all(parent).expect("create pdok parent dir");
         }
-        std::fs::write(&golden, &produced_norm).expect("write golden file");
-        eprintln!("(UPDATE_GOLDEN) wrote {}", golden.display());
+        std::fs::write(&pdok, &produced_norm).expect("write pdok file");
+        eprintln!("(UPDATE_PDOK) wrote {}", pdok.display());
         return;
     }
 
-    let expected = std::fs::read_to_string(&golden).unwrap_or_else(|e| {
+    let expected = std::fs::read_to_string(&pdok).unwrap_or_else(|e| {
         panic!(
-            "missing golden file `{}` ({e}). \
-             Bootstrap with UPDATE_GOLDEN=1 and commit the result.",
-            golden.display()
+            "missing pdok file `{}` ({e}). \
+             Bootstrap with UPDATE_PDOK=1 and commit the result.",
+            pdok.display()
         )
     });
     let expected_norm = normalize_xml(&expected);
@@ -197,42 +187,42 @@ pub fn assert_xml_matches_golden(produced: &str, rel: &str) {
         pretty_assertions::assert_eq!(
             expected_norm,
             produced_norm,
-            "XML differs from golden `{}`. \
-             If intended, regenerate with UPDATE_GOLDEN=1.",
-            golden.display()
+            "XML differs from pdok `{}`. \
+             If intended, regenerate with UPDATE_PDOK=1.",
+            pdok.display()
         );
     }
 }
 
-/// Compare `produced` bytes against the golden file at
-/// `tests/fixtures/golden/<rel>` (byte-exact).
+/// Compare `produced` bytes against the pdok file at
+/// `tests/fixtures/pdok/<rel>` (byte-exact).
 ///
-/// Same bootstrap workflow as [`assert_xml_matches_golden`].
-pub fn assert_bytes_match_golden(produced: &[u8], rel: &str) {
-    let golden = golden_path(rel);
+/// Same bootstrap workflow as [`assert_xml_matches_pdok`].
+pub fn assert_bytes_match_pdok(produced: &[u8], rel: &str) {
+    let pdok = pdok_path(rel);
 
-    if std::env::var("UPDATE_GOLDEN").is_ok() {
-        if let Some(parent) = golden.parent() {
-            std::fs::create_dir_all(parent).expect("create golden parent dir");
+    if std::env::var("UPDATE_PDOK").is_ok() {
+        if let Some(parent) = pdok.parent() {
+            std::fs::create_dir_all(parent).expect("create pdok parent dir");
         }
-        std::fs::write(&golden, produced).expect("write golden file");
-        eprintln!("(UPDATE_GOLDEN) wrote {}", golden.display());
+        std::fs::write(&pdok, produced).expect("write pdok file");
+        eprintln!("(UPDATE_PDOK) wrote {}", pdok.display());
         return;
     }
 
-    let expected = std::fs::read(&golden).unwrap_or_else(|e| {
+    let expected = std::fs::read(&pdok).unwrap_or_else(|e| {
         panic!(
-            "missing golden file `{}` ({e}). \
-             Bootstrap with UPDATE_GOLDEN=1 and commit the result.",
-            golden.display()
+            "missing pdok file `{}` ({e}). \
+             Bootstrap with UPDATE_PDOK=1 and commit the result.",
+            pdok.display()
         )
     });
 
     if expected != produced {
         panic!(
-            "byte mismatch against golden `{}` (expected {} bytes, got {} bytes). \
-             If intended, regenerate with UPDATE_GOLDEN=1.",
-            golden.display(),
+            "byte mismatch against pdok `{}` (expected {} bytes, got {} bytes). \
+             If intended, regenerate with UPDATE_PDOK=1.",
+            pdok.display(),
             expected.len(),
             produced.len()
         );

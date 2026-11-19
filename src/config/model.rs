@@ -157,8 +157,12 @@ impl WmtsConfig {
     /// The TileMatrixSet identifiers `grid` is published under: its
     /// configured names in order, else its default name.
     pub fn tile_matrix_set_ids(&self, grid: &str) -> Vec<String> {
-        let named: Vec<String> =
-            self.tile_matrix_sets.iter().filter(|t| t.grid == grid).map(|t| t.identifier.clone()).collect();
+        let named: Vec<String> = self
+            .tile_matrix_sets
+            .iter()
+            .filter(|t| t.grid == grid)
+            .map(|t| t.identifier.clone())
+            .collect();
         if named.is_empty() {
             vec![crate::tile::grid::tile_matrix_set_name(grid).to_string()]
         } else {
@@ -248,7 +252,10 @@ pub struct JpegSettings {
 
 impl Default for JpegSettings {
     fn default() -> Self {
-        Self { quality: default_jpeg_quality(), progressive: false }
+        Self {
+            quality: default_jpeg_quality(),
+            progressive: false,
+        }
     }
 }
 
@@ -266,7 +273,9 @@ pub struct PngSettings {
 
 impl Default for PngSettings {
     fn default() -> Self {
-        Self { compression: default_png_compression() }
+        Self {
+            compression: default_png_compression(),
+        }
     }
 }
 
@@ -286,7 +295,10 @@ pub struct WebpSettings {
 
 impl Default for WebpSettings {
     fn default() -> Self {
-        Self { quality: default_webp_quality(), lossless: false }
+        Self {
+            quality: default_webp_quality(),
+            lossless: false,
+        }
     }
 }
 
@@ -308,7 +320,11 @@ pub struct GeoTiffSettings {
 
 impl Default for GeoTiffSettings {
     fn default() -> Self {
-        Self { compress: GeoTiffCompression::default(), predictor: default_geotiff_predictor(), tiled: true }
+        Self {
+            compress: GeoTiffCompression::default(),
+            predictor: default_geotiff_predictor(),
+            tiled: true,
+        }
     }
 }
 
@@ -383,11 +399,8 @@ impl Default for ServerConfig {
 impl ServerConfig {
     /// Effective render concurrency (`render_concurrency` or the CPU count).
     pub fn effective_render_concurrency(&self) -> usize {
-        self.render_concurrency.unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        })
+        self.render_concurrency
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
     }
 }
 
@@ -444,7 +457,10 @@ impl Default for GlobalCacheConfig {
 }
 
 fn default_tiers() -> Vec<TierConfig> {
-    vec![TierConfig::Memory(MemoryTierConfig::default()), TierConfig::Store(StoreTierConfig::default())]
+    vec![
+        TierConfig::Memory(MemoryTierConfig::default()),
+        TierConfig::Store(StoreTierConfig::default()),
+    ]
 }
 
 /// One cache tier.
@@ -467,7 +483,9 @@ pub struct MemoryTierConfig {
 
 impl Default for MemoryTierConfig {
     fn default() -> Self {
-        Self { max_bytes: default_memory_max() }
+        Self {
+            max_bytes: default_memory_max(),
+        }
     }
 }
 
@@ -498,7 +516,11 @@ impl Default for StoreTierConfig {
     fn default() -> Self {
         let mut options = HashMap::new();
         options.insert("root".into(), "/var/cache/kwms".into());
-        Self { backend: "fs".into(), options, credentials: None }
+        Self {
+            backend: "fs".into(),
+            options,
+            credentials: None,
+        }
     }
 }
 
@@ -774,13 +796,18 @@ mod tier_config_tests {
     fn tiers_parse_in_order_and_reject_typos() {
         let yaml = "tiers:\n  - type: memory\n    max_bytes: 64MB\n  - type: store\n    backend: fs\n    options: {root: /x}\n  - type: store\n    backend: azblob\n    credentials: c\n";
         let cfg: GlobalCacheConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(matches!(&cfg.tiers[..], [TierConfig::Memory(m), TierConfig::Store(a), TierConfig::Store(b)]
-            if m.max_bytes == "64MB" && a.backend == "fs" && b.credentials.as_deref() == Some("c")));
+        assert!(
+            matches!(&cfg.tiers[..], [TierConfig::Memory(m), TierConfig::Store(a), TierConfig::Store(b)]
+            if m.max_bytes == "64MB" && a.backend == "fs" && b.credentials.as_deref() == Some("c"))
+        );
 
-        for bad in ["tiers: [{type: memory, max_byte: 1MB}]", "tiers: [{type: disk}]", "hot: {max_bytes: 1MB}"] {
+        for bad in [
+            "tiers: [{type: memory, max_byte: 1MB}]",
+            "tiers: [{type: disk}]",
+            "hot: {max_bytes: 1MB}",
+        ] {
             assert!(serde_yaml::from_str::<GlobalCacheConfig>(bad).is_err(), "{bad}");
         }
         assert_eq!(GlobalCacheConfig::default().tiers.len(), 2);
     }
 }
-

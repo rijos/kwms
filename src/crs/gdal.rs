@@ -25,8 +25,7 @@ use crate::ffi;
 /// will read/fetch. Only ever call this with config-derived CRSes: request
 /// CRSes are resolved by `protocol::catalog`, never parsed here.
 fn spatial_ref(crs: &Crs) -> Result<SpatialRef> {
-    SpatialRef::from_definition(crs.as_str())
-        .with_context(|| format!("invalid or unknown CRS '{}'", crs.as_str()))
+    SpatialRef::from_definition(crs.as_str()).with_context(|| format!("invalid or unknown CRS '{}'", crs.as_str()))
 }
 
 pub fn is_geographic(crs: &Crs) -> Result<bool> {
@@ -275,13 +274,20 @@ mod tests {
     #[test]
     fn transform_coord_amsterdam_to_webmercator() {
         let c = transform_coord(Coord { x: 4.9, y: 52.37 }, &epsg(4326), &epsg(3857)).unwrap();
-        assert!((c.x - 545_465.5).abs() < 1.0 && (c.y - 6_867_304.7).abs() < 1.0, "{c:?}");
+        assert!(
+            (c.x - 545_465.5).abs() < 1.0 && (c.y - 6_867_304.7).abs() < 1.0,
+            "{c:?}"
+        );
     }
 
     #[test]
     fn axis_order_comes_from_gdal_for_geographic_and_projected() {
         assert_eq!(native_axis_order(&epsg(4326)).unwrap(), AxisOrder::YX);
-        assert_eq!(native_axis_order(&epsg(3035)).unwrap(), AxisOrder::YX, "LAEA is northing-first");
+        assert_eq!(
+            native_axis_order(&epsg(3035)).unwrap(),
+            AxisOrder::YX,
+            "LAEA is northing-first"
+        );
         assert_eq!(native_axis_order(&epsg(3857)).unwrap(), AxisOrder::XY);
         assert_eq!(native_axis_order(&epsg(28992)).unwrap(), AxisOrder::XY);
         assert_eq!(native_axis_order(&Crs::new("CRS:84")).unwrap(), AxisOrder::XY);
@@ -292,7 +298,10 @@ mod tests {
     fn same_crs_uses_gdal_identity() {
         assert!(same_crs(&epsg(4326), &Crs::new("CRS:84")).unwrap());
         assert!(!same_crs(&epsg(4326), &epsg(3857)).unwrap());
-        assert!(same_crs(&Crs::new("garbage"), &epsg(3857)).is_err(), "parse failure is an error");
+        assert!(
+            same_crs(&Crs::new("garbage"), &epsg(3857)).is_err(),
+            "parse failure is an error"
+        );
     }
 
     #[test]
@@ -302,7 +311,10 @@ mod tests {
         let esri = Crs::new(sr.to_wkt().unwrap());
         assert_eq!(identify_crs(&esri).unwrap(), epsg(28992));
         assert_eq!(identify_crs(&epsg(3857)).unwrap(), epsg(3857));
-        assert!(identify_crs(&Crs::new("not-a-crs")).is_err(), "GDAL failure is an error, not a fallback");
+        assert!(
+            identify_crs(&Crs::new("not-a-crs")).is_err(),
+            "GDAL failure is an error, not a fallback"
+        );
     }
 
     #[test]

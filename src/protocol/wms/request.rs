@@ -162,7 +162,10 @@ fn bbox(s: &str) -> Result<[f64; 4], OgcError> {
         out[i] = p.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or(BAD)?;
     }
     if !(out[0] < out[2] && out[1] < out[3]) {
-        return Err(OgcError::invalid(Param::Bbox, "BBOX minimum must be less than maximum on both axes"));
+        return Err(OgcError::invalid(
+            Param::Bbox,
+            "BBOX minimum must be less than maximum on both axes",
+        ));
     }
     Ok(out)
 }
@@ -183,7 +186,11 @@ fn format(s: &str) -> Result<OutputFormat, OgcError> {
         "image/jpeg" => Ok(OutputFormat::Jpeg),
         "image/webp" => Ok(OutputFormat::Webp),
         "image/tiff" | "image/tiff; application=geotiff" | "image/geotiff" => Ok(OutputFormat::GeoTiff),
-        _ => Err(OgcError::new(OgcCode::InvalidFormat, Some(Param::Format), "FORMAT is not supported")),
+        _ => Err(OgcError::new(
+            OgcCode::InvalidFormat,
+            Some(Param::Format),
+            "FORMAT is not supported",
+        )),
     }
 }
 
@@ -191,7 +198,10 @@ fn boolean(s: &str) -> Result<bool, OgcError> {
     match s.to_ascii_lowercase().as_str() {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
-        _ => Err(OgcError::invalid(Param::Transparent, "TRANSPARENT must be TRUE or FALSE")),
+        _ => Err(OgcError::invalid(
+            Param::Transparent,
+            "TRANSPARENT must be TRUE or FALSE",
+        )),
     }
 }
 
@@ -245,11 +255,7 @@ mod tests {
         assert_eq!(m.version, WmsVersion::V1_1_1);
         assert_eq!(m.layers, vec!["ortho"]);
         assert_eq!(m.crs, "EPSG:4326", "CRS is kept verbatim for the validator");
-        assert_eq!(
-            m.bbox,
-            [3.0, 50.0, 7.0, 54.0],
-            "wire order, not swapped here"
-        );
+        assert_eq!(m.bbox, [3.0, 50.0, 7.0, 54.0], "wire order, not swapped here");
         assert_eq!((m.width, m.height, m.format), (256, 256, OutputFormat::Png));
     }
 
@@ -274,15 +280,9 @@ mod tests {
             replace("VERSION=1.1.1", "VERSION=1.2.0").locator_name(),
             Some("VERSION")
         );
-        assert_eq!(
-            replace("image/png", "image/gif").code,
-            OgcCode::InvalidFormat
-        );
+        assert_eq!(replace("image/png", "image/gif").code, OgcCode::InvalidFormat);
         assert_eq!(replace("SRS=", "CRS=").locator_name(), Some("CRS"));
-        assert_eq!(
-            replace("LAYERS=ortho", "LAYERS=").locator_name(),
-            Some("LAYERS")
-        );
+        assert_eq!(replace("LAYERS=ortho", "LAYERS=").locator_name(), Some("LAYERS"));
         for (from, to, loc) in [
             ("WIDTH=256", "WIDTH=0", "WIDTH"),
             ("WIDTH=256", "WIDTH=+5", "WIDTH"),
@@ -293,18 +293,10 @@ mod tests {
             ("3.0,50.0,7.0,54.0", "7,50,3,54", "BBOX"),
             ("3.0,50.0,7.0,54.0", "1,2,3", "BBOX"),
         ] {
-            assert_eq!(
-                replace(from, to).locator_name(),
-                Some(loc),
-                "{from} -> {to}"
-            );
+            assert_eq!(replace(from, to).locator_name(), Some(loc), "{from} -> {to}");
         }
         assert!(err(&format!("{MAP_111}&BGCOLOR=0xFFF")).locator_name() == Some("BGCOLOR"));
-        assert!(
-            err(&format!("{MAP_111}&TRANSPARENT=maybe"))
-                .locator_name()
-                == Some("TRANSPARENT")
-        );
+        assert!(err(&format!("{MAP_111}&TRANSPARENT=maybe")).locator_name() == Some("TRANSPARENT"));
         assert_eq!(err(&format!("{MAP_111}&LAYERS=again")).locator_name(), Some("LAYERS"));
     }
 
@@ -323,13 +315,9 @@ mod tests {
                 version: WmsVersion::V1_3_0
             }
         );
+        assert_eq!(err("REQUEST=GetLegendGraphic").code, OgcCode::OperationNotSupported);
         assert_eq!(
-            err("REQUEST=GetLegendGraphic").code,
-            OgcCode::OperationNotSupported
-        );
-        assert_eq!(
-            err("SERVICE=WMTS&REQUEST=GetCapabilities")
-                .locator_name(),
+            err("SERVICE=WMTS&REQUEST=GetCapabilities").locator_name(),
             Some("SERVICE")
         );
     }

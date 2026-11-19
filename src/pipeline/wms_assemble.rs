@@ -107,9 +107,18 @@ pub async fn serve_get_map(r: &Renderer, q: &WmsGetMap<'_>) -> Result<Bytes> {
     // blocking, so it runs on the bounded render pool.
     let resampling = layer_resampling(layer)?;
     let nodata = r.layer_nodata(layer);
-    let target = Target { crs: crs.clone(), bbox, width, height, format: q.format(), opts: r.encode_opts(layer, q.format()) };
+    let target = Target {
+        crs: crs.clone(),
+        bbox,
+        width,
+        height,
+        format: q.format(),
+        opts: r.encode_opts(layer, q.format()),
+    };
     r.cpu
-        .run("wms_composite", move || composite_tiles(&grid, &tile_bytes, &target, resampling, nodata))
+        .run("wms_composite", move || {
+            composite_tiles(&grid, &tile_bytes, &target, resampling, nodata)
+        })
         .await
 }
 
@@ -185,18 +194,18 @@ pub(crate) fn tile_range_for_bbox(grid: &dyn TileGrid, level: u32, bbox: &Bbox) 
         .zip(span(row_lo, row_hi))
         .and_then(|(c, r)| c.checked_mul(r))
         .ok_or_else(|| anyhow!("internal: tile range is inverted or overflows"))?;
-    Ok(Some(TileRange { level, cols: (col_lo, col_hi), rows: (row_lo, row_hi), count }))
+    Ok(Some(TileRange {
+        level,
+        cols: (col_lo, col_hi),
+        rows: (row_lo, row_hi),
+        count,
+    }))
 }
 
 /// Inclusive `(col, row)` tile rectangle covering `bbox` at `level`.
 /// Errors (as a client error) when the bbox misses the grid entirely or
 /// would need more than `max_tiles` tiles.
-fn tile_coords_for_bbox(
-    grid: &Arc<dyn TileGrid>,
-    level: u32,
-    bbox: &Bbox,
-    max_tiles: u64,
-) -> Result<Vec<TileCoord>> {
+fn tile_coords_for_bbox(grid: &Arc<dyn TileGrid>, level: u32, bbox: &Bbox, max_tiles: u64) -> Result<Vec<TileCoord>> {
     let range = tile_range_for_bbox(grid.as_ref(), level, bbox)?
         .ok_or_else(|| client_error("BBOX does not intersect the layer's grid"))?;
     if range.count > max_tiles {
@@ -231,8 +240,7 @@ fn composite_tiles(
     let mut datasets = Vec::with_capacity(tiles.len());
     for (coord, bytes) in tiles {
         let path = vsimem_path("wms-tile", ext);
-        create_mem_file(&path, bytes.to_vec())
-            .with_context(|| format!("composite: stage tile {coord:?}"))?;
+        create_mem_file(&path, bytes.to_vec()).with_context(|| format!("composite: stage tile {coord:?}"))?;
         files.push(MemFile(path.clone()));
         let mut ds = Dataset::open(&path).with_context(|| format!("composite: open tile {coord:?}"))?;
         // Web tile formats carry no georeferencing; place each tile on its cell.
@@ -243,22 +251,44 @@ fn composite_tiles(
         set_nodata(&ds, nodata)?;
         datasets.push(ds);
     }
-    let first = datasets.first().ok_or_else(|| anyhow!("composite_tiles called with no tiles"))?;
+    let first = datasets
+        .first()
+        .ok_or_else(|| anyhow!("composite_tiles called with no tiles"))?;
     let tile_bands = u32::try_from(first.raster_count()).context("tile band count overflow")?;
     let pixel_type = pixel_type_from_gdal(first.rasterband(1).context("composite: tile band 1")?.band_type())?;
     // PNG/WebP tiles carry alpha (no-data areas); JPEG tiles have it baked
     // in as white. The output always gets an alpha band: it also marks
     // pixels no tile covers.
     let src_alpha = tile_bands > 1
-        && first.rasterband(tile_bands as usize).context("composite: last tile band")?.color_interpretation()
+        && first
+            .rasterband(tile_bands as usize)
+            .context("composite: last tile band")?
+            .color_interpretation()
             == gdal::raster::ColorInterpretation::AlphaBand;
-    let colour_bands = if src_alpha { tile_bands.saturating_sub(1) } else { tile_bands };
+    let colour_bands = if src_alpha {
+        tile_bands.saturating_sub(1)
+    } else {
+        tile_bands
+    };
 
     let mut dst = create_georeferenced_mem(
-        pixel_type, req.width, req.height, colour_bands.saturating_add(1), &req.crs, &req.bbox, nodata,
+        pixel_type,
+        req.width,
+        req.height,
+        colour_bands.saturating_add(1),
+        &req.crs,
+        &req.bbox,
+        nodata,
     )?;
     let sources: Vec<&Dataset> = datasets.iter().collect();
-    let opts = WarpOptions { resampling, src_nodata: nodata, dst_nodata: nodata, src_alpha, dst_alpha: true, black_is_gap: false };
+    let opts = WarpOptions {
+        resampling,
+        src_nodata: nodata,
+        dst_nodata: nodata,
+        src_alpha,
+        dst_alpha: true,
+        black_is_gap: false,
+    };
     warp(&sources, &mut dst, &opts).context("composite: warping tiles into GetMap extent")?;
     drop(sources);
     drop(datasets);
@@ -288,17 +318,16 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use crate::cache::memory::MemoryTier;
+    use crate::cache::LayeredCache;
     use crate::config::model::{
-        CacheMode, Config, LayerCacheConfig, LayerConfig, MaxResolution, MaxResolutionMode,
-        SourceConfig,
+        CacheMode, Config, LayerCacheConfig, LayerConfig, MaxResolution, MaxResolutionMode, SourceConfig,
     };
     use crate::crs::{Bbox, Crs};
     use crate::encode::{encode, EncodeOpts, GeoRef, OutputFormat};
+    use crate::pipeline::cpu::CpuPool;
     use crate::protocol::catalog::Catalog;
     use crate::protocol::wms::request::parse;
     use crate::protocol::wms::validate::{validate, WmsQuery};
-    use crate::cache::LayeredCache;
-    use crate::pipeline::cpu::CpuPool;
     use crate::source::gdal::GdalSource;
     use crate::source::{PixelBuffer, PixelType, Source, SourceRegistry};
 
@@ -407,7 +436,10 @@ mod tests {
             Arc::new(registry),
             Arc::new(fresh_cache()),
             CpuPool::new(2, Duration::from_secs(5)),
-            [(uri.clone(), Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>)],
+            [(
+                uri.clone(),
+                Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>,
+            )],
         )
         .unwrap();
         let catalog = world_catalog(&uri);
@@ -415,15 +447,9 @@ mod tests {
         let half = 20_037_508.342_789_2_f64;
         let req = world_request(&catalog, 256, 256, [-half, -half, half, half]);
 
-        let bytes = serve_get_map(&r, &req)
-            .await
-            .expect("serve_get_map");
+        let bytes = serve_get_map(&r, &req).await.expect("serve_get_map");
         assert!(bytes.len() > 8, "PNG too small: {} bytes", bytes.len());
-        assert_eq!(
-            &bytes[..4],
-            &[0x89, 0x50, 0x4E, 0x47],
-            "PNG magic missing"
-        );
+        assert_eq!(&bytes[..4], &[0x89, 0x50, 0x4E, 0x47], "PNG magic missing");
 
         // Round-trip the response through GDAL via /vsimem/ and confirm size.
         let path = vsimem_path("wms-test", "png");
@@ -443,10 +469,21 @@ mod tests {
         let tmp = write_world_mercator_fixture();
         let uri = tmp.path().to_string_lossy().into_owned();
         let mut registry = SourceRegistry::new();
-        let cfg = SourceConfig { uri: uri.clone(), credentials: None, ..Default::default() };
-        registry.insert(uri.clone(), Arc::new(GdalSource::open(&cfg).unwrap()) as Arc<dyn Source>);
+        let cfg = SourceConfig {
+            uri: uri.clone(),
+            credentials: None,
+            ..Default::default()
+        };
+        registry.insert(
+            uri.clone(),
+            Arc::new(GdalSource::open(&cfg).unwrap()) as Arc<dyn Source>,
+        );
         let grid: Arc<dyn TileGrid> = Arc::new(crate::tile::grid::WebMercator::new());
-        let limits = [(("world".to_string(), "webmercator".to_string()), (Some(0), "test".to_string()))].into();
+        let limits = [(
+            ("world".to_string(), "webmercator".to_string()),
+            (Some(0), "test".to_string()),
+        )]
+        .into();
         let r = Renderer::new(
             Arc::new(registry),
             Arc::new(fresh_cache()),
@@ -472,12 +509,26 @@ mod tests {
         let size = Dataset::open(&path).unwrap().raster_size();
         let _ = unlink_mem_file(&path);
         assert_eq!(size, (300, 200), "direct reads render at exactly the requested size");
-        assert!(r.cache.get(&level0_tile, Duration::from_secs(60)).await.unwrap().is_none(), "direct read cached a tile");
+        assert!(
+            r.cache
+                .get(&level0_tile, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none(),
+            "direct read cached a tile"
+        );
 
         // The whole world at 256x256 = level-0 resolution -> tiles.
         let req = world_request(&catalog, 256, 256, [-half, -half, half, half]);
         serve_get_map(&r, &req).await.unwrap();
-        assert!(r.cache.get(&level0_tile, Duration::from_secs(60)).await.unwrap().is_some(), "level-0 tile not used");
+        assert!(
+            r.cache
+                .get(&level0_tile, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_some(),
+            "level-0 tile not used"
+        );
     }
 
     fn world_catalog(uri: &str) -> Catalog {
@@ -509,13 +560,23 @@ mod tests {
         let mut registry = SourceRegistry::new();
         registry.insert(
             uri.clone(),
-            Arc::new(GdalSource::open(&SourceConfig { uri: uri.clone(), credentials: None, ..Default::default() }).unwrap()),
+            Arc::new(
+                GdalSource::open(&SourceConfig {
+                    uri: uri.clone(),
+                    credentials: None,
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
         );
         let r = Renderer::new(
             Arc::new(registry),
             Arc::new(fresh_cache()),
             CpuPool::new(1, Duration::from_secs(5)),
-            [(uri.clone(), Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>)],
+            [(
+                uri.clone(),
+                Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>,
+            )],
         )
         .unwrap();
         let catalog = world_catalog(&uri);
@@ -533,7 +594,10 @@ mod tests {
     #[test]
     fn huge_or_skewed_bboxes_are_clamped_to_a_bounded_tile_set() {
         let grid: Arc<dyn TileGrid> = Arc::new(crate::tile::grid::WebMercator::new());
-        let pyramid = Pyramid { grid: grid.clone(), max_level: 21 };
+        let pyramid = Pyramid {
+            grid: grid.clone(),
+            max_level: 21,
+        };
         let half = 20_037_508.342_789_2_f64;
         let cases = [
             // Used to yield ~i64::MAX tile coordinates and abort the process.
@@ -568,21 +632,42 @@ mod tests {
         use proptest::prelude::*;
         use proptest::test_runner::{Config as PtConfig, TestRunner};
 
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
         let tmp = write_world_mercator_fixture();
         let uri = tmp.path().to_string_lossy().into_owned();
         let mut registry = SourceRegistry::new();
-        registry.insert(uri.clone(), Arc::new(GdalSource::open(&SourceConfig { uri: uri.clone(), credentials: None, ..Default::default() }).unwrap()));
+        registry.insert(
+            uri.clone(),
+            Arc::new(
+                GdalSource::open(&SourceConfig {
+                    uri: uri.clone(),
+                    credentials: None,
+                    ..Default::default()
+                })
+                .unwrap(),
+            ),
+        );
         let r = Renderer::new(
             Arc::new(registry),
             Arc::new(fresh_cache()),
             CpuPool::new(2, Duration::from_secs(30)),
-            [(uri.clone(), Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>)],
+            [(
+                uri.clone(),
+                Arc::new(crate::tile::grid::WebMercator::new()) as Arc<dyn TileGrid>,
+            )],
         )
         .unwrap();
         let mut layer = build_layer("world", &uri);
         layer.formats.push(OutputFormat::GeoTiff);
-        let catalog = Catalog::build(&Config { layers: vec![layer], ..Config::default() }).unwrap();
+        let catalog = Catalog::build(&Config {
+            layers: vec![layer],
+            ..Config::default()
+        })
+        .unwrap();
 
         let half = 20_037_508.342_789_2_f64;
         let edge = prop_oneof![
@@ -621,7 +706,11 @@ mod tests {
         );
         // How many cases got past validation into the renderer.
         let rendered = std::sync::atomic::AtomicU32::new(0);
-        let mut runner = TestRunner::new(PtConfig { cases: 128, failure_persistence: None, ..PtConfig::default() });
+        let mut runner = TestRunner::new(PtConfig {
+            cases: 128,
+            failure_persistence: None,
+            ..PtConfig::default()
+        });
         runner
             .run(&strategy, |([a, b, c, d], w, h, tiff, v111)| {
                 // Mostly well-ordered boxes: an inverted one only tests stage 1.

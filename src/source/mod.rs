@@ -163,12 +163,14 @@ impl PixelBuffer {
         let floats = |size: usize, read: fn(&[u8]) -> Option<f64>| {
             let chunks = self.data.chunks_exact(size);
             chunks.remainder().is_empty()
-                && chunks.into_iter().all(|c| {
-                    read(c).is_some_and(|v| if fill.is_nan() { v.is_nan() } else { v == fill })
-                })
+                && chunks
+                    .into_iter()
+                    .all(|c| read(c).is_some_and(|v| if fill.is_nan() { v.is_nan() } else { v == fill }))
         };
         match self.pixel_type {
-            PixelType::F32 => floats(4, |c| <[u8; 4]>::try_from(c).ok().map(|b| f64::from(f32::from_ne_bytes(b)))),
+            PixelType::F32 => floats(4, |c| {
+                <[u8; 4]>::try_from(c).ok().map(|b| f64::from(f32::from_ne_bytes(b)))
+            }),
             PixelType::F64 => floats(8, |c| <[u8; 8]>::try_from(c).ok().map(f64::from_ne_bytes)),
             _ => match Self::filled(1, 1, 1, self.pixel_type, fill, None) {
                 Ok(one) => {
@@ -205,16 +207,28 @@ mod tests {
     use super::*;
 
     fn buffer(pixel_type: PixelType, data: Vec<u8>, nodata: Option<f64>) -> PixelBuffer {
-        PixelBuffer { width: 1, height: 1, bands: 1, pixel_type, data: Bytes::from(data), nodata, alpha: None }
+        PixelBuffer {
+            width: 1,
+            height: 1,
+            bands: 1,
+            pixel_type,
+            data: Bytes::from(data),
+            nodata,
+            alpha: None,
+        }
     }
 
     #[test]
     fn is_all_fill_matches_nodata_or_zero() {
         // No nodata: all zeros is "no data"; any non-zero sample is data.
-        assert!(PixelBuffer::filled(4, 4, 3, PixelType::U8, 0.0, None).unwrap().is_all_fill());
+        assert!(PixelBuffer::filled(4, 4, 3, PixelType::U8, 0.0, None)
+            .unwrap()
+            .is_all_fill());
         assert!(!buffer(PixelType::U8, vec![0, 0, 1], None).is_all_fill());
         // Integer nodata, compared after the same cast `filled` uses.
-        assert!(PixelBuffer::filled(2, 2, 1, PixelType::I16, -9999.0, Some(-9999.0)).unwrap().is_all_fill());
+        assert!(PixelBuffer::filled(2, 2, 1, PixelType::I16, -9999.0, Some(-9999.0))
+            .unwrap()
+            .is_all_fill());
         assert!(!buffer(PixelType::I16, to_ne_bytes(vec![-9999i16, 0]), Some(-9999.0)).is_all_fill());
         // Float nodata by value; NaN nodata matches any NaN payload.
         assert!(buffer(PixelType::F32, to_ne_bytes(vec![-3.5f32; 3]), Some(-3.5)).is_all_fill());

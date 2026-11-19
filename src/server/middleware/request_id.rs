@@ -41,7 +41,10 @@ impl RequestId {
 
     #[cfg(test)]
     pub fn for_tests(id: &str) -> Self {
-        Self { id: id.to_string(), upstream: None }
+        Self {
+            id: id.to_string(),
+            upstream: None,
+        }
     }
 }
 
@@ -58,7 +61,8 @@ fn fresh_id() -> String {
 fn is_acceptable_id(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// `axum::middleware::from_fn`-compatible handler.
@@ -70,7 +74,10 @@ pub async fn middleware(mut req: Request<Body>, next: Next) -> Response {
         .filter(|s| is_acceptable_id(s))
         .map(str::to_string);
     let id = fresh_id();
-    req.extensions_mut().insert(RequestId { id: id.clone(), upstream });
+    req.extensions_mut().insert(RequestId {
+        id: id.clone(),
+        upstream,
+    });
 
     let mut response = next.run(req).await;
     if let Ok(value) = HeaderValue::from_str(&id) {

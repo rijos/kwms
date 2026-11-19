@@ -30,10 +30,7 @@ pub fn wmts_code(code: OgcCode) -> (u16, &'static str) {
 /// `(HTTP status, ExceptionReport XML)` for a request error.
 pub fn for_error(err: &OgcError) -> (u16, String) {
     let (status, code) = wmts_code(err.code);
-    (
-        status,
-        exception_report(code, err.locator_name(), err.message),
-    )
+    (status, exception_report(code, err.locator_name(), err.message))
 }
 
 /// An `ExceptionReport` document (all text XML-escaped).

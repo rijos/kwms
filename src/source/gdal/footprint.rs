@@ -36,15 +36,22 @@ pub struct Footprint {
 pub fn file_footprint(source: &SourceConfig, meta: &SourceMetadata) -> Result<Footprint> {
     let Some(index) = tile_index_path(&source.uri) else {
         let b = meta.native_bbox;
-        return Ok(Footprint { width: b.maxx - b.minx, height: b.maxy - b.miny, files: 1 });
+        return Ok(Footprint {
+            width: b.maxx - b.minx,
+            height: b.maxy - b.miny,
+            files: 1,
+        });
     };
-    index_footprint(index, source, &meta.native_crs)
-        .with_context(|| format!("measuring the tiles of index '{index}'"))
+    index_footprint(index, source, &meta.native_crs).with_context(|| format!("measuring the tiles of index '{index}'"))
 }
 
 /// The vector index behind a GTI URI, if the URI is one.
 pub(crate) fn tile_index_path(uri: &str) -> Option<&str> {
-    if let Some(rest) = uri.get(..4).filter(|p| p.eq_ignore_ascii_case("GTI:")).map(|_| &uri[4..]) {
+    if let Some(rest) = uri
+        .get(..4)
+        .filter(|p| p.eq_ignore_ascii_case("GTI:"))
+        .map(|_| &uri[4..])
+    {
         return Some(rest);
     }
     let lower = uri.to_ascii_lowercase();
@@ -60,7 +67,9 @@ fn index_footprint(index: &str, source: &SourceConfig, native: &Crs) -> Result<F
     // Same layer choice as GTI: the LAYER open option, else the only layer.
     let wanted = source.open_options.iter().find_map(|o| o.strip_prefix("LAYER="));
     let mut layer = match wanted {
-        Some(name) => ds.layer_by_name(name).with_context(|| format!("index has no layer '{name}'"))?,
+        Some(name) => ds
+            .layer_by_name(name)
+            .with_context(|| format!("index has no layer '{name}'"))?,
         None if ds.layer_count() == 1 => ds.layer(0)?,
         None => bail!("index has {} layers; set the LAYER open option", ds.layer_count()),
     };
@@ -116,9 +125,19 @@ mod tests {
         if !Path::new(index).exists() {
             return;
         }
-        let src = SourceConfig { uri: format!("GTI:{index}"), ..Default::default() };
+        let src = SourceConfig {
+            uri: format!("GTI:{index}"),
+            ..Default::default()
+        };
         let fp = index_footprint(index, &src, &Crs::new("EPSG:28992")).unwrap();
-        assert_eq!(fp, Footprint { width: 10_000.0, height: 10_000.0, files: 498 });
+        assert_eq!(
+            fp,
+            Footprint {
+                width: 10_000.0,
+                height: 10_000.0,
+                files: 498
+            }
+        );
     }
 
     #[test]

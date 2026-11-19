@@ -7,9 +7,9 @@ The repository has two layers of tests, mirroring Rust convention:
 
 See [Module layout](./module-layout.md) for the directory tree, including the `tests/` structure.
 
-## Capabilities rendering (golden-XML tests)
+## Capabilities rendering (pdok-XML tests)
 
-`tests/capabilities.rs` covers GetCapabilities generation for all four protocol flavors. Each test loads a fixture config, asks the protocol layer to render the capabilities document, and asserts the output matches a golden XML file (with insignificant whitespace and attribute order normalized before diffing).
+`tests/capabilities.rs` covers GetCapabilities generation for all four protocol flavors. Each test loads a fixture config, asks the protocol layer to render the capabilities document, and asserts the output matches a pdok XML file (with insignificant whitespace and attribute order normalized before diffing).
 
 ### Fixture configs
 
@@ -25,22 +25,22 @@ See [Module layout](./module-layout.md) for the directory tree, including the `t
 
 For each fixture, the test file asserts:
 
-- **WMS 1.1.1**: output matches `tests/fixtures/golden/capabilities/wms_111_<fixture>.xml`. Axis order in BoundingBox elements is x,y for all CRSes (WMS 1.1.1 convention).
-- **WMS 1.3.0**: output matches `wms_130_<fixture>.xml`. Geographic CRSes use lat,lon axis order in BoundingBox elements (1.3.0 convention); projected CRSes stay x,y. The 1.1.1 vs 1.3.0 difference is baked into separate golden files, not computed at test time.
+- **WMS 1.1.1**: output matches `tests/fixtures/pdok/capabilities/wms_111_<fixture>.xml`. Axis order in BoundingBox elements is x,y for all CRSes (WMS 1.1.1 convention).
+- **WMS 1.3.0**: output matches `wms_130_<fixture>.xml`. Geographic CRSes use lat,lon axis order in BoundingBox elements (1.3.0 convention); projected CRSes stay x,y. The 1.1.1 vs 1.3.0 difference is baked into separate pdok files, not computed at test time.
 - **WMTS 1.0.0**: output matches `wmts_<fixture>.xml`, including the full `TileMatrixSet` definitions derived from each grid + `max_resolution`. Verifies scale denominators, top-left corners, tile matrix counts.
 - **TMS 1.0.0**: root document (`/tms/1.0.0/`) and per-layer documents (`/tms/1.0.0/{layer}/`) match `tms_root_<fixture>.xml` and `tms_<layer>_<fixture>.xml`.
 
-### Updating golden files
+### Updating pdok files
 
-Golden XML files are checked into the repo. Update workflow: set `UPDATE_GOLDEN=1` and re-run the failing test; the test harness writes the produced XML over the golden file. CI runs without the env var, so accidental drift fails the build. (The name is deliberately unprefixed: the loader's `KWMS_*` env-var override path would otherwise inject the variable into the config tree.)
+Pdok XML files are checked into the repo. Update workflow: set `UPDATE_PDOK=1` and re-run the failing test; the test harness writes the produced XML over the pdok file. CI runs without the env var, so accidental drift fails the build. (The name is deliberately unprefixed: the loader's `KWMS_*` env-var override path would otherwise inject the variable into the config tree.)
 
 ### Schema validation (future)
 
-Validating output against the published OGC XSDs (WMS 1.1.1, WMS 1.3.0, WMTS 1.0.0) would catch structural errors that text-diff golden files miss. Deferred: Rust's XSD tooling is thin, and for v1 the combination of golden diffs + cross-checking against PDOK in early iterations is enough.
+Validating output against the published OGC XSDs (WMS 1.1.1, WMS 1.3.0, WMTS 1.0.0) would catch structural errors that text-diff pdok files miss. Deferred: Rust's XSD tooling is thin, and for v1 the combination of pdok diffs + cross-checking against PDOK in early iterations is enough.
 
 ## Other test suites
 
-- **`tests/tile_render.rs`** — golden-tile diffs. A fixture directory of source files (small COGs, VRTs) plus expected output tiles per layer/format/level. Tests render the tiles and compare bytes; for lossy formats (JPEG, WebP-lossy), compare via a perceptual-hash threshold.
+- **`tests/tile_render.rs`** — pdok-tile diffs. A fixture directory of source files (small COGs, VRTs) plus expected output tiles per layer/format/level. Tests render the tiles and compare bytes; for lossy formats (JPEG, WebP-lossy), compare via a perceptual-hash threshold.
 - **`tests/conformance.rs`** — protocol conformance against GetMap, GetTile, and GetFeatureInfo with known inputs. Asserts content types, response headers, axis order per WMS version, and ServiceException response shapes for error cases.
 - **`tests/cache_integration.rs`** — end-to-end exercises of the hot tier, persistent tier (against a temp-dir OpenDAL backend), TTL expiry, passthrough mode, level-rule overrides, and single-flight coalescing under concurrent load.
 - **`tests/config_merge.rs`** — config loading, deep-merge semantics, env-var overrides, CLI overrides, and JSON Schema export.

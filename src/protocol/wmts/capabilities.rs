@@ -70,7 +70,16 @@ pub fn generate(config: &Config, base_url: &str) -> Result<String> {
     write_operations_metadata(
         &mut writer,
         &["GetCapabilities", "GetTile"],
-        &[GetBinding { href: &kvp, encoding: "KVP" }, GetBinding { href: base, encoding: "RESTful" }],
+        &[
+            GetBinding {
+                href: &kvp,
+                encoding: "KVP",
+            },
+            GetBinding {
+                href: base,
+                encoding: "RESTful",
+            },
+        ],
     )?;
 
     start(&mut writer, "Contents")?;
@@ -109,13 +118,21 @@ fn published_sets(config: &Config) -> Result<Vec<Published>> {
     let mut out: Vec<Published> = Vec::new();
     for entry in &config.wmts.tile_matrix_sets {
         if used.contains(&&entry.grid) {
-            out.push(Published { id: entry.identifier.clone(), grid_name: entry.grid.clone(), grid: lookup(&entry.grid)? });
+            out.push(Published {
+                id: entry.identifier.clone(),
+                grid_name: entry.grid.clone(),
+                grid: lookup(&entry.grid)?,
+            });
         }
     }
     for name in used {
         if !out.iter().any(|p| &p.grid_name == name) {
             for id in config.wmts.tile_matrix_set_ids(name) {
-                out.push(Published { id, grid_name: name.clone(), grid: lookup(name)? });
+                out.push(Published {
+                    id,
+                    grid_name: name.clone(),
+                    grid: lookup(name)?,
+                });
             }
         }
     }
@@ -192,7 +209,11 @@ fn write_tile_matrix_set<W: std::io::Write>(writer: &mut Writer<W>, p: &Publishe
     let grid = p.grid.as_ref();
     start(writer, "TileMatrixSet")?;
     write_text(writer, "ows:Identifier", &p.id)?;
-    write_text(writer, "ows:SupportedCRS", &supported_crs(grid.crs().as_str(), wmts.crs_identifier))?;
+    write_text(
+        writer,
+        "ows:SupportedCRS",
+        &supported_crs(grid.crs().as_str(), wmts.crs_identifier),
+    )?;
 
     let (tile_w, tile_h) = grid.tile_size();
     let top_left = grid.tile_bbox(TileCoord::new(0, 0, 0));
@@ -239,9 +260,7 @@ fn supported_crs(crs: &str, style: CrsIdentifierStyle) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig,
-    };
+    use crate::config::{Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig};
     use crate::crs::Bbox;
     use crate::encode::OutputFormat;
 
@@ -331,9 +350,7 @@ mod tests {
             "expected resourceType=tile on ResourceURL"
         );
         assert!(
-            xml.contains(
-                "https://example.org/wmts/ortho2024/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.png"
-            ),
+            xml.contains("https://example.org/wmts/ortho2024/{TileMatrixSet}/{TileMatrix}/{TileCol}/{TileRow}.png"),
             "expected template substitution placeholders; got:\n{xml}"
         );
     }
@@ -347,7 +364,10 @@ mod tests {
         cfg.wmts.tile_matrix_digits = 2;
         cfg.wmts.crs_identifier = CrsIdentifierStyle::Epsg;
         cfg.wmts.tile_matrix_sets = vec![
-            crate::config::TileMatrixSetName { grid: "webmercator".into(), identifier: "EPSG:3857".into() },
+            crate::config::TileMatrixSetName {
+                grid: "webmercator".into(),
+                identifier: "EPSG:3857".into(),
+            },
             crate::config::TileMatrixSetName {
                 grid: "webmercator".into(),
                 identifier: "OGC:1.0:GoogleMapsCompatible".into(),
@@ -374,7 +394,10 @@ mod tests {
         ] {
             assert!(xml.contains(needle), "missing {needle}\n{xml}");
         }
-        assert!(!xml.contains("<TileMatrixSet>GoogleMapsCompatible</TileMatrixSet>"), "default name still advertised");
+        assert!(
+            !xml.contains("<TileMatrixSet>GoogleMapsCompatible</TileMatrixSet>"),
+            "default name still advertised"
+        );
     }
 
     #[test]
@@ -410,7 +433,10 @@ mod tests {
     fn geographic_matrix_set_uses_ogc_scale_and_lat_lon_corner() {
         let mut layer = minimal_layer();
         layer.grids = vec!["global_geodetic".into()];
-        let cfg = Config { layers: vec![layer], ..Default::default() };
+        let cfg = Config {
+            layers: vec![layer],
+            ..Default::default()
+        };
         let xml = generate(&cfg, "https://example.org").unwrap();
         assert!(xml.contains("<ows:Identifier>WorldCRS84Quad</ows:Identifier>"), "{xml}");
         // OGC WorldCRS84Quad level 0: 279541132.0143589 (degrees → metres

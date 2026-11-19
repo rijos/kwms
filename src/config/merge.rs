@@ -112,9 +112,7 @@ mod tests {
         let a = y("server:\n  bind: 0.0.0.0:8080\n  log_level: info\ncache:\n  hot:\n    max_bytes: 512MB\n");
         let b = y("server:\n  bind: 127.0.0.1:9000\ncache:\n  hot:\n    max_bytes: 1GB\n");
         let merged = merge(a, b).unwrap();
-        let expected = y(
-            "server:\n  bind: 127.0.0.1:9000\n  log_level: info\ncache:\n  hot:\n    max_bytes: 1GB\n",
-        );
+        let expected = y("server:\n  bind: 127.0.0.1:9000\n  log_level: info\ncache:\n  hot:\n    max_bytes: 1GB\n");
         assert_eq!(merged, expected);
     }
 }

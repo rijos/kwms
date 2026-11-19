@@ -32,9 +32,7 @@ pub fn read_window(dataset: &Dataset, req: &WindowRequest, black_is_gap: bool) -
     let pixel_type = pixel_type_from_gdal(band1.band_type())?;
     let nodata = req.nodata.or_else(|| band1.no_data_value());
 
-    let mut dst = create_georeferenced_mem(
-        pixel_type, req.width, req.height, bands, &req.crs, &req.bbox, nodata,
-    )?;
+    let mut dst = create_georeferenced_mem(pixel_type, req.width, req.height, bands, &req.crs, &req.bbox, nodata)?;
     let opts = WarpOptions {
         resampling: req.resampling,
         src_nodata: req.nodata,

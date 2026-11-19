@@ -48,8 +48,7 @@ impl AppState {
     ///   handlers via `axum::extract::State`.
     pub fn new(config: Config, secrets: Secrets) -> Result<Self> {
         // Before any source is opened: GDAL reads them while opening.
-        crate::source::gdal::credentials::register(&config, &secrets)
-            .context("registering source credentials")?;
+        crate::source::gdal::credentials::register(&config, &secrets).context("registering source credentials")?;
         let mut registry = SourceRegistry::new();
         let mut seen: HashSet<String> = HashSet::new();
         for layer in &config.layers {
@@ -70,8 +69,7 @@ impl AppState {
 
         let source_count = seen.len();
 
-        let cache = LayeredCache::new(&config.cache, &secrets.credentials)
-            .context("building layered cache")?;
+        let cache = LayeredCache::new(&config.cache, &secrets.credentials).context("building layered cache")?;
 
         Self::from_parts(config, registry, cache, source_count)
     }
@@ -109,11 +107,16 @@ impl AppState {
         let mut limits = HashMap::new();
         for cl in catalog.layers() {
             let layer = cl.config();
-            let Some(source) = layer.sources.first().and_then(|s| renderer.sources.get(&s.uri)) else { continue };
+            let Some(source) = layer.sources.first().and_then(|s| renderer.sources.get(&s.uri)) else {
+                continue;
+            };
             for cg in cl.grids() {
                 let grid = cg.grid();
-                let (max, reason) = crate::pipeline::cache_levels::layer_max_level(layer, grid.as_ref(), source.metadata())
-                    .with_context(|| format!("layer `{}`: cache.max_level for grid `{}`", layer.name, grid.name()))?;
+                let (max, reason) =
+                    crate::pipeline::cache_levels::layer_max_level(layer, grid.as_ref(), source.metadata())
+                        .with_context(|| {
+                            format!("layer `{}`: cache.max_level for grid `{}`", layer.name, grid.name())
+                        })?;
                 tracing::info!(layer = %layer.name, grid = grid.name(), max_level = ?max, %reason, "durable cache levels");
                 limits.insert((layer.name.clone(), grid.name().to_string()), (max, reason));
             }
@@ -123,7 +126,10 @@ impl AppState {
             .iter()
             .map(|l| (l.name.clone(), config.output_formats.with_overrides(&l.output_formats)))
             .collect();
-        let renderer = renderer.with_cache_limits(limits).with_masks(load_masks(&config)?).with_encoding(encoding);
+        let renderer = renderer
+            .with_cache_limits(limits)
+            .with_masks(load_masks(&config)?)
+            .with_encoding(encoding);
         let documents = Documents::build(&config).context("rendering capabilities documents")?;
         Ok(Self {
             config: Arc::new(config),
@@ -144,7 +150,9 @@ fn with_source_extents(mut config: Config, sources: &SourceRegistry) -> Config {
         if layer.bbox.is_some() {
             continue;
         }
-        let Some(source) = layer.sources.first().and_then(|s| sources.get(&s.uri)) else { continue };
+        let Some(source) = layer.sources.first().and_then(|s| sources.get(&s.uri)) else {
+            continue;
+        };
         let meta = source.metadata();
         tracing::info!(
             layer = %layer.name,
@@ -164,7 +172,9 @@ fn load_masks(config: &Config) -> Result<HashMap<String, crate::source::Area>> {
     let mut by_path: HashMap<String, crate::source::Area> = HashMap::new();
     let mut masks = HashMap::new();
     for layer in &config.layers {
-        let Some(path) = layer.effective_source_mask(config.source_mask.as_deref()) else { continue };
+        let Some(path) = layer.effective_source_mask(config.source_mask.as_deref()) else {
+            continue;
+        };
         if !by_path.contains_key(path) {
             let area = crate::source::gdal::mask::load(path)
                 .with_context(|| format!("layer `{}`: loading source_mask", layer.name))?;
@@ -216,8 +226,7 @@ impl Documents {
             wmts: wmts::capabilities::generate(config, &format!("{base}{}", config.wmts.path))
                 .context("WMTS capabilities")?,
             tms_root: tms::capabilities::generate_root(base),
-            tms_service: tms::capabilities::generate_service_metadata(config, base)
-                .context("TMS service metadata")?,
+            tms_service: tms::capabilities::generate_service_metadata(config, base).context("TMS service metadata")?,
             tms_layers,
         })
     }

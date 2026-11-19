@@ -47,10 +47,12 @@ fn validate_get_tile(t: GetTileRequest, catalog: &Catalog) -> Result<TileQuery<'
             ));
         }
     }
-    let grid = layer.grid_for_tile_matrix_set(&t.tile_matrix_set).ok_or(OgcError::invalid(
-        Param::TileMatrixSet,
-        "the layer is not published on this TileMatrixSet",
-    ))?;
+    let grid = layer
+        .grid_for_tile_matrix_set(&t.tile_matrix_set)
+        .ok_or(OgcError::invalid(
+            Param::TileMatrixSet,
+            "the layer is not published on this TileMatrixSet",
+        ))?;
     TileQuery::new(
         layer,
         grid,
@@ -126,10 +128,7 @@ mod tests {
             code("ortho/GoogleMapsCompatible/1/0/2.jpeg"),
             (OgcCode::TileOutOfRange, Some("TILEROW"))
         );
-        assert_eq!(
-            code("ortho/GoogleMapsCompatible/0/0/0.png").0,
-            OgcCode::InvalidFormat
-        );
+        assert_eq!(code("ortho/GoogleMapsCompatible/0/0/0.png").0, OgcCode::InvalidFormat);
     }
 
     #[test]

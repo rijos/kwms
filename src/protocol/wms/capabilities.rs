@@ -88,11 +88,7 @@ fn crs_element_name(version: WmsVersion) -> &'static str {
 // <Service> — server-level metadata
 // ---------------------------------------------------------------------------
 
-fn write_service<W: std::io::Write>(
-    w: &mut Writer<W>,
-    _config: &Config,
-    base_url: &str,
-) -> Result<()> {
+fn write_service<W: std::io::Write>(w: &mut Writer<W>, _config: &Config, base_url: &str) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new("Service")))?;
 
     write_text_element(w, "Name", "WMS")?;
@@ -169,12 +165,7 @@ fn write_request_block<W: std::io::Write>(
     Ok(())
 }
 
-fn write_request_op<W: std::io::Write>(
-    w: &mut Writer<W>,
-    op: &str,
-    formats: &[&str],
-    base_url: &str,
-) -> Result<()> {
+fn write_request_op<W: std::io::Write>(w: &mut Writer<W>, op: &str, formats: &[&str], base_url: &str) -> Result<()> {
     w.write_event(Event::Start(BytesStart::new(op)))?;
     for fmt in formats {
         write_text_element(w, "Format", fmt)?;
@@ -293,11 +284,7 @@ fn write_layer<W: std::io::Write>(
     Ok(())
 }
 
-fn write_geographic_bbox<W: std::io::Write>(
-    w: &mut Writer<W>,
-    bbox: &Bbox,
-    version: WmsVersion,
-) -> Result<()> {
+fn write_geographic_bbox<W: std::io::Write>(w: &mut Writer<W>, bbox: &Bbox, version: WmsVersion) -> Result<()> {
     match version {
         WmsVersion::V1_1_1 => {
             // <LatLonBoundingBox minx miny maxx maxy /> — note that
@@ -325,20 +312,14 @@ fn write_geographic_bbox<W: std::io::Write>(
     Ok(())
 }
 
-fn write_bounding_box<W: std::io::Write>(
-    w: &mut Writer<W>,
-    crs: &Crs,
-    bbox: &Bbox,
-    version: WmsVersion,
-) -> Result<()> {
+fn write_bounding_box<W: std::io::Write>(w: &mut Writer<W>, crs: &Crs, bbox: &Bbox, version: WmsVersion) -> Result<()> {
     let crs_attr = crs_element_name(version);
 
     // 1.3.0: for geographic-YX CRSes, emit attributes in YX order
     // (minimum-latitude first), matching the wire-format BBOX convention.
     // A CRS whose axis order GDAL can't report is an error, never a guess:
     // a wrong order would advertise a transposed BoundingBox.
-    let swap = should_swap_axes(crs, version)
-        .with_context(|| format!("axis order of advertised CRS '{crs}'"))?;
+    let swap = should_swap_axes(crs, version).with_context(|| format!("axis order of advertised CRS '{crs}'"))?;
 
     let mut el = BytesStart::new("BoundingBox");
     el.push_attribute((crs_attr, crs.as_str()));
@@ -477,10 +458,7 @@ mod tests {
             xml.contains("<WMT_MS_Capabilities"),
             "missing 1.1.1 root element: {xml}"
         );
-        assert!(
-            !xml.contains("<WMS_Capabilities"),
-            "wrong root for 1.1.1: {xml}"
-        );
+        assert!(!xml.contains("<WMS_Capabilities"), "wrong root for 1.1.1: {xml}");
         assert!(xml.contains("version=\"1.1.1\""), "missing version attr");
 
         // Layer name is present.
@@ -503,14 +481,8 @@ mod tests {
         let cfg = minimal_config();
         let xml = generate(&cfg, WmsVersion::V1_3_0, "http://example.com/wms").unwrap();
 
-        assert!(
-            xml.contains("<WMS_Capabilities"),
-            "missing 1.3.0 root: {xml}"
-        );
-        assert!(
-            !xml.contains("<WMT_MS_Capabilities"),
-            "wrong root for 1.3.0: {xml}"
-        );
+        assert!(xml.contains("<WMS_Capabilities"), "missing 1.3.0 root: {xml}");
+        assert!(!xml.contains("<WMT_MS_Capabilities"), "wrong root for 1.3.0: {xml}");
         assert!(xml.contains("version=\"1.3.0\""));
         // 1.3.0 namespace is bound on root.
         assert!(xml.contains("xmlns=\"http://www.opengis.net/wms\""));

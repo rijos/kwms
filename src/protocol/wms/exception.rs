@@ -120,7 +120,10 @@ mod tests {
         let e = OgcError::new(OgcCode::InvalidCrs, Some(Param::Srs), "nope");
         let xml = for_error(&e, WmsVersion::V1_1_1);
         assert!(xml.contains(r#"code="InvalidSRS" locator="SRS""#), "{xml}");
-        let xml = for_error(&OgcError::new(OgcCode::InvalidCrs, Some(Param::Crs), "nope"), WmsVersion::V1_3_0);
+        let xml = for_error(
+            &OgcError::new(OgcCode::InvalidCrs, Some(Param::Crs), "nope"),
+            WmsVersion::V1_3_0,
+        );
         assert!(xml.contains(r#"code="InvalidCRS" locator="CRS""#), "{xml}");
     }
 }

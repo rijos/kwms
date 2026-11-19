@@ -1,5 +1,5 @@
 # Both queryable and opaque set to their non-default values, so the
-# capabilities goldens reflect the toggled XML attributes.
+# capabilities pdok files reflect the toggled XML attributes.
 # (Defaults: queryable=true, opaque=false; here we flip both.)
 layers:
   - name: ortho_flags

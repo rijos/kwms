@@ -4,9 +4,7 @@
 //! sink configured in [`crate::subcommand::serve`].
 
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
-use tower_http::trace::{
-    DefaultMakeSpan, DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer,
-};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
 /// Build the tracing layer that wraps the whole router.
 ///

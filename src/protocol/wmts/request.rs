@@ -97,7 +97,10 @@ pub fn parse_rest(path: &str) -> Result<WmtsRequest, OgcError> {
     let [layer, tile_matrix_set, tile_matrix, tile_col, last] = segments[..] else {
         return Err(SHAPE);
     };
-    if [layer, tile_matrix_set, tile_matrix, tile_col, last].iter().any(|s| s.is_empty()) {
+    if [layer, tile_matrix_set, tile_matrix, tile_col, last]
+        .iter()
+        .any(|s| s.is_empty())
+    {
         return Err(SHAPE);
     }
     let (tile_row, ext) = last.rsplit_once('.').ok_or(SHAPE)?;
@@ -221,11 +224,7 @@ mod tests {
         assert_eq!(t.layer, "Actueel_orthoHR");
         assert_eq!(t.tile_matrix_set, "EPSG:28992");
         assert_eq!(t.tile_matrix, 5);
-        assert_eq!(
-            (t.tile_col, t.tile_row),
-            (34, 12),
-            "TileCol comes before TileRow"
-        );
+        assert_eq!((t.tile_col, t.tile_row), (34, 12), "TileCol comes before TileRow");
         assert_eq!(t.style, None);
         assert_eq!(
             parse_rest("/ortho/GoogleMapsCompatible/0/0/0.png").unwrap(),
@@ -245,10 +244,7 @@ mod tests {
             ("webp", OutputFormat::Webp),
             ("tif", OutputFormat::GeoTiff),
         ] {
-            assert_eq!(
-                tile(parse_rest(&format!("l/t/0/0/0.{ext}")).unwrap()).format,
-                fmt
-            );
+            assert_eq!(tile(parse_rest(&format!("l/t/0/0/0.{ext}")).unwrap()).format, fmt);
         }
     }
 

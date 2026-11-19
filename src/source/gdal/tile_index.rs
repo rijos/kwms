@@ -134,9 +134,12 @@ impl TileIndex {
 
 /// Probe `uri` if it is a GTI tile index (`None` otherwise).
 pub fn probe(uri: &str, open_options: &[String]) -> Result<Option<TileIndex>> {
-    let Some(index) = tile_index_path(uri) else { return Ok(None) };
+    let Some(index) = tile_index_path(uri) else {
+        return Ok(None);
+    };
     let started = Instant::now();
-    let (entries, extent, stored) = read_index(index, open_options).with_context(|| format!("reading tile index '{index}'"))?;
+    let (entries, extent, stored) =
+        read_index(index, open_options).with_context(|| format!("reading tile index '{index}'"))?;
     let locations: Vec<&str> = entries.iter().map(|(l, _, _)| l.as_str()).collect();
     if locations.is_empty() {
         bail!("tile index '{index}' has no tiles");
@@ -158,7 +161,9 @@ pub fn probe(uri: &str, open_options: &[String]) -> Result<Option<TileIndex>> {
             });
         }
     });
-    let mut results = results.into_inner().map_err(|_| anyhow!("tile probe thread panicked"))?;
+    let mut results = results
+        .into_inner()
+        .map_err(|_| anyhow!("tile probe thread panicked"))?;
     results.sort_by_key(|(i, _)| *i);
     let mut tiles = Vec::with_capacity(results.len());
     let mut footprints = Vec::with_capacity(results.len());
@@ -204,7 +209,13 @@ pub fn probe(uri: &str, open_options: &[String]) -> Result<Option<TileIndex>> {
         );
     }
     info.elapsed = started.elapsed();
-    Ok(Some(TileIndex { info, tiles, footprints, configured: open_options.to_vec(), stored }))
+    Ok(Some(TileIndex {
+        info,
+        tiles,
+        footprints,
+        configured: open_options.to_vec(),
+        stored,
+    }))
 }
 
 /// Locations of every tile (resolved like GTI does: relative to the index),
@@ -220,9 +231,15 @@ fn read_index(index: &str, open_options: &[String]) -> Result<IndexContents> {
         ..Default::default()
     };
     let ds = Dataset::open_ex(Path::new(index), options).context("opening the index as a vector dataset")?;
-    let option = |key: &str| open_options.iter().find_map(|o| o.strip_prefix(key)?.strip_prefix('=').map(str::to_string));
+    let option = |key: &str| {
+        open_options
+            .iter()
+            .find_map(|o| o.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+    };
     let mut layer = match option("LAYER") {
-        Some(name) => ds.layer_by_name(&name).with_context(|| format!("index has no layer '{name}'"))?,
+        Some(name) => ds
+            .layer_by_name(&name)
+            .with_context(|| format!("index has no layer '{name}'"))?,
         None if ds.layer_count() == 1 => ds.layer(0)?,
         None => bail!("index has {} layers; set the LAYER open option", ds.layer_count()),
     };
@@ -234,17 +251,27 @@ fn read_index(index: &str, open_options: &[String]) -> Result<IndexContents> {
     let field = option("LOCATION_FIELD")
         .or_else(|| layer.metadata_item("LOCATION_FIELD", ""))
         .unwrap_or_else(|| "location".into());
-    let dir = Path::new(index).parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    let dir = Path::new(index)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let mut locations = Vec::new();
     for feature in layer.features() {
-        let Some(loc) = feature.field_as_string_by_name(&field).with_context(|| format!("reading field '{field}'"))? else {
+        let Some(loc) = feature
+            .field_as_string_by_name(&field)
+            .with_context(|| format!("reading field '{field}'"))?
+        else {
             continue;
         };
         let Some(geometry) = feature.geometry() else { continue };
         let e = geometry.envelope();
         // GTI resolves relative locations against the index's directory.
         let absolute = loc.starts_with('/') || loc.contains(':');
-        let loc = if absolute || dir.is_empty() { loc } else { format!("{dir}/{loc}") };
+        let loc = if absolute || dir.is_empty() {
+            loc
+        } else {
+            format!("{dir}/{loc}")
+        };
         locations.push((loc, (e.MinX, e.MinY, e.MaxX, e.MaxY), geometry.wkb()?));
     }
     let e = layer.get_extent().context("index extent")?;
@@ -273,7 +300,9 @@ fn round_res(r: f64) -> f64 {
 }
 
 fn is_set(configured: &[String], stored: &[String], key: &str) -> bool {
-    configured.iter().any(|o| o.split_once('=').is_some_and(|(k, _)| k.eq_ignore_ascii_case(key)))
+    configured
+        .iter()
+        .any(|o| o.split_once('=').is_some_and(|(k, _)| k.eq_ignore_ascii_case(key)))
         || stored.iter().any(|s| s.eq_ignore_ascii_case(key))
 }
 
@@ -283,30 +312,64 @@ fn derive_options(info: &TileIndexInfo, res: (f64, f64), configured: &[String], 
     let set = |key: &str| is_set(configured, stored, key);
     let mut out = Vec::new();
     let (rx, ry) = res;
-    if !set("RESX") && !set("RESY") {
+    let derive_res = !set("RESX") && !set("RESY");
+    if derive_res {
         out.push(format!("RESX={rx}"));
         out.push(format!("RESY={ry}"));
     }
-    if info.mixed() && !set("RESAMPLING") {
-        out.push("RESAMPLING=bilinear".into());
+    let resampling = (info.mixed() && !set("RESAMPLING")).then_some("RESAMPLING=bilinear");
+    out.extend(resampling.map(String::from));
+    let any_overview = |list: &[String]| list.iter().any(|o| o.to_ascii_uppercase().starts_with("OVERVIEW_"));
+    if any_overview(configured) || any_overview(stored) {
+        return out;
     }
-    let any_overview = |list: &[String]| {
-        list.iter().any(|o| o.to_ascii_uppercase().starts_with("OVERVIEW_"))
-    };
-    if !any_overview(configured) && !any_overview(stored) {
-        let (minx, miny, maxx, maxy) = info.extent;
-        let px = ((maxx - minx) / rx).max((maxy - miny) / ry);
-        let mut factor: u64 = 2;
-        let mut n = 0u32;
-        // Powers of two until the whole mosaic fits COARSEST_OVERVIEW_PX
-        // (capped: 2^30 covers any raster GDAL can address).
-        while n < 30 {
-            out.push(format!("OVERVIEW_{n}_FACTOR={factor}"));
-            if px / factor as f64 <= COARSEST_OVERVIEW_PX {
-                break;
-            }
-            factor = factor.saturating_mul(2);
-            n = n.saturating_add(1);
+
+    let (minx, miny, maxx, maxy) = info.extent;
+    // Full-resolution size in pixels (an extent that is a whole number of
+    // pixels must not gain one from float noise).
+    let pixels = |span: f64, r: f64| ((span / r) - 1e-9).ceil().max(1.0);
+    let (w, h) = (pixels(maxx - minx, rx), pixels(maxy - miny, ry));
+    // Powers of two until the whole mosaic fits COARSEST_OVERVIEW_PX
+    // (capped: 2^30 covers any raster GDAL can address).
+    let mut factors: Vec<u64> = Vec::new();
+    let mut factor: u64 = 2;
+    while factors.len() < 30 {
+        factors.push(factor);
+        if w.max(h) / factor as f64 <= COARSEST_OVERVIEW_PX {
+            break;
+        }
+        factor = factor.saturating_mul(2);
+    }
+    let largest = factors.last().copied().unwrap_or(2) as f64;
+
+    // GDAL maps an overview's pixels by the size ratio full/overview. If the
+    // mosaic isn't a whole number of overview pixels, GTI rounds the
+    // overview size up and the overview's pixels come out slightly too
+    // small: the image drifts away from the top-left corner (measured on the
+    // 2026 ortho: up to half an overview pixel by Rotterdam, a -0.3 px bias
+    // in Web Mercator tiles). So pad the extent (top-left fixed) to a whole
+    // number of the largest overview's pixels, and give every overview the
+    // same resolution and extent: GTI opens overviews from the index with
+    // only their own `OVERVIEW_<n>_OPEN_OPTIONS`, not the parent's options.
+    let padded = derive_res.then(|| {
+        let (pw, ph) = ((w / largest).ceil() * largest, (h / largest).ceil() * largest);
+        [
+            format!("MINX={minx}"),
+            format!("MINY={}", maxy - ph * ry),
+            format!("MAXX={}", minx + pw * rx),
+            format!("MAXY={maxy}"),
+        ]
+    });
+    if let Some(extent) = &padded {
+        out.extend(extent.iter().cloned());
+    }
+    for (n, f) in factors.iter().enumerate() {
+        out.push(format!("OVERVIEW_{n}_FACTOR={f}"));
+        if let Some(extent) = &padded {
+            let mut own = vec![format!("RESX={rx}"), format!("RESY={ry}")];
+            own.extend(extent.iter().cloned());
+            own.extend(resampling.map(String::from));
+            out.push(format!("OVERVIEW_{n}_OPEN_OPTIONS={}", own.join(",")));
         }
     }
     out
@@ -337,37 +400,79 @@ mod tests {
         let i = info(&[(0.05, 148), (0.08, 350)], (280_000.0, 330_000.0));
         let opts = derive_options(&i, (0.05, 0.05), &[], &[]);
         assert_eq!(&opts[..3], ["RESX=0.05", "RESY=0.05", "RESAMPLING=bilinear"]);
-        assert_eq!(opts.last().unwrap(), "OVERVIEW_10_FACTOR=2048");
-        assert_eq!(opts.len(), 3 + 11);
+        assert!(opts.contains(&"OVERVIEW_10_FACTOR=2048".to_string()), "{opts:?}");
+        assert!(!opts.iter().any(|o| o.starts_with("OVERVIEW_11_")));
         // The 8 cm view: 4.1M px / 1024 = 4029 <= 4096.
         let opts = derive_options(&i, (0.08, 0.08), &[], &[]);
         assert_eq!(&opts[..2], ["RESX=0.08", "RESY=0.08"]);
-        assert_eq!(opts.last().unwrap(), "OVERVIEW_9_FACTOR=1024");
+        assert!(opts.contains(&"OVERVIEW_9_FACTOR=1024".to_string()), "{opts:?}");
+        assert!(!opts.iter().any(|o| o.starts_with("OVERVIEW_10_")));
+    }
+
+    /// The extent is padded to whole pixels of the largest overview
+    /// (top-left fixed), and every overview gets the same resolution and
+    /// extent — otherwise GDAL's size-ratio mapping drifts the image.
+    #[test]
+    fn extent_is_padded_for_exact_overviews() {
+        // The 2026 index: 280 x 330 km at 8 cm = 3500000 x 4125000 px.
+        let opts = derive_options(&info(&[(0.08, 498)], (280_000.0, 330_000.0)), (0.08, 0.08), &[], &[]);
+        let get = |k: &str| {
+            opts.iter()
+                .find_map(|o| o.strip_prefix(&format!("{k}=")))
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        };
+        let (minx, miny, maxx, maxy) = (get("MINX"), get("MINY"), get("MAXX"), get("MAXY"));
+        assert_eq!((minx, maxy), (0.0, 330_000.0), "top-left fixed");
+        let (w, h) = (((maxx - minx) / 0.08).round(), ((maxy - miny) / 0.08).round());
+        assert_eq!((w % 1024.0, h % 1024.0), (0.0, 0.0), "{w} x {h}");
+        assert!(w >= 3_500_000.0 && h >= 4_125_000.0 && w - 3_500_000.0 < 1024.0 && h - 4_125_000.0 < 1024.0);
+        let own = opts.iter().find(|o| o.starts_with("OVERVIEW_0_OPEN_OPTIONS=")).unwrap();
+        assert!(own.contains("RESX=0.08,RESY=0.08,MINX=0,"), "{own}");
+        assert_eq!(opts.iter().filter(|o| o.contains("_OPEN_OPTIONS=")).count(), 10);
     }
 
     #[test]
     fn single_resolution_needs_no_resampling() {
         let opts = derive_options(&info(&[(0.08, 498)], (280_000.0, 330_000.0)), (0.08, 0.08), &[], &[]);
         assert!(opts.contains(&"RESX=0.08".to_string()));
-        assert!(!opts.iter().any(|o| o.starts_with("RESAMPLING")));
-        assert_eq!(opts.last().unwrap(), "OVERVIEW_9_FACTOR=1024");
+        assert!(!opts.iter().any(|o| o.contains("RESAMPLING")));
+        assert!(opts.contains(&"OVERVIEW_9_FACTOR=1024".to_string()));
     }
 
     #[test]
     fn finest_under_picks_the_finest_intersecting_tile() {
         let tiles = [
-            IndexTile { bbox: (0.0, 0.0, 10.0, 10.0), res: (0.08, 0.08) },
-            IndexTile { bbox: (10.0, 0.0, 20.0, 10.0), res: (0.05, 0.05) },
+            IndexTile {
+                bbox: (0.0, 0.0, 10.0, 10.0),
+                res: (0.08, 0.08),
+            },
+            IndexTile {
+                bbox: (10.0, 0.0, 20.0, 10.0),
+                res: (0.05, 0.05),
+            },
         ];
-        assert_eq!(TileIndex::finest_under(&tiles, (1.0, 1.0, 2.0, 2.0)), Some((0.08, 0.08)));
-        assert_eq!(TileIndex::finest_under(&tiles, (9.0, 1.0, 11.0, 2.0)), Some((0.05, 0.05)));
+        assert_eq!(
+            TileIndex::finest_under(&tiles, (1.0, 1.0, 2.0, 2.0)),
+            Some((0.08, 0.08))
+        );
+        assert_eq!(
+            TileIndex::finest_under(&tiles, (9.0, 1.0, 11.0, 2.0)),
+            Some((0.05, 0.05))
+        );
         assert_eq!(TileIndex::finest_under(&tiles, (30.0, 30.0, 31.0, 31.0)), None);
     }
 
     #[test]
     fn configured_or_stored_options_win() {
         let i = info(&[(0.05, 1), (0.08, 1)], (10_000.0, 10_000.0));
-        let opts = derive_options(&i, (0.05, 0.05), &["RESX=0.1".into(), "OVERVIEW_0_FACTOR=4".into()], &["RESAMPLING".into()]);
+        let opts = derive_options(
+            &i,
+            (0.05, 0.05),
+            &["RESX=0.1".into(), "OVERVIEW_0_FACTOR=4".into()],
+            &["RESAMPLING".into()],
+        );
         assert!(opts.is_empty(), "{opts:?}");
     }
 
@@ -380,7 +485,11 @@ mod tests {
         }
         let (entries, extent, stored) = read_index(index, &[]).unwrap();
         assert_eq!(entries.len(), 498);
-        assert!(entries[0].0.starts_with("/vsiaz/open-tiles/2026hrrgb/"), "{}", entries[0].0);
+        assert!(
+            entries[0].0.starts_with("/vsiaz/open-tiles/2026hrrgb/"),
+            "{}",
+            entries[0].0
+        );
         let (minx, miny, maxx, maxy) = entries[0].1;
         assert!(!entries[0].2.is_empty(), "footprint WKB");
         assert_eq!((maxx - minx, maxy - miny), (10_000.0, 10_000.0));

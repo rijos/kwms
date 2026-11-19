@@ -97,7 +97,10 @@ pub fn validate(req: WmsRequest, catalog: &Catalog) -> Result<WmsQuery<'_>, OgcE
 fn validate_get_map(m: GetMapRequest, catalog: &Catalog) -> Result<WmsGetMap<'_>, OgcError> {
     // LAYERS: exactly one, and it exists.
     let [name] = m.layers.as_slice() else {
-        return Err(OgcError::invalid(Param::Layers, "exactly one layer per request is supported"));
+        return Err(OgcError::invalid(
+            Param::Layers,
+            "exactly one layer per request is supported",
+        ));
     };
     let layer = catalog.layer(name).ok_or(OgcError::new(
         OgcCode::LayerNotDefined,
@@ -136,7 +139,11 @@ fn validate_get_map(m: GetMapRequest, catalog: &Catalog) -> Result<WmsGetMap<'_>
     // BBOX: wire order → x/y. Only 1.3.0 follows the CRS's axis order.
     let [a, b, c, d] = m.bbox;
     let swap = m.version == WmsVersion::V1_3_0 && crs.axis_order() == AxisOrder::YX;
-    let bbox = if swap { Bbox::from([b, a, d, c]) } else { Bbox::from([a, b, c, d]) };
+    let bbox = if swap {
+        Bbox::from([b, a, d, c])
+    } else {
+        Bbox::from([a, b, c, d])
+    };
 
     // Size limit (advertised as MaxWidth/MaxHeight).
     let [max_w, max_h] = catalog.max_request_pixels();
@@ -157,10 +164,8 @@ fn validate_get_map(m: GetMapRequest, catalog: &Catalog) -> Result<WmsGetMap<'_>
     }
 
     let extent = grid.grid().extent();
-    let intersects_grid = bbox.minx < extent.maxx
-        && extent.minx < bbox.maxx
-        && bbox.miny < extent.maxy
-        && extent.miny < bbox.maxy;
+    let intersects_grid =
+        bbox.minx < extent.maxx && extent.minx < bbox.maxx && bbox.miny < extent.maxy && extent.miny < bbox.maxy;
 
     Ok(WmsGetMap {
         version: m.version,
@@ -258,18 +263,10 @@ mod tests {
             &map_query("1.3.0", "urn:ogc:def:crs:EPSG::3857", "0,0,1000,1000", ""),
         )
         .unwrap();
-        assert_eq!(
-            m.crs().crs().as_str(),
-            "EPSG:3857",
-            "downstream sees the config token"
-        );
+        assert_eq!(m.crs().crs().as_str(), "EPSG:3857", "downstream sees the config token");
         assert_eq!(m.grid().name(), "webmercator");
         assert!(m.intersects_grid());
-        let m = get_map(
-            &cat,
-            &map_query("1.3.0", "epsg:28992", "0,300000,1000,301000", ""),
-        )
-        .unwrap();
+        let m = get_map(&cat, &map_query("1.3.0", "epsg:28992", "0,300000,1000,301000", "")).unwrap();
         assert_eq!(m.grid().name(), "rd_new_quad");
     }
 
@@ -311,10 +308,7 @@ mod tests {
             code(ok.replace("STYLES=", "STYLES=fancy")),
             (OgcCode::StyleNotDefined, Some("STYLES"))
         );
-        assert_eq!(
-            code(ok.replace("STYLES=", "STYLES=,")).0,
-            OgcCode::StyleNotDefined
-        );
+        assert_eq!(code(ok.replace("STYLES=", "STYLES=,")).0, OgcCode::StyleNotDefined);
         assert_eq!(
             code(ok.replace("EPSG:3857", "EPSG:3035")),
             (OgcCode::InvalidCrs, Some("CRS")),
@@ -350,14 +344,8 @@ mod tests {
             code(ok.replace("WIDTH=256", "WIDTH=2501")),
             (OgcCode::InvalidParameterValue, Some("WIDTH"))
         );
-        assert_eq!(
-            code(ok.replace("HEIGHT=256", "HEIGHT=4000")).1,
-            Some("HEIGHT")
-        );
-        assert_eq!(
-            code(ok.replace("image/jpeg", "image/png")).0,
-            OgcCode::InvalidFormat
-        );
+        assert_eq!(code(ok.replace("HEIGHT=256", "HEIGHT=4000")).1, Some("HEIGHT"));
+        assert_eq!(code(ok.replace("image/jpeg", "image/png")).0, OgcCode::InvalidFormat);
         let e = validate(parse("REQUEST=GetFeatureInfo&VERSION=1.3.0").unwrap(), &cat)
             .err()
             .unwrap();
@@ -379,7 +367,10 @@ mod tests {
         assert_eq!(bbox_err("0,0,5e-324,5e-324"), rejected, "subnormal extent");
         assert_eq!(bbox_err("0,0,1e-300,1e-300"), rejected);
         assert_eq!(bbox_err("0,0,1e-9,1e-9"), rejected);
-        assert_eq!(bbox_err("10000000,10000000,10000000.000000002,10000000.000000002"), rejected);
+        assert_eq!(
+            bbox_err("10000000,10000000,10000000.000000002,10000000.000000002"),
+            rejected
+        );
         assert_eq!(bbox_err("0,-20037508,1e-300,20037508"), rejected, "one axis too thin");
         // Still fine: zoomed in a lot, huge but finite, far outside the grid.
         assert_eq!(bbox_err("0,0,1,1"), None);
@@ -393,11 +384,7 @@ mod tests {
     #[test]
     fn bbox_outside_the_grid_is_valid_but_flagged() {
         let cat = catalog();
-        let m = get_map(
-            &cat,
-            &map_query("1.3.0", "EPSG:3857", "1e9,1e9,2e9,2e9", ""),
-        )
-        .unwrap();
+        let m = get_map(&cat, &map_query("1.3.0", "EPSG:3857", "1e9,1e9,2e9,2e9", "")).unwrap();
         assert!(!m.intersects_grid());
     }
 }

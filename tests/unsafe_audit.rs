@@ -88,9 +88,8 @@ fn every_unsafe_block_is_in_ffi_and_documented() {
                 idx + 1,
                 line.trim()
             );
-            let id = audit_tag(&lines, idx).unwrap_or_else(|| {
-                panic!("{rel}:{}: unsafe block without an `// UNSAFE-AUDIT: <id>` tag", idx + 1)
-            });
+            let id = audit_tag(&lines, idx)
+                .unwrap_or_else(|| panic!("{rel}:{}: unsafe block without an `// UNSAFE-AUDIT: <id>` tag", idx + 1));
             tags.push(id);
         }
     }
@@ -110,7 +109,10 @@ fn every_unsafe_block_is_in_ffi_and_documented() {
 
     let undocumented: Vec<_> = unique.difference(&documented).collect();
     let stale: Vec<_> = documented.difference(&unique).collect();
-    assert!(undocumented.is_empty(), "unsafe blocks missing from {AUDIT_DOC}: {undocumented:?}");
+    assert!(
+        undocumented.is_empty(),
+        "unsafe blocks missing from {AUDIT_DOC}: {undocumented:?}"
+    );
     assert!(stale.is_empty(), "{AUDIT_DOC} documents ids no code uses: {stale:?}");
 }
 

@@ -62,8 +62,8 @@ pub async fn middleware(req: Request<Body>, next: Next) -> Response {
     // `RUST_LOG=info,kwms::server::middleware::metrics=debug`): what
     // clients actually ask for (QGIS image sizes, CRS, formats). The URI is
     // capped so a hostile query string can't bloat the log.
-    let access = tracing::enabled!(tracing::Level::DEBUG)
-        .then(|| req.uri().to_string().chars().take(2048).collect::<String>());
+    let access =
+        tracing::enabled!(tracing::Level::DEBUG).then(|| req.uri().to_string().chars().take(2048).collect::<String>());
 
     let started = Instant::now();
     let response = next.run(req).await;

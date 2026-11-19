@@ -92,8 +92,14 @@ mod tests {
             mode: CacheMode::Cache,
             max_level: crate::config::model::CacheMaxLevel::default(),
             level_rules: vec![
-                LevelRule { levels: "0-9".into(), mode: CacheMode::Passthrough },
-                LevelRule { levels: "10-19".into(), mode: CacheMode::Cache },
+                LevelRule {
+                    levels: "0-9".into(),
+                    mode: CacheMode::Passthrough,
+                },
+                LevelRule {
+                    levels: "10-19".into(),
+                    mode: CacheMode::Cache,
+                },
             ],
             ..LayerCacheConfig::default()
         };

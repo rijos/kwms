@@ -47,7 +47,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/wms", get(routes::wms::handle))
         // WMTS: KVP at `wmts.path`, RESTful below it (validated config).
         .route(&state.config.wmts.path, get(routes::wmts::handle_kvp))
-        .route(&format!("{}/*rest", state.config.wmts.path), get(routes::wmts::handle_rest))
+        .route(
+            &format!("{}/*rest", state.config.wmts.path),
+            get(routes::wmts::handle_rest),
+        )
         // TMS
         .route("/tms/*rest", get(routes::tms::handle));
     let protocols = with_overload_protection(protocols, &state.config.server);
@@ -125,11 +128,9 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    use crate::cache::memory::MemoryTier;
     use crate::cache::layered::LayeredCache;
-    use crate::config::{
-        Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig,
-    };
+    use crate::cache::memory::MemoryTier;
+    use crate::config::{Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig};
     use crate::crs::Bbox;
     use crate::encode::OutputFormat;
     use crate::source::{PixelType, Source, SourceMetadata, SourceRegistry};
@@ -148,10 +149,7 @@ mod tests {
         fn metadata(&self) -> &SourceMetadata {
             &self.0
         }
-        async fn read_window(
-            &self,
-            _req: crate::source::WindowRequest,
-        ) -> anyhow::Result<crate::source::PixelBuffer> {
+        async fn read_window(&self, _req: crate::source::WindowRequest) -> anyhow::Result<crate::source::PixelBuffer> {
             anyhow::bail!("dummy source")
         }
         async fn sample(
@@ -324,12 +322,7 @@ mod tests {
     async fn metrics_endpoint_returns_prometheus_exposition() {
         let app = metrics_router();
         let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -368,7 +361,10 @@ mod tests {
         let app = Router::new()
             .route("/boom", get(overflow))
             .layer(CatchPanicLayer::custom(panic_response));
-        let resp = app.oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app
+            .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body_to_string(resp).await, "internal server error");
     }
@@ -413,7 +409,10 @@ mod tests {
             .await
             .unwrap();
         let body = body_to_string(resp).await;
-        assert!(body.contains(r#"locator="WIDTH">WIDTH/HEIGHT exceed the maximum image size<"#), "{body}");
+        assert!(
+            body.contains(r#"locator="WIDTH">WIDTH/HEIGHT exceed the maximum image size<"#),
+            "{body}"
+        );
     }
 
     #[tokio::test]

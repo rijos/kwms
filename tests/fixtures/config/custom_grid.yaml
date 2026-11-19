@@ -17,3 +17,4 @@ layers:
       - uri: tests/fixtures/sources/ortho_small.tif
     formats: [png]
     bbox: [120000.0, 480000.0, 130000.0, 490000.0]
+    bbox_crs: EPSG:28992   # the bbox is in RD New, the grid's CRS

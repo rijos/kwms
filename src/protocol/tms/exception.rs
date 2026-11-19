@@ -41,7 +41,10 @@ mod tests {
         // Messages are static literals; escaping still holds for any we write.
         let (s, xml) = for_error(&OgcError::new(OgcCode::LayerNotDefined, None, "a <a> b"));
         assert_eq!(s, 404);
-        assert!(xml.contains("<Code>LayerNotDefined</Code>") && xml.contains("&lt;a&gt;"), "{xml}");
+        assert!(
+            xml.contains("<Code>LayerNotDefined</Code>") && xml.contains("&lt;a&gt;"),
+            "{xml}"
+        );
         assert_eq!(for_error(&OgcError::invalid(Param::X, "bad")).0, 400);
     }
 }

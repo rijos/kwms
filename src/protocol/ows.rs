@@ -14,19 +14,29 @@ use crate::config::{ServiceContact, ServiceMetadata};
 
 /// `<tag>text</tag>`.
 pub(crate) fn write_text<W: std::io::Write>(writer: &mut Writer<W>, tag: &str, text: &str) -> Result<()> {
-    writer.write_event(Event::Start(BytesStart::new(tag))).with_context(|| format!("start <{tag}>"))?;
-    writer.write_event(Event::Text(BytesText::new(text))).with_context(|| format!("text for <{tag}>"))?;
-    writer.write_event(Event::End(BytesEnd::new(tag))).with_context(|| format!("end <{tag}>"))?;
+    writer
+        .write_event(Event::Start(BytesStart::new(tag)))
+        .with_context(|| format!("start <{tag}>"))?;
+    writer
+        .write_event(Event::Text(BytesText::new(text)))
+        .with_context(|| format!("text for <{tag}>"))?;
+    writer
+        .write_event(Event::End(BytesEnd::new(tag)))
+        .with_context(|| format!("end <{tag}>"))?;
     Ok(())
 }
 
 pub(crate) fn start<W: std::io::Write>(writer: &mut Writer<W>, tag: &str) -> Result<()> {
-    writer.write_event(Event::Start(BytesStart::new(tag))).with_context(|| format!("start <{tag}>"))?;
+    writer
+        .write_event(Event::Start(BytesStart::new(tag)))
+        .with_context(|| format!("start <{tag}>"))?;
     Ok(())
 }
 
 pub(crate) fn end<W: std::io::Write>(writer: &mut Writer<W>, tag: &str) -> Result<()> {
-    writer.write_event(Event::End(BytesEnd::new(tag))).with_context(|| format!("end <{tag}>"))?;
+    writer
+        .write_event(Event::End(BytesEnd::new(tag)))
+        .with_context(|| format!("end <{tag}>"))?;
     Ok(())
 }
 
@@ -34,7 +44,9 @@ pub(crate) fn end<W: std::io::Write>(writer: &mut Writer<W>, tag: &str) -> Resul
 pub(crate) fn write_href<W: std::io::Write>(writer: &mut Writer<W>, tag: &str, href: &str) -> Result<()> {
     let mut el = BytesStart::new(tag);
     el.push_attribute(("xlink:href", href));
-    writer.write_event(Event::Empty(el)).with_context(|| format!("<{tag}>"))?;
+    writer
+        .write_event(Event::Empty(el))
+        .with_context(|| format!("<{tag}>"))?;
     Ok(())
 }
 
@@ -138,7 +150,9 @@ pub fn write_operations_metadata<W: std::io::Write>(
             writer.write_event(Event::Start(get)).context("start Get")?;
             let mut constraint = BytesStart::new("ows:Constraint");
             constraint.push_attribute(("name", "GetEncoding"));
-            writer.write_event(Event::Start(constraint)).context("start Constraint")?;
+            writer
+                .write_event(Event::Start(constraint))
+                .context("start Constraint")?;
             start(writer, "ows:AllowedValues")?;
             write_text(writer, "ows:Value", b.encoding)?;
             end(writer, "ows:AllowedValues")?;

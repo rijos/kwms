@@ -76,9 +76,7 @@ mod tests {
 
     #[test]
     fn classify_sees_through_context() {
-        let e = Err::<(), _>(client_error("bad layer"))
-            .context("outer")
-            .unwrap_err();
+        let e = Err::<(), _>(client_error("bad layer")).context("outer").unwrap_err();
         assert_eq!(classify(&e), Disposition::Client("bad layer"));
 
         let e = Err::<(), _>(anyhow::Error::from(Busy)).context("outer").unwrap_err();

@@ -1,5 +1,5 @@
 # Like single_grid_minimal but with max_resolution capped to 0.5 m/pixel.
-# Capabilities golden should show a truncated TileMatrix list — webmercator
+# Capabilities pdok file should show a truncated TileMatrix list — webmercator
 # would normally advertise ~22 levels; capping at 0.5 m/px drops the
 # deepest few.
 layers:

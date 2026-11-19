@@ -64,7 +64,12 @@ mod tests {
     use bytes::Bytes;
 
     fn key(z: u32, x: u32, y: u32) -> TileKey {
-        TileKey { layer: "L".into(), coord: TileCoord::new(z, x, y), format: OutputFormat::Png, grid_dir: "3857".into() }
+        TileKey {
+            layer: "L".into(),
+            coord: TileCoord::new(z, x, y),
+            format: OutputFormat::Png,
+            grid_dir: "3857".into(),
+        }
     }
 
     const TTL: Duration = Duration::from_secs(60);
@@ -83,7 +88,10 @@ mod tests {
     #[tokio::test]
     async fn expired_entries_are_misses() {
         let tier = MemoryTier::new(1024);
-        let old = Entry { bytes: Bytes::from_static(b"x"), written_at: Entry::now(Bytes::new()).written_at - 120 };
+        let old = Entry {
+            bytes: Bytes::from_static(b"x"),
+            written_at: Entry::now(Bytes::new()).written_at - 120,
+        };
         tier.put(&key(0, 0, 0), old).await.unwrap();
         assert!(tier.get(&key(0, 0, 0), TTL).await.unwrap().is_none());
     }
@@ -94,7 +102,9 @@ mod tests {
         let cap: u64 = 300;
         let tier = MemoryTier::new(cap);
         for i in 0..10 {
-            tier.put(&key(0, i, 0), Entry::now(Bytes::from(vec![0u8; 100]))).await.unwrap();
+            tier.put(&key(0, i, 0), Entry::now(Bytes::from(vec![0u8; 100])))
+                .await
+                .unwrap();
         }
         tier.inner.run_pending_tasks().await;
         let weighted = tier.inner.weighted_size();

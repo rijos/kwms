@@ -51,7 +51,9 @@ impl std::str::FromStr for MaxLevel {
         if s.eq_ignore_ascii_case("auto") {
             return Ok(Self::Auto);
         }
-        s.parse().map(Self::Level).map_err(|_| format!("expected `auto` or a level number, got `{s}`"))
+        s.parse()
+            .map(Self::Level)
+            .map_err(|_| format!("expected `auto` or a level number, got `{s}`"))
     }
 }
 
@@ -90,12 +92,20 @@ pub async fn run(args: Args) -> Result<()> {
     if args.concurrency == 0 {
         bail!("--concurrency must be at least 1");
     }
-    let (config, secrets) = crate::config::load::load(&args.config, &args.secrets)
-        .with_context(|| format!("loading config (`{}`) and secrets (`{}`)", args.config.display(), args.secrets.display()))?;
+    let (config, secrets) = crate::config::load::load(&args.config, &args.secrets).with_context(|| {
+        format!(
+            "loading config (`{}`) and secrets (`{}`)",
+            args.config.display(),
+            args.secrets.display()
+        )
+    })?;
     let state = Arc::new(AppState::new(config, secrets).context("opening sources and cache")?);
     let cache = &state.renderer.cache;
     if !cache.has_durable_tier() {
-        bail!("the cache has no durable tier (only {:?}); there is nothing to update", cache.describe());
+        bail!(
+            "the cache has no durable tier (only {:?}); there is nothing to update",
+            cache.describe()
+        );
     }
 
     let jobs = plan(&state, &args)?;
@@ -112,7 +122,10 @@ pub async fn run(args: Args) -> Result<()> {
     }
     println!("total: {total} tiles");
     if total > args.max_tiles {
-        bail!("{total} tiles exceeds --max-tiles {}; narrow the levels or raise the limit", args.max_tiles);
+        bail!(
+            "{total} tiles exceeds --max-tiles {}; narrow the levels or raise the limit",
+            args.max_tiles
+        );
     }
     if args.dry_run || total == 0 {
         return Ok(());
@@ -156,7 +169,10 @@ pub async fn run(args: Args) -> Result<()> {
         if failures.len() > 10 {
             eprintln!("  … and {} more", failures.len().saturating_sub(10));
         }
-        bail!("{} tile(s) failed; run the same command again to retry just those", failures.len());
+        bail!(
+            "{} tile(s) failed; run the same command again to retry just those",
+            failures.len()
+        );
     }
     Ok(())
 }
@@ -179,11 +195,19 @@ fn plan(state: &AppState, args: &Args) -> Result<Vec<Job>> {
         if !args.layers.is_empty() && !args.layers.contains(&layer.name) {
             continue;
         }
-        let source = layer.sources.first().ok_or_else(|| anyhow!("layer '{}' has no sources", layer.name))?;
+        let source = layer
+            .sources
+            .first()
+            .ok_or_else(|| anyhow!("layer '{}' has no sources", layer.name))?;
         let formats = select_formats(layer, &args.formats)?;
         let layer_arc = Arc::new(layer.clone());
         for cg in cl.grids() {
-            if !args.grids.is_empty() && !args.grids.iter().any(|g| g == cg.name() || cg.tile_matrix_sets().contains(g)) {
+            if !args.grids.is_empty()
+                && !args
+                    .grids
+                    .iter()
+                    .any(|g| g == cg.name() || cg.tile_matrix_sets().contains(g))
+            {
                 continue;
             }
             let grid = cg.grid().clone();
@@ -194,14 +218,24 @@ fn plan(state: &AppState, args: &Args) -> Result<Vec<Job>> {
                 .renderer
                 .cache_limit(&layer.name, grid.name())
                 .cloned()
-                .ok_or_else(|| anyhow!("no cache limit computed for layer '{}' grid '{}'", layer.name, grid.name()))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no cache limit computed for layer '{}' grid '{}'",
+                        layer.name,
+                        grid.name()
+                    )
+                })?;
             let (max, reason) = match (args.max_level, limit) {
                 (MaxLevel::Auto, _) => (limit, why),
-                (MaxLevel::Level(n), Some(l)) if n > l => {
-                    (limit, format!("--max-level {n} capped to the layer's durable depth {l} ({why})"))
-                }
+                (MaxLevel::Level(n), Some(l)) if n > l => (
+                    limit,
+                    format!("--max-level {n} capped to the layer's durable depth {l} ({why})"),
+                ),
                 (MaxLevel::Level(n), Some(_)) => (Some(n), format!("--max-level {n}")),
-                (MaxLevel::Level(n), None) => (None, format!("--max-level {n}, but the layer stores no level durably ({why})")),
+                (MaxLevel::Level(n), None) => (
+                    None,
+                    format!("--max-level {n}, but the layer stores no level durably ({why})"),
+                ),
             };
             let mut levels = Vec::new();
             let mut passthrough = Vec::new();
@@ -222,7 +256,13 @@ fn plan(state: &AppState, args: &Args) -> Result<Vec<Job>> {
                 format!("{reason}; skipping passthrough levels {passthrough:?}")
             };
             for &format in &formats {
-                jobs.push(Job { layer: layer_arc.clone(), grid: grid.clone(), format, levels: levels.clone(), reason: reason.clone() });
+                jobs.push(Job {
+                    layer: layer_arc.clone(),
+                    grid: grid.clone(),
+                    format,
+                    levels: levels.clone(),
+                    reason: reason.clone(),
+                });
             }
         }
     }
@@ -236,7 +276,11 @@ fn select_formats(layer: &LayerConfig, wanted: &[String]) -> Result<Vec<OutputFo
     wanted
         .iter()
         .map(|w| {
-            let w = if w.eq_ignore_ascii_case("jpg") { "jpeg" } else { w.as_str() };
+            let w = if w.eq_ignore_ascii_case("jpg") {
+                "jpeg"
+            } else {
+                w.as_str()
+            };
             layer
                 .formats
                 .iter()
@@ -268,7 +312,13 @@ impl Counts {
 }
 
 /// Fill every tile of one level, `--concurrency` at a time.
-async fn run_level(state: &Arc<AppState>, job: &Job, range: TileRange, args: &Args, failures: &mut Vec<String>) -> Counts {
+async fn run_level(
+    state: &Arc<AppState>,
+    job: &Job,
+    range: TileRange,
+    args: &Args,
+    failures: &mut Vec<String>,
+) -> Counts {
     let started = Instant::now();
     let mut counts = Counts::default();
     let mut set = JoinSet::new();
@@ -328,7 +378,11 @@ async fn seed_with_retries(
     let mut failed_attempts = 0u32;
     let mut busy_waits = 0u32;
     loop {
-        let attempt = tokio::time::timeout(timeout, seed_grid_tile(&state.renderer, layer, grid, coord, format, force)).await;
+        let attempt = tokio::time::timeout(
+            timeout,
+            seed_grid_tile(&state.renderer, layer, grid, coord, format, force),
+        )
+        .await;
         let err = match attempt {
             Ok(Ok(outcome)) => return Ok(outcome),
             Ok(Err(e)) if classify(&e) == Disposition::Busy && busy_waits < 600 => {

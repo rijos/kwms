@@ -45,9 +45,7 @@ pub fn generate_service_metadata(config: &Config, base_url: &str) -> Result<Stri
     let mut root = BytesStart::new("TileMapService");
     root.push_attribute(("version", "1.0.0"));
     root.push_attribute(("services", "."));
-    writer
-        .write_event(Event::Start(root))
-        .context("start TileMapService")?;
+    writer.write_event(Event::Start(root)).context("start TileMapService")?;
 
     write_text(&mut writer, "Title", "kwms TMS")?;
     write_text(&mut writer, "Abstract", "kwms — TMS 1.0.0 service")?;
@@ -60,12 +58,10 @@ pub fn generate_service_metadata(config: &Config, base_url: &str) -> Result<Stri
         // Pick the layer's first grid for the advertised `srs` attribute —
         // TMS predates the multi-CRS layer concept, so a layer-per-CRS view
         // is the simplest stable mapping.
-        let grid_name = layer.grids.first().ok_or_else(|| {
-            anyhow!(
-                "TMS service metadata: layer `{}` has no grids configured",
-                layer.name
-            )
-        })?;
+        let grid_name = layer
+            .grids
+            .first()
+            .ok_or_else(|| anyhow!("TMS service metadata: layer `{}` has no grids configured", layer.name))?;
         let grid = lookup_grid(grid_name, &config.grids).ok_or_else(|| {
             anyhow!(
                 "TMS service metadata: layer `{}` references unknown grid `{}`",
@@ -82,9 +78,7 @@ pub fn generate_service_metadata(config: &Config, base_url: &str) -> Result<Stri
         tm.push_attribute(("srs", srs.as_str()));
         tm.push_attribute(("title", layer.title.as_str()));
         tm.push_attribute(("profile", profile.as_str()));
-        writer
-            .write_event(Event::Empty(tm))
-            .context("write TileMap entry")?;
+        writer.write_event(Event::Empty(tm)).context("write TileMap entry")?;
     }
 
     writer
@@ -103,16 +97,13 @@ pub fn generate_service_metadata(config: &Config, base_url: &str) -> Result<Stri
 // ---------------------------------------------------------------------------
 
 /// Generate the per-layer `<TileMap>` document.
-pub fn generate_tile_map(
-    layer: &LayerConfig,
-    config: &Config,
-    base_url: &str,
-) -> Result<String> {
+pub fn generate_tile_map(layer: &LayerConfig, config: &Config, base_url: &str) -> Result<String> {
     let base = base_url.trim_end_matches('/');
 
-    let grid_name = layer.grids.first().ok_or_else(|| {
-        anyhow!("TMS TileMap: layer `{}` has no grids configured", layer.name)
-    })?;
+    let grid_name = layer
+        .grids
+        .first()
+        .ok_or_else(|| anyhow!("TMS TileMap: layer `{}` has no grids configured", layer.name))?;
     let grid = lookup_grid(grid_name, &config.grids).ok_or_else(|| {
         anyhow!(
             "TMS TileMap: layer `{}` references unknown grid `{}`",
@@ -120,12 +111,10 @@ pub fn generate_tile_map(
             grid_name
         )
     })?;
-    let fmt = layer.formats.first().ok_or_else(|| {
-        anyhow!(
-            "TMS TileMap: layer `{}` declares no output formats",
-            layer.name
-        )
-    })?;
+    let fmt = layer
+        .formats
+        .first()
+        .ok_or_else(|| anyhow!("TMS TileMap: layer `{}` declares no output formats", layer.name))?;
 
     let mut writer = Writer::new(Vec::<u8>::new());
     writer
@@ -136,9 +125,7 @@ pub fn generate_tile_map(
     root.push_attribute(("version", "1.0.0"));
     let tms_url = format!("{base}/tms/1.0.0/");
     root.push_attribute(("tilemapservice", tms_url.as_str()));
-    writer
-        .write_event(Event::Start(root))
-        .context("start TileMap")?;
+    writer.write_event(Event::Start(root)).context("start TileMap")?;
 
     write_text(&mut writer, "Title", &layer.title)?;
     write_text(&mut writer, "Abstract", &layer.abstract_)?;
@@ -158,9 +145,7 @@ pub fn generate_tile_map(
     bbox_el.push_attribute(("miny", miny_s.as_str()));
     bbox_el.push_attribute(("maxx", maxx_s.as_str()));
     bbox_el.push_attribute(("maxy", maxy_s.as_str()));
-    writer
-        .write_event(Event::Empty(bbox_el))
-        .context("write BoundingBox")?;
+    writer.write_event(Event::Empty(bbox_el)).context("write BoundingBox")?;
 
     // TMS addresses rows bottom-up, so its Origin is the lower-left corner
     // of the tile matrix (not the top-left that WMTS uses).
@@ -171,9 +156,7 @@ pub fn generate_tile_map(
     let oy_s = oy.to_string();
     origin_el.push_attribute(("x", ox_s.as_str()));
     origin_el.push_attribute(("y", oy_s.as_str()));
-    writer
-        .write_event(Event::Empty(origin_el))
-        .context("write Origin")?;
+    writer.write_event(Event::Empty(origin_el)).context("write Origin")?;
 
     // TileFormat — width / height / mime / extension from the layer's first
     // declared output format. (TMS allows only one tile format per
@@ -186,9 +169,7 @@ pub fn generate_tile_map(
     tf.push_attribute(("height", th.as_str()));
     tf.push_attribute(("mime-type", fmt.mime_type()));
     tf.push_attribute(("extension", fmt.extension()));
-    writer
-        .write_event(Event::Empty(tf))
-        .context("write TileFormat")?;
+    writer.write_event(Event::Empty(tf)).context("write TileFormat")?;
 
     // TileSets — one TileSet per level.
     let profile = tms_profile(grid_name);
@@ -208,9 +189,7 @@ pub fn generate_tile_map(
         ts.push_attribute(("href", href.as_str()));
         ts.push_attribute(("units-per-pixel", upp.as_str()));
         ts.push_attribute(("order", order.as_str()));
-        writer
-            .write_event(Event::Empty(ts))
-            .context("write TileSet")?;
+        writer.write_event(Event::Empty(ts)).context("write TileSet")?;
     }
 
     writer
@@ -228,11 +207,7 @@ pub fn generate_tile_map(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn write_text<W: std::io::Write>(
-    writer: &mut Writer<W>,
-    tag: &str,
-    text: &str,
-) -> Result<()> {
+fn write_text<W: std::io::Write>(writer: &mut Writer<W>, tag: &str, text: &str) -> Result<()> {
     writer
         .write_event(Event::Start(BytesStart::new(tag)))
         .with_context(|| format!("start <{tag}>"))?;
@@ -252,9 +227,7 @@ fn write_text<W: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig,
-    };
+    use crate::config::{Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig};
     use crate::crs::Bbox;
     use crate::encode::OutputFormat;
 
@@ -308,12 +281,8 @@ mod tests {
 
     #[test]
     fn service_metadata_lists_layers() {
-        let xml =
-            generate_service_metadata(&minimal_config(), "https://example.org").unwrap();
-        assert!(
-            xml.contains("<TileMapService"),
-            "missing root element; got:\n{xml}"
-        );
+        let xml = generate_service_metadata(&minimal_config(), "https://example.org").unwrap();
+        assert!(xml.contains("<TileMapService"), "missing root element; got:\n{xml}");
         assert!(
             xml.contains("href=\"https://example.org/tms/1.0.0/ortho2024\""),
             "layer href missing; got:\n{xml}"
@@ -331,12 +300,8 @@ mod tests {
     #[test]
     fn tile_map_has_tilesets_per_level() {
         let cfg = minimal_config();
-        let xml =
-            generate_tile_map(&cfg.layers[0], &cfg, "https://example.org").unwrap();
-        assert!(
-            xml.contains("<TileSets"),
-            "missing <TileSets>; got:\n{xml}"
-        );
+        let xml = generate_tile_map(&cfg.layers[0], &cfg, "https://example.org").unwrap();
+        assert!(xml.contains("<TileSets"), "missing <TileSets>; got:\n{xml}");
         // WebMercator has 22 levels.
         let count = xml.matches("<TileSet ").count();
         assert_eq!(
@@ -351,13 +316,7 @@ mod tests {
         assert!(xml.contains("<Origin "), "missing <Origin> element");
         assert!(xml.contains("<BoundingBox "), "missing <BoundingBox>");
         // TileFormat reflects PNG.
-        assert!(
-            xml.contains("mime-type=\"image/png\""),
-            "expected PNG mime-type"
-        );
-        assert!(
-            xml.contains("extension=\"png\""),
-            "expected png extension"
-        );
+        assert!(xml.contains("mime-type=\"image/png\""), "expected PNG mime-type");
+        assert!(xml.contains("extension=\"png\""), "expected png extension");
     }
 }

@@ -58,7 +58,10 @@ mod tests {
     #[test]
     fn select_level_amsterdam_111km_square() {
         let grid: Arc<dyn TileGrid> = Arc::new(WebMercator::new());
-        let pyramid = Pyramid { grid: grid.clone(), max_level: 20 };
+        let pyramid = Pyramid {
+            grid: grid.clone(),
+            max_level: 20,
+        };
 
         // ~1° × 1° area near Amsterdam, in EPSG:3857. ~111 km wide.
         // (The corners don't need to be geographically exact for this test —
@@ -126,7 +129,12 @@ mod tests {
         let grid: Arc<dyn TileGrid> = Arc::new(WebMercator::new());
         let pyramid = Pyramid { grid, max_level: 3 };
         // 1 m/px request would naturally pick a very deep level; cap at 3.
-        let bbox = Bbox { minx: 0.0, miny: 0.0, maxx: 256.0, maxy: 256.0 };
+        let bbox = Bbox {
+            minx: 0.0,
+            miny: 0.0,
+            maxx: 256.0,
+            maxy: 256.0,
+        };
         assert_eq!(pyramid.select_level(&bbox, (256, 256)), 3);
     }
 }

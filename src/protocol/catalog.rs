@@ -115,8 +115,7 @@ impl CatalogLayer {
     pub fn grid_for_tile_matrix_set(&self, tile_matrix_set: &str) -> Option<&CatalogGrid> {
         self.grids.iter().find(|g| {
             g.tile_matrix_sets.iter().any(|t| t == tile_matrix_set)
-                || well_known_grid(&g.name)
-                    .is_some_and(|w| w.tile_matrix_set_aliases.contains(&tile_matrix_set))
+                || well_known_grid(&g.name).is_some_and(|w| w.tile_matrix_set_aliases.contains(&tile_matrix_set))
         })
     }
     /// The layer's primary grid (the first listed) — what TMS serves.
@@ -150,9 +149,8 @@ impl Catalog {
             }
             let mut grids = Vec::with_capacity(layer.grids.len());
             for name in &layer.grids {
-                let grid = lookup_grid(name, &config.grids).ok_or_else(|| {
-                    anyhow!("layer `{}` references unknown grid `{name}`", layer.name)
-                })?;
+                let grid = lookup_grid(name, &config.grids)
+                    .ok_or_else(|| anyhow!("layer `{}` references unknown grid `{name}`", layer.name))?;
                 let crs = catalog
                     .intern_crs(grid.crs())
                     .with_context(|| format!("grid `{name}` of layer `{}`", layer.name))?;
@@ -179,19 +177,16 @@ impl Catalog {
         let key = match normalize_crs_spelling(crs.as_str()) {
             Some(k) => k,
             None => {
-                let identified = identify_crs(crs)
-                    .with_context(|| format!("GDAL cannot use configured CRS '{crs}'"))?;
+                let identified =
+                    identify_crs(crs).with_context(|| format!("GDAL cannot use configured CRS '{crs}'"))?;
                 normalize_crs_spelling(identified.as_str()).unwrap_or_else(|| crs.as_str().to_string())
             }
         };
         if let Some(&id) = self.crs_spellings.get(&key) {
-            self.crs_spellings
-                .entry(crs.as_str().to_string())
-                .or_insert(id);
+            self.crs_spellings.entry(crs.as_str().to_string()).or_insert(id);
             return Ok(id);
         }
-        let axis_order = native_axis_order(crs)
-            .with_context(|| format!("GDAL cannot use configured CRS '{crs}'"))?;
+        let axis_order = native_axis_order(crs).with_context(|| format!("GDAL cannot use configured CRS '{crs}'"))?;
         let id = CrsId(self.crses.len());
         self.crses.push(CatalogCrs {
             crs: crs.clone(),
@@ -199,9 +194,7 @@ impl Catalog {
         });
         self.crs_spellings.insert(key, id);
         // The exact config token is also a valid spelling.
-        self.crs_spellings
-            .entry(crs.as_str().to_string())
-            .or_insert(id);
+        self.crs_spellings.entry(crs.as_str().to_string()).or_insert(id);
         Ok(id)
     }
 
@@ -252,9 +245,7 @@ pub fn normalize_crs_spelling(spelling: &str) -> Option<String> {
         }
         Some(format!("EPSG:{}", code.parse::<u32>().ok()?))
     };
-    let ogc = |code: &str| -> Option<String> {
-        matches!(code, "84" | "83" | "27").then(|| format!("CRS:{code}"))
-    };
+    let ogc = |code: &str| -> Option<String> { matches!(code, "84" | "83" | "27").then(|| format!("CRS:{code}")) };
     if let Some(code) = lower.strip_prefix("epsg:") {
         return epsg(code);
     }
@@ -318,11 +309,7 @@ mod tests {
             "http://www.opengis.net/def/crs/EPSG/0/3857",
             "https://www.opengis.net/def/crs/EPSG/0/3857",
         ] {
-            assert_eq!(
-                normalize_crs_spelling(s).as_deref(),
-                Some("EPSG:3857"),
-                "{s}"
-            );
+            assert_eq!(normalize_crs_spelling(s).as_deref(), Some("EPSG:3857"), "{s}");
         }
         for s in [
             "CRS:84",
@@ -352,9 +339,7 @@ mod tests {
             layer("a", &["webmercator", "rd_new_quad"]),
             layer("b", &["webmercator"]),
         ]);
-        let wm = cat
-            .resolve_crs("urn:ogc:def:crs:EPSG::3857")
-            .expect("3857 advertised");
+        let wm = cat.resolve_crs("urn:ogc:def:crs:EPSG::3857").expect("3857 advertised");
         assert_eq!(cat.resolve_crs("epsg:3857"), Some(wm));
         assert_eq!(cat.crs(wm).crs().as_str(), "EPSG:3857");
         assert_eq!(cat.crs(wm).axis_order(), AxisOrder::XY);
@@ -387,25 +372,18 @@ mod tests {
         let a = cat.layer("a").unwrap();
         assert_eq!(a.primary_grid().name(), "webmercator");
         assert_eq!(
-            a.grid_for_tile_matrix_set("GoogleMapsCompatible")
-                .unwrap()
-                .name(),
+            a.grid_for_tile_matrix_set("GoogleMapsCompatible").unwrap().name(),
             "webmercator"
         );
         assert_eq!(
-            a.grid_for_tile_matrix_set("GoogleCRS84Quad")
-                .unwrap()
-                .name(),
+            a.grid_for_tile_matrix_set("GoogleCRS84Quad").unwrap().name(),
             "global_geodetic"
         );
         assert!(a.grid_for_tile_matrix_set("NetherlandsRDNewQuad").is_none());
         // Config grid names are not TileMatrixSet identifiers.
         assert!(a.grid_for_tile_matrix_set("webmercator").is_none());
         let geo = cat.resolve_crs("EPSG:4326").unwrap();
-        assert_eq!(
-            a.grid_for_crs(geo).unwrap().tile_matrix_set(),
-            "WorldCRS84Quad"
-        );
+        assert_eq!(a.grid_for_crs(geo).unwrap().tile_matrix_set(), "WorldCRS84Quad");
         assert!(a.offers(OutputFormat::Png) && !a.offers(OutputFormat::GeoTiff));
         assert!(cat.layer("nope").is_none());
     }
@@ -436,11 +414,7 @@ mod tests {
         let id = cat
             .resolve_crs("EPSG:31370")
             .expect("identified via GDAL at build time");
-        assert_eq!(
-            cat.crs(id).crs().as_str(),
-            wkt,
-            "downstream sees the config token"
-        );
+        assert_eq!(cat.crs(id).crs().as_str(), wkt, "downstream sees the config token");
     }
 
     #[test]

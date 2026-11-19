@@ -126,8 +126,7 @@ pub(crate) fn create_georeferenced_mem(
 /// for EPSG:3035); attaching that to a dataset would make GDAL read our x/y
 /// geotransform as y/x.
 pub(crate) fn gis_order_spatial_ref(crs: &Crs) -> Result<SpatialRef> {
-    let mut sr = SpatialRef::from_definition(crs.as_str())
-        .with_context(|| format!("invalid CRS '{crs}'"))?;
+    let mut sr = SpatialRef::from_definition(crs.as_str()).with_context(|| format!("invalid CRS '{crs}'"))?;
     sr.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
     Ok(sr)
 }
@@ -147,11 +146,7 @@ pub(crate) fn set_nodata(ds: &Dataset, nodata: Option<f64>) -> Result<()> {
 }
 
 /// Read every band of `ds` into a band-interleaved [`PixelBuffer`].
-pub(crate) fn read_pixel_buffer(
-    ds: &Dataset,
-    pt: PixelType,
-    nodata: Option<f64>,
-) -> Result<PixelBuffer> {
+pub(crate) fn read_pixel_buffer(ds: &Dataset, pt: PixelType, nodata: Option<f64>) -> Result<PixelBuffer> {
     let (w, h) = ds.raster_size();
     let bands = ds.raster_count();
     let mut planes = Vec::with_capacity(bands);
@@ -223,7 +218,10 @@ pub(crate) fn split_alpha(buffer: PixelBuffer) -> Result<PixelBuffer> {
         data.extend_from_slice(c);
         alpha.push(match buffer.pixel_type {
             PixelType::U16 => {
-                let v = a.get(..2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map_or(0, u16::from_ne_bytes);
+                let v = a
+                    .get(..2)
+                    .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                    .map_or(0, u16::from_ne_bytes);
                 u8::try_from(v.checked_div(257).unwrap_or(0)).unwrap_or(u8::MAX)
             }
             _ => a.first().copied().unwrap_or(0),
@@ -363,7 +361,16 @@ pub(crate) fn warp(sources: &[&Dataset], dst: &mut Dataset, opts: &WarpOptions) 
         push(&nd.to_string())?;
     }
     if opts.black_is_gap && opts.src_nodata.is_none() {
-        for a in ["-srcnodata", "0", "-dstnodata", "None", "-wo", "UNIFIED_SRC_NODATA=YES", "-wo", "INIT_DEST=0"] {
+        for a in [
+            "-srcnodata",
+            "0",
+            "-dstnodata",
+            "None",
+            "-wo",
+            "UNIFIED_SRC_NODATA=YES",
+            "-wo",
+            "INIT_DEST=0",
+        ] {
             push(a)?;
         }
     }
@@ -423,14 +430,22 @@ mod tests {
         let src = source(None);
         // Destination: twice as wide as the source, source on the left half.
         let mut dst = create_georeferenced_mem(
-            PixelType::U8, 8, 4, 1, &Crs::new("EPSG:3857"),
-            &Bbox::from([0.0, 0.0, 800.0, 400.0]), Some(255.0),
+            PixelType::U8,
+            8,
+            4,
+            1,
+            &Crs::new("EPSG:3857"),
+            &Bbox::from([0.0, 0.0, 800.0, 400.0]),
+            Some(255.0),
         )
         .unwrap();
         let opts = WarpOptions {
             resampling: ResampleAlg::NearestNeighbour,
             src_nodata: None,
-            dst_nodata: Some(255.0), src_alpha: false, dst_alpha: false, black_is_gap: false
+            dst_nodata: Some(255.0),
+            src_alpha: false,
+            dst_alpha: false,
+            black_is_gap: false,
         };
         warp(&[&src], &mut dst, &opts).unwrap();
         let out = read_pixel_buffer(&dst, PixelType::U8, Some(255.0)).unwrap();
@@ -443,11 +458,23 @@ mod tests {
         // Bilinear/average would invent values that don't exist in the source.
         let src = source(None);
         let mut dst = create_georeferenced_mem(
-            PixelType::U8, 2, 2, 1, &Crs::new("EPSG:3857"),
-            &Bbox::from([0.0, 0.0, 400.0, 400.0]), None,
+            PixelType::U8,
+            2,
+            2,
+            1,
+            &Crs::new("EPSG:3857"),
+            &Bbox::from([0.0, 0.0, 400.0, 400.0]),
+            None,
         )
         .unwrap();
-        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
+        let opts = WarpOptions {
+            resampling: ResampleAlg::NearestNeighbour,
+            src_nodata: None,
+            dst_nodata: None,
+            src_alpha: false,
+            dst_alpha: false,
+            black_is_gap: false,
+        };
         warp(&[&src], &mut dst, &opts).unwrap();
         let out = read_pixel_buffer(&dst, PixelType::U8, None).unwrap();
         assert!(out.data.iter().all(|v| (1..=16).contains(v)), "{:?}", out.data);
@@ -457,11 +484,23 @@ mod tests {
     fn warp_cross_crs_uses_source_nodata() {
         let src = source(Some(7.0));
         let mut dst = create_georeferenced_mem(
-            PixelType::U8, 4, 4, 1, &Crs::new("EPSG:4326"),
-            &Bbox::from([-180.0, -85.0, 180.0, 85.0]), Some(7.0),
+            PixelType::U8,
+            4,
+            4,
+            1,
+            &Crs::new("EPSG:4326"),
+            &Bbox::from([-180.0, -85.0, 180.0, 85.0]),
+            Some(7.0),
         )
         .unwrap();
-        let opts = WarpOptions { resampling: ResampleAlg::Bilinear, src_nodata: None, dst_nodata: Some(7.0) , src_alpha: false, dst_alpha: false, black_is_gap: false};
+        let opts = WarpOptions {
+            resampling: ResampleAlg::Bilinear,
+            src_nodata: None,
+            dst_nodata: Some(7.0),
+            src_alpha: false,
+            dst_alpha: false,
+            black_is_gap: false,
+        };
         warp(&[&src], &mut dst, &opts).unwrap();
         // The tiny source covers almost nothing of the world: everything is nodata.
         let out = read_pixel_buffer(&dst, PixelType::U8, Some(7.0)).unwrap();
@@ -482,15 +521,29 @@ mod tests {
         // window falls outside the source.
         let buf = PixelBuffer::filled(360, 180, 1, PixelType::U8, 77.0, None).unwrap();
         let mut src = mem_from_pixel_buffer(&buf).unwrap();
-        src.set_spatial_ref(&gis_order_spatial_ref(&Crs::new("EPSG:4326")).unwrap()).unwrap();
+        src.set_spatial_ref(&gis_order_spatial_ref(&Crs::new("EPSG:4326")).unwrap())
+            .unwrap();
         src.set_geo_transform(&bbox_to_geotransform(&Bbox::from([-180.0, -90.0, 180.0, 90.0]), 360, 180).unwrap())
             .unwrap();
         for crs in ["EPSG:4326", "CRS:84"] {
             let mut dst = create_georeferenced_mem(
-                PixelType::U8, 16, 16, 1, &Crs::new(crs), &Bbox::from([-10.0, 40.0, 10.0, 60.0]), None,
+                PixelType::U8,
+                16,
+                16,
+                1,
+                &Crs::new(crs),
+                &Bbox::from([-10.0, 40.0, 10.0, 60.0]),
+                None,
             )
             .unwrap();
-            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
+            let opts = WarpOptions {
+                resampling: ResampleAlg::NearestNeighbour,
+                src_nodata: None,
+                dst_nodata: None,
+                src_alpha: false,
+                dst_alpha: false,
+                black_is_gap: false,
+            };
             warp(&[&src], &mut dst, &opts).unwrap();
             let out = read_pixel_buffer(&dst, PixelType::U8, None).unwrap();
             assert!(out.data.iter().all(|&v| v == 77), "{crs}: {:?}", &out.data[..16]);
@@ -502,29 +555,50 @@ mod tests {
         // Two adjacent 4326 tiles (west, east), both 77: the mosaic across
         // the antimeridian-free middle must be 77 on both sides.
         let tile = |minx: f64| {
-            let mut ds = mem_from_pixel_buffer(&PixelBuffer::filled(16, 16, 1, PixelType::U8, 77.0, None).unwrap()).unwrap();
-            ds.set_spatial_ref(&gis_order_spatial_ref(&Crs::new("EPSG:4326")).unwrap()).unwrap();
-            ds.set_geo_transform(&bbox_to_geotransform(&Bbox::from([minx, -90.0, minx + 180.0, 90.0]), 16, 16).unwrap())
+            let mut ds =
+                mem_from_pixel_buffer(&PixelBuffer::filled(16, 16, 1, PixelType::U8, 77.0, None).unwrap()).unwrap();
+            ds.set_spatial_ref(&gis_order_spatial_ref(&Crs::new("EPSG:4326")).unwrap())
                 .unwrap();
+            ds.set_geo_transform(
+                &bbox_to_geotransform(&Bbox::from([minx, -90.0, minx + 180.0, 90.0]), 16, 16).unwrap(),
+            )
+            .unwrap();
             ds
         };
         let (west, east) = (tile(-180.0), tile(0.0));
         for nodata in [None, Some(255.0)] {
             let mut dst = create_georeferenced_mem(
-                PixelType::U8, 34, 16, 1, &Crs::new("EPSG:4326"),
-                &Bbox::from([-170.0, -80.0, 170.0, 80.0]), nodata,
+                PixelType::U8,
+                34,
+                16,
+                1,
+                &Crs::new("EPSG:4326"),
+                &Bbox::from([-170.0, -80.0, 170.0, 80.0]),
+                nodata,
             )
             .unwrap();
-            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: nodata , src_alpha: false, dst_alpha: false, black_is_gap: false};
+            let opts = WarpOptions {
+                resampling: ResampleAlg::NearestNeighbour,
+                src_nodata: None,
+                dst_nodata: nodata,
+                src_alpha: false,
+                dst_alpha: false,
+                black_is_gap: false,
+            };
             warp(&[&west, &east], &mut dst, &opts).unwrap();
             let out = read_pixel_buffer(&dst, PixelType::U8, nodata).unwrap();
-            assert!(out.data.iter().all(|&v| v == 77), "nodata={nodata:?}: {:?}", &out.data[..34]);
+            assert!(
+                out.data.iter().all(|&v| v == 77),
+                "nodata={nodata:?}: {:?}",
+                &out.data[..34]
+            );
         }
     }
 
     fn bad_source(geotransform: Option<[f64; 6]>) -> Dataset {
         let mut ds = mem_from_pixel_buffer(&PixelBuffer::filled(4, 4, 1, PixelType::U8, 9.0, None).unwrap()).unwrap();
-        ds.set_spatial_ref(&gis_order_spatial_ref(&Crs::new("EPSG:3857")).unwrap()).unwrap();
+        ds.set_spatial_ref(&gis_order_spatial_ref(&Crs::new("EPSG:3857")).unwrap())
+            .unwrap();
         if let Some(gt) = geotransform {
             ds.set_geo_transform(&gt).unwrap();
         }
@@ -534,10 +608,23 @@ mod tests {
     #[test]
     fn failed_warps_never_release_or_leak_the_destination() {
         let mut dst = create_georeferenced_mem(
-            PixelType::U8, 4, 4, 1, &Crs::new("EPSG:3857"), &Bbox::from([0.0, 0.0, 400.0, 400.0]), None,
+            PixelType::U8,
+            4,
+            4,
+            1,
+            &Crs::new("EPSG:3857"),
+            &Bbox::from([0.0, 0.0, 400.0, 400.0]),
+            None,
         )
         .unwrap();
-        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
+        let opts = WarpOptions {
+            resampling: ResampleAlg::NearestNeighbour,
+            src_nodata: None,
+            dst_nodata: None,
+            src_alpha: false,
+            dst_alpha: false,
+            black_is_gap: false,
+        };
         assert_eq!(ffi::dataset_ref_count(&dst), 1);
         // Zero pixel size ("Cannot invert geotransform") and no geotransform
         // ("Unable to compute a transformation") make GDALWarp itself fail.
@@ -547,12 +634,20 @@ mod tests {
             for bad in [&zero_pixel, &no_geotransform] {
                 let err = warp(&[bad], &mut dst, &opts).unwrap_err();
                 assert!(err.to_string().starts_with("GDALWarp failed: "), "{err:#}");
-                assert_eq!(ffi::dataset_ref_count(&dst), 1, "GDALWarp must balance its reference on failure");
+                assert_eq!(
+                    ffi::dataset_ref_count(&dst),
+                    1,
+                    "GDALWarp must balance its reference on failure"
+                );
             }
         }
         // Still fully usable afterwards, and a success balances too.
         warp(&[&source(None)], &mut dst, &opts).unwrap();
-        assert_eq!(ffi::dataset_ref_count(&dst), 1, "GDALWarp must balance its reference on success");
+        assert_eq!(
+            ffi::dataset_ref_count(&dst),
+            1,
+            "GDALWarp must balance its reference on success"
+        );
         let out = read_pixel_buffer(&dst, PixelType::U8, None).unwrap();
         assert_eq!(&out.data[..4], &[1, 2, 3, 4]);
     }
@@ -563,18 +658,27 @@ mod tests {
         for a in ["-r", "no-such-kernel"] {
             args.add_string(a).unwrap();
         }
-        let err = ffi::WarpAppOptions::new(&args).err().expect("GDAL must reject the options");
+        let err = ffi::WarpAppOptions::new(&args)
+            .err()
+            .expect("GDAL must reject the options");
         assert!(err.to_string().contains("rejected the options"), "{err:#}");
     }
 
     #[test]
     fn last_cpl_error_only_reports_the_current_call() {
         // Leave a stale error on this thread, then reset: it must not be reported.
-        let _ = warp(&[&bad_source(None)], &mut create_mem(PixelType::U8, 1, 1, 1).unwrap(), &WarpOptions {
-            resampling: ResampleAlg::NearestNeighbour,
-            src_nodata: None,
-            dst_nodata: None, src_alpha: false, dst_alpha: false, black_is_gap: false
-        });
+        let _ = warp(
+            &[&bad_source(None)],
+            &mut create_mem(PixelType::U8, 1, 1, 1).unwrap(),
+            &WarpOptions {
+                resampling: ResampleAlg::NearestNeighbour,
+                src_nodata: None,
+                dst_nodata: None,
+                src_alpha: false,
+                dst_alpha: false,
+                black_is_gap: false,
+            },
+        );
         ffi::cpl_error_reset();
         assert_eq!(ffi::cpl_error_message(), None);
     }
@@ -586,10 +690,23 @@ mod tests {
     fn concurrent_warps_on_independent_datasets_agree() {
         let expected = {
             let mut dst = create_georeferenced_mem(
-                PixelType::U8, 8, 4, 1, &Crs::new("EPSG:3857"), &Bbox::from([0.0, 0.0, 800.0, 400.0]), Some(255.0),
+                PixelType::U8,
+                8,
+                4,
+                1,
+                &Crs::new("EPSG:3857"),
+                &Bbox::from([0.0, 0.0, 800.0, 400.0]),
+                Some(255.0),
             )
             .unwrap();
-            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: Some(255.0) , src_alpha: false, dst_alpha: false, black_is_gap: false};
+            let opts = WarpOptions {
+                resampling: ResampleAlg::NearestNeighbour,
+                src_nodata: None,
+                dst_nodata: Some(255.0),
+                src_alpha: false,
+                dst_alpha: false,
+                black_is_gap: false,
+            };
             warp(&[&source(None)], &mut dst, &opts).unwrap();
             read_pixel_buffer(&dst, PixelType::U8, None).unwrap().data
         };
@@ -600,10 +717,23 @@ mod tests {
                     for _ in 0..50 {
                         let src = source(None);
                         let mut dst = create_georeferenced_mem(
-                            PixelType::U8, 8, 4, 1, &Crs::new("EPSG:3857"), &Bbox::from([0.0, 0.0, 800.0, 400.0]), Some(255.0),
+                            PixelType::U8,
+                            8,
+                            4,
+                            1,
+                            &Crs::new("EPSG:3857"),
+                            &Bbox::from([0.0, 0.0, 800.0, 400.0]),
+                            Some(255.0),
                         )
                         .unwrap();
-                        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: Some(255.0) , src_alpha: false, dst_alpha: false, black_is_gap: false};
+                        let opts = WarpOptions {
+                            resampling: ResampleAlg::NearestNeighbour,
+                            src_nodata: None,
+                            dst_nodata: Some(255.0),
+                            src_alpha: false,
+                            dst_alpha: false,
+                            black_is_gap: false,
+                        };
                         warp(&[&src], &mut dst, &opts).unwrap();
                         assert_eq!(read_pixel_buffer(&dst, PixelType::U8, None).unwrap().data, expected);
                     }
@@ -624,7 +754,14 @@ mod tests {
             .map(|_| {
                 let stop = stop.clone();
                 std::thread::spawn(move || {
-                    let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
+                    let opts = WarpOptions {
+                        resampling: ResampleAlg::NearestNeighbour,
+                        src_nodata: None,
+                        dst_nodata: None,
+                        src_alpha: false,
+                        dst_alpha: false,
+                        black_is_gap: false,
+                    };
                     let mut dst = create_mem(PixelType::U8, 1, 1, 1).unwrap();
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = warp(&[&bad_source(None)], &mut dst, &opts); // raises CPL errors
@@ -634,7 +771,11 @@ mod tests {
             .collect();
         for _ in 0..2000 {
             ffi::cpl_error_reset();
-            assert_eq!(ffi::cpl_error_message(), None, "another thread's GDAL error leaked into this thread");
+            assert_eq!(
+                ffi::cpl_error_message(),
+                None,
+                "another thread's GDAL error leaked into this thread"
+            );
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for t in noisy {

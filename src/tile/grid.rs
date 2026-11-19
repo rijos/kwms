@@ -394,7 +394,12 @@ impl CustomGrid {
             GridOrigin::TopLeft => (ax, ay),
             GridOrigin::BottomLeft => (ax, ay + f64::from(cfg.tile_size[1]) * cfg.base_resolution),
         };
-        Self { name: name.into(), cfg, level_count, top_left }
+        Self {
+            name: name.into(),
+            cfg,
+            level_count,
+            top_left,
+        }
     }
 }
 
@@ -423,9 +428,16 @@ impl TileGrid for CustomGrid {
         // must not gain a column/row from float noise.
         let count = |span: f64, tile: u32| {
             let n = (span / (f64::from(tile) * res) - 1e-9).ceil();
-            if n.is_finite() && n >= 1.0 { n as u64 } else { 1 }
+            if n.is_finite() && n >= 1.0 {
+                n as u64
+            } else {
+                1
+            }
         };
-        (count(maxx - tlx, self.cfg.tile_size[0]), count(tly - miny, self.cfg.tile_size[1]))
+        (
+            count(maxx - tlx, self.cfg.tile_size[0]),
+            count(tly - miny, self.cfg.tile_size[1]),
+        )
     }
     fn level_count(&self) -> u32 {
         self.level_count
@@ -437,7 +449,12 @@ impl TileGrid for CustomGrid {
         let (tlx, tly) = self.top_left;
         let minx = tlx + f64::from(coord.x) * tw;
         let maxy = tly - f64::from(coord.y) * th;
-        Bbox { minx, miny: maxy - th, maxx: minx + tw, maxy }
+        Bbox {
+            minx,
+            miny: maxy - th,
+            maxx: minx + tw,
+            maxy,
+        }
     }
 }
 
@@ -520,10 +537,7 @@ pub fn tms_profile(grid_name: &str) -> &'static str {
 /// Resolve a grid name to a `TileGrid`: built-in grids first, then the
 /// user-supplied `custom` map. (Validation forbids custom grids that reuse a
 /// built-in name, so the precedence never hides one.)
-pub fn lookup_grid(
-    name: &str,
-    custom: &HashMap<String, GridConfig>,
-) -> Option<Arc<dyn TileGrid>> {
+pub fn lookup_grid(name: &str, custom: &HashMap<String, GridConfig>) -> Option<Arc<dyn TileGrid>> {
     if let Some(g) = well_known_grid(name) {
         return Some((g.build)());
     }
@@ -636,8 +650,14 @@ mod tests {
         let g = WebMercator::new();
         assert!(g.check_coord(TileCoord::new(0, 0, 0)).is_ok());
         assert!(g.check_coord(TileCoord::new(21, (1 << 21) - 1, (1 << 21) - 1)).is_ok());
-        assert!(g.check_coord(TileCoord::new(22, 0, 0)).is_err(), "level past level_count");
-        assert!(g.check_coord(TileCoord::new(64, 0, 0)).is_err(), "would overflow a shift");
+        assert!(
+            g.check_coord(TileCoord::new(22, 0, 0)).is_err(),
+            "level past level_count"
+        );
+        assert!(
+            g.check_coord(TileCoord::new(64, 0, 0)).is_err(),
+            "would overflow a shift"
+        );
         assert!(g.check_coord(TileCoord::new(u32::MAX, 0, 0)).is_err());
         assert!(g.check_coord(TileCoord::new(3, 8, 0)).is_err(), "column past matrix");
         assert!(g.check_coord(TileCoord::new(3, 0, 8)).is_err(), "row past matrix");
@@ -694,8 +714,18 @@ mod tests {
         // Bottom-left anchor (0,0) with a 256-unit level-0 tile is the same
         // grid as a top-left anchor at (0,256).
         let bl = CustomGrid::new("bl", cfg(GridOrigin::BottomLeft));
-        let tl = CustomGrid::new("tl", GridConfig { top_left: [0.0, 256.0], ..cfg(GridOrigin::TopLeft) });
-        for c in [TileCoord::new(0, 0, 0), TileCoord::new(1, 0, 0), TileCoord::new(1, 1, 1)] {
+        let tl = CustomGrid::new(
+            "tl",
+            GridConfig {
+                top_left: [0.0, 256.0],
+                ..cfg(GridOrigin::TopLeft)
+            },
+        );
+        for c in [
+            TileCoord::new(0, 0, 0),
+            TileCoord::new(1, 0, 0),
+            TileCoord::new(1, 1, 1),
+        ] {
             assert_eq!(bl.tile_bbox(c), tl.tile_bbox(c), "{c:?}");
         }
         // Row 0 at level 1 is the *top* row.

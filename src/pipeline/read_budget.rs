@@ -36,8 +36,12 @@ const GDAL_OVR_EPSILON: f64 = 0.1;
 /// and the overview decimation that would be needed.
 pub fn check(uri: &str, meta: &SourceMetadata, grid: &dyn TileGrid, coverage: &Bbox) -> Result<()> {
     for level in 0..grid.level_count() {
-        let read = pixels_read(meta, grid, level, coverage)
-            .with_context(|| format!("estimating source reads of `{uri}` for grid `{}` level {level}", grid.name()))?;
+        let read = pixels_read(meta, grid, level, coverage).with_context(|| {
+            format!(
+                "estimating source reads of `{uri}` for grid `{}` level {level}",
+                grid.name()
+            )
+        })?;
         let Some(read) = read else { continue };
         if read.pixels > MAX_SOURCE_READ_PIXELS {
             let needed = (read.full_res_pixels / MAX_SOURCE_READ_PIXELS).sqrt().ceil();
@@ -71,8 +75,19 @@ fn pixels_read(meta: &SourceMetadata, grid: &dyn TileGrid, level: u32, coverage:
     let (tile_w, tile_h) = grid.tile_size();
     let res = grid.resolution(level);
     let (half_w, half_h) = (f64::from(tile_w) * res / 2.0, f64::from(tile_h) * res / 2.0);
-    let (cx, cy) = ((coverage.minx + coverage.maxx) / 2.0, (coverage.miny + coverage.maxy) / 2.0);
-    let window = clip(&Bbox { minx: cx - half_w, miny: cy - half_h, maxx: cx + half_w, maxy: cy + half_h }, coverage);
+    let (cx, cy) = (
+        (coverage.minx + coverage.maxx) / 2.0,
+        (coverage.miny + coverage.maxy) / 2.0,
+    );
+    let window = clip(
+        &Bbox {
+            minx: cx - half_w,
+            miny: cy - half_h,
+            maxx: cx + half_w,
+            maxy: cy + half_h,
+        },
+        coverage,
+    );
     let Some(window) = window else { return Ok(None) };
     // Output pixels the window spans (at most one tile).
     let out_w = ((window.maxx - window.minx) / res).max(1.0);
@@ -84,7 +99,9 @@ fn pixels_read(meta: &SourceMetadata, grid: &dyn TileGrid, level: u32, coverage:
     } else {
         transform_bbox(&window, grid.crs(), &meta.native_crs)?
     };
-    let Some(footprint) = clip(&footprint, &meta.native_bbox) else { return Ok(None) };
+    let Some(footprint) = clip(&footprint, &meta.native_bbox) else {
+        return Ok(None);
+    };
     let (src_w, src_h) = (f64::from(meta.size.0), f64::from(meta.size.1));
     let nb = &meta.native_bbox;
     let fx = (footprint.maxx - footprint.minx) / (nb.maxx - nb.minx) * src_w;
@@ -95,7 +112,10 @@ fn pixels_read(meta: &SourceMetadata, grid: &dyn TileGrid, level: u32, coverage:
     if !pixels.is_finite() {
         bail!("non-finite source footprint {footprint:?}");
     }
-    Ok(Some(Read { pixels, full_res_pixels: fx * fy }))
+    Ok(Some(Read {
+        pixels,
+        full_res_pixels: fx * fy,
+    }))
 }
 
 /// The (x, y) decimation of the overview GDAL's `-ovr AUTO` picks for
@@ -125,16 +145,25 @@ pub const MAX_DIRECT_READ_PIXELS: f64 = 4.0 * MAX_SOURCE_READ_PIXELS;
 /// source. The ratio of source to output pixels comes from the whole
 /// window; only the part over the source is read.
 pub fn window_read_pixels(meta: &SourceMetadata, crs: &Crs, bbox: &Bbox, size: (u32, u32)) -> Result<f64> {
-    let footprint = if same_token(crs, &meta.native_crs) { *bbox } else { transform_bbox(bbox, crs, &meta.native_crs)? };
+    let footprint = if same_token(crs, &meta.native_crs) {
+        *bbox
+    } else {
+        transform_bbox(bbox, crs, &meta.native_crs)?
+    };
     let (src_w, src_h) = (f64::from(meta.size.0), f64::from(meta.size.1));
     let nb = &meta.native_bbox;
     let px = |f: &Bbox| {
-        ((f.maxx - f.minx) / (nb.maxx - nb.minx) * src_w, (f.maxy - f.miny) / (nb.maxy - nb.miny) * src_h)
+        (
+            (f.maxx - f.minx) / (nb.maxx - nb.minx) * src_w,
+            (f.maxy - f.miny) / (nb.maxy - nb.miny) * src_h,
+        )
     };
     let (fx, fy) = px(&footprint);
     let ratio = (fx / f64::from(size.0.max(1))).min(fy / f64::from(size.1.max(1)));
     let (kx, ky) = gdal_overview(meta, ratio);
-    let Some(clipped) = clip(&footprint, nb) else { return Ok(0.0) };
+    let Some(clipped) = clip(&footprint, nb) else {
+        return Ok(0.0);
+    };
     let (cx, cy) = px(&clipped);
     let pixels = (cx / kx).ceil() * (cy / ky).ceil();
     if !pixels.is_finite() {
@@ -144,7 +173,12 @@ pub fn window_read_pixels(meta: &SourceMetadata, crs: &Crs, bbox: &Bbox, size: (
 }
 
 fn clip(a: &Bbox, b: &Bbox) -> Option<Bbox> {
-    let c = Bbox { minx: a.minx.max(b.minx), miny: a.miny.max(b.miny), maxx: a.maxx.min(b.maxx), maxy: a.maxy.min(b.maxy) };
+    let c = Bbox {
+        minx: a.minx.max(b.minx),
+        miny: a.miny.max(b.miny),
+        maxx: a.maxx.min(b.maxx),
+        maxy: a.maxy.min(b.maxy),
+    };
     (c.minx < c.maxx && c.miny < c.maxy).then_some(c)
 }
 
@@ -236,7 +270,9 @@ mod tests {
         // ratios 491 / 423 → target 423. GDAL takes the coarsest overview
         // decimated below 423.1: 1/256 (157 px), not 1/512 (79 px ≈ 506×).
         let meta = big_rd(pyramid(40_000, &[2, 4, 8, 16, 32, 64, 128, 256, 512]));
-        let read = pixels_read(&meta, &RdNewQuad::new(), 0, &meta.native_bbox).unwrap().unwrap();
+        let read = pixels_read(&meta, &RdNewQuad::new(), 0, &meta.native_bbox)
+            .unwrap()
+            .unwrap();
         assert!((157.0 * 157.0..=158.0 * 158.0).contains(&read.pixels), "{read:?}");
         assert_eq!(read.full_res_pixels, 40_000.0 * 40_000.0);
     }

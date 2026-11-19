@@ -130,9 +130,13 @@ fn shapefile_boxes(path: &Path) -> Result<Vec<[f64; 4]>> {
     while let Some(head) = bytes.get(at..at.saturating_add(8)) {
         // Record header: number and content length in 16-bit words, big-endian.
         let words = i32::from_be_bytes([head[4], head[5], head[6], head[7]]);
-        let len = usize::try_from(words).context("negative shapefile record length")?.saturating_mul(2);
+        let len = usize::try_from(words)
+            .context("negative shapefile record length")?
+            .saturating_mul(2);
         let start = at.saturating_add(8);
-        let content = bytes.get(start..start.saturating_add(len)).context("truncated shapefile record")?;
+        let content = bytes
+            .get(start..start.saturating_add(len))
+            .context("truncated shapefile record")?;
         if content.len() >= 36 && i32::from_le_bytes([content[0], content[1], content[2], content[3]]) != 0 {
             let f = |i: usize| f64::from_le_bytes(content[4 + 8 * i..12 + 8 * i].try_into().unwrap_or([0; 8]));
             boxes.push([f(0), f(1), f(2), f(3)]);
@@ -217,7 +221,11 @@ fn fetch(agent: &ureq::Agent, url: &str) -> Sample {
         }
         Err(e) => (format!("error: {}", error_kind(&e)), 0),
     };
-    Sample { secs: started.elapsed().as_secs_f64(), status, bytes }
+    Sample {
+        secs: started.elapsed().as_secs_f64(),
+        status,
+        bytes,
+    }
 }
 
 fn error_kind(e: &ureq::Error) -> &'static str {
@@ -234,7 +242,11 @@ fn get_text(agent: &ureq::Agent, url: &str) -> Result<String> {
     if resp.status().as_u16() != 200 {
         bail!("GET {url}: HTTP {}", resp.status());
     }
-    resp.body_mut().with_config().limit(64 << 20).read_to_string().with_context(|| format!("reading {url}"))
+    resp.body_mut()
+        .with_config()
+        .limit(64 << 20)
+        .read_to_string()
+        .with_context(|| format!("reading {url}"))
 }
 
 /// Cache counters and stage timings from a kwms /metrics endpoint (empty if
@@ -252,7 +264,9 @@ fn metrics(agent: &ureq::Agent, url: &str) -> BTreeMap<String, f64> {
     if url.is_empty() {
         return BTreeMap::new();
     }
-    let Ok(text) = get_text(agent, url) else { return BTreeMap::new() };
+    let Ok(text) = get_text(agent, url) else {
+        return BTreeMap::new();
+    };
     text.lines()
         .filter(|l| KEEP.iter().any(|k| l.starts_with(k)))
         .filter_map(|l| {
@@ -269,10 +283,16 @@ fn cpu_by_thread(pid: Option<u32>) -> BTreeMap<String, f64> {
     let Some(pid) = pid else { return out };
     // USER_HZ: 100 on every Linux kwms runs on.
     let tick = 100.0;
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return out };
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return out;
+    };
     for task in tasks.flatten() {
-        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else { continue };
-        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            continue;
+        };
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            continue;
+        };
         let name = &stat[open + 1..close];
         let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
         // utime, stime: fields 14 and 15 of stat = 11 and 12 after the name.
@@ -334,11 +354,18 @@ struct Grid {
 fn wmts_grid(agent: &ureq::Agent, base: &str, layer: &str, matrix_set: &str, level: u32, format: &str) -> Result<Grid> {
     let xml = get_text(agent, &format!("{base}/wmts?SERVICE=WMTS&REQUEST=GetCapabilities"))?;
     let doc = roxmltree::Document::parse(&xml).context("parsing WMTS capabilities")?;
-    let is = |n: &roxmltree::Node, ns: &str, name: &str| n.tag_name().namespace() == Some(ns) && n.tag_name().name() == name;
+    let is =
+        |n: &roxmltree::Node, ns: &str, name: &str| n.tag_name().namespace() == Some(ns) && n.tag_name().name() == name;
     let child_text = |n: roxmltree::Node, ns: &str, name: &str| -> Option<String> {
-        n.children().find(|c| is(c, ns, name)).and_then(|c| c.text()).map(|t| t.trim().to_string())
+        n.children()
+            .find(|c| is(c, ns, name))
+            .and_then(|c| c.text())
+            .map(|t| t.trim().to_string())
     };
-    let contents = doc.descendants().find(|n| is(n, WMTS_NS, "Contents")).context("no Contents")?;
+    let contents = doc
+        .descendants()
+        .find(|n| is(n, WMTS_NS, "Contents"))
+        .context("no Contents")?;
     let tms = contents
         .children()
         .filter(|n| is(n, WMTS_NS, "TileMatrixSet"))
@@ -352,7 +379,10 @@ fn wmts_grid(agent: &ureq::Agent, base: &str, layer: &str, matrix_set: &str, lev
         .find(|n| child_text(*n, OWS_NS, "Identifier").as_deref() == Some(&level.to_string()))
         .with_context(|| format!("no TileMatrix {level} in '{matrix_set}'"))?;
     let num = |name: &str| -> Result<f64> {
-        child_text(tm, WMTS_NS, name).with_context(|| format!("no {name}"))?.parse().with_context(|| format!("bad {name}"))
+        child_text(tm, WMTS_NS, name)
+            .with_context(|| format!("no {name}"))?
+            .parse()
+            .with_context(|| format!("bad {name}"))
     };
     let corner = child_text(tm, WMTS_NS, "TopLeftCorner").context("no TopLeftCorner")?;
     let mut xy = corner.split_whitespace().map(str::parse::<f64>);
@@ -387,8 +417,14 @@ fn view_tiles(grid: &Grid, (cx, cy): (f64, f64), size: (u32, u32)) -> Vec<(u32, 
     let (tw, th) = (f64::from(grid.tile.0) * res, f64::from(grid.tile.1) * res);
     let (w, h) = (f64::from(size.0) * res, f64::from(size.1) * res);
     let clamp = |v: f64, max: u32| v.floor().clamp(0.0, f64::from(max.saturating_sub(1))) as u32;
-    let (c0, c1) = (clamp((cx - w / 2.0 - x0) / tw, grid.matrix.0), clamp((cx + w / 2.0 - x0) / tw, grid.matrix.0));
-    let (r0, r1) = (clamp((y0 - (cy + h / 2.0)) / th, grid.matrix.1), clamp((y0 - (cy - h / 2.0)) / th, grid.matrix.1));
+    let (c0, c1) = (
+        clamp((cx - w / 2.0 - x0) / tw, grid.matrix.0),
+        clamp((cx + w / 2.0 - x0) / tw, grid.matrix.0),
+    );
+    let (r0, r1) = (
+        clamp((y0 - (cy + h / 2.0)) / th, grid.matrix.1),
+        clamp((y0 - (cy - h / 2.0)) / th, grid.matrix.1),
+    );
     (r0..=r1).flat_map(|r| (c0..=c1).map(move |c| (c, r))).collect()
 }
 
@@ -456,13 +492,22 @@ fn summarize(
     let bytes: usize = samples.iter().map(|s| s.bytes).sum();
     let wall: f64 = view_times.iter().sum();
     let ms = |v: f64| (v * 1000.0).round();
-    let view_mean = if view_times.is_empty() { f64::NAN } else { wall / view_times.len() as f64 };
+    let view_mean = if view_times.is_empty() {
+        f64::NAN
+    } else {
+        wall / view_times.len() as f64
+    };
     let view_max = view_times.iter().copied().fold(0.0, f64::max);
     let req_per_s = if wall > 0.0 { lat.len() as f64 / wall } else { 0.0 };
     let cache: BTreeMap<String, f64> = after
         .iter()
         .filter(|(k, _)| !k.contains("_seconds_"))
-        .map(|(k, v)| (k.replacen("kwms_cache_", "", 1), v - before.get(k).copied().unwrap_or(0.0)))
+        .map(|(k, v)| {
+            (
+                k.replacen("kwms_cache_", "", 1),
+                v - before.get(k).copied().unwrap_or(0.0),
+            )
+        })
         .filter(|(_, d)| *d != 0.0)
         .collect();
     let stages = stage_table(before, after);
@@ -492,7 +537,10 @@ fn summarize(
         let mut rows: Vec<_> = stages.iter().collect();
         rows.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
         for (name, (n, t)) in rows {
-            println!("        {name:22} {n:6} x {:8.1} ms = {t:8.2} s", t / *n as f64 * 1000.0);
+            println!(
+                "        {name:22} {n:6} x {:8.1} ms = {t:8.2} s",
+                t / *n as f64 * 1000.0
+            );
         }
     }
     if !cpu.is_empty() {
@@ -527,7 +575,11 @@ fn summarize(
 fn main() -> Result<()> {
     let args = Args::parse();
     let base = args.url.trim_end_matches('/').to_string();
-    let size = match args.size.split_once('x').map(|(w, h)| (w.parse::<u32>(), h.parse::<u32>())) {
+    let size = match args
+        .size
+        .split_once('x')
+        .map(|(w, h)| (w.parse::<u32>(), h.parse::<u32>()))
+    {
         Some((Ok(w), Ok(h))) if w > 0 && h > 0 => (w, h),
         _ => bail!("--size must look like 1920x1080"),
     };
@@ -535,20 +587,37 @@ fn main() -> Result<()> {
         bail!("--concurrency and --views must be at least 1");
     }
     let seed = args.seed.unwrap_or_else(|| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
     });
     let agent = agent(Duration::from_secs_f64(args.timeout));
     let points = sample_points(&shapefile_boxes(&args.index)?, args.views, &mut Rng(seed));
 
     let (views, what): (Vec<Vec<String>>, String) = match &args.mode {
-        Mode::Wmts { matrix_set, level, format } => {
+        Mode::Wmts {
+            matrix_set,
+            level,
+            format,
+        } => {
             let grid = wmts_grid(&agent, &base, &args.layer, matrix_set, *level, format)?;
             let centres = reproject(&points, &args.index_crs, &grid.crs)?;
             let views = centres
                 .iter()
-                .map(|&c| view_tiles(&grid, c, size).into_iter().map(|t| tile_url(&grid, matrix_set, *level, t)).collect())
+                .map(|&c| {
+                    view_tiles(&grid, c, size)
+                        .into_iter()
+                        .map(|t| tile_url(&grid, matrix_set, *level, t))
+                        .collect()
+                })
                 .collect();
-            (views, format!("WMTS {matrix_set} level {level} ({:.3} m/px), {}x{} views", grid.res, size.0, size.1))
+            (
+                views,
+                format!(
+                    "WMTS {matrix_set} level {level} ({:.3} m/px), {}x{} views",
+                    grid.res, size.0, size.1
+                ),
+            )
         }
         Mode::Wms { crs, res, format } => {
             let centres = reproject(&points, &args.index_crs, crs)?;
@@ -573,7 +642,10 @@ fn main() -> Result<()> {
             (views, format!("WMS {crs} {res} m/px, {}x{} GetMap", size.0, size.1))
         }
     };
-    println!("{what}; {} views, {} connections (seed {seed})", args.views, args.concurrency);
+    println!(
+        "{what}; {} views, {} connections (seed {seed})",
+        args.views, args.concurrency
+    );
 
     let phases: &[&str] = if args.no_warm { &["cold"] } else { &["cold", "warm"] };
     let mut results = Vec::new();
@@ -581,7 +653,15 @@ fn main() -> Result<()> {
         let (before, cpu_before) = (metrics(&agent, &args.metrics), cpu_by_thread(args.pid));
         let (samples, view_times) = run_views(&agent, &views, args.concurrency);
         let (after, cpu_after) = (metrics(&agent, &args.metrics), cpu_by_thread(args.pid));
-        results.push(summarize(phase, &samples, &view_times, &before, &after, &cpu_before, &cpu_after));
+        results.push(summarize(
+            phase,
+            &samples,
+            &view_times,
+            &before,
+            &after,
+            &cpu_before,
+            &cpu_after,
+        ));
     }
 
     if let Some(path) = &args.json {
@@ -612,7 +692,10 @@ mod tests {
 
     #[test]
     fn reads_the_shipped_index() {
-        let boxes = shapefile_boxes(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/data/2026_orthoHR/tiles.shp")));
+        let boxes = shapefile_boxes(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/data/2026_orthoHR/tiles.shp"
+        )));
         let Ok(boxes) = boxes else { return };
         assert_eq!(boxes.len(), 498);
         assert!(boxes.iter().all(|b| (b[2] - b[0] - 10_000.0).abs() < 1e-3));

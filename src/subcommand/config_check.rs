@@ -30,7 +30,10 @@ pub fn run(config: PathBuf, secrets: PathBuf) -> anyhow::Result<()> {
                 "    - store backend={} ({} option(s){})",
                 st.backend,
                 st.options.len(),
-                st.credentials.as_ref().map(|c| format!(", credentials='{c}'")).unwrap_or_default(),
+                st.credentials
+                    .as_ref()
+                    .map(|c| format!(", credentials='{c}'"))
+                    .unwrap_or_default(),
             ),
         }
     }

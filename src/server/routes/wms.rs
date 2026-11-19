@@ -63,9 +63,7 @@ pub async fn handle(
 
 fn request_version(req: &WmsRequest) -> WmsVersion {
     match req {
-        WmsRequest::GetCapabilities { version } | WmsRequest::GetFeatureInfo { version } => {
-            *version
-        }
+        WmsRequest::GetCapabilities { version } | WmsRequest::GetFeatureInfo { version } => *version,
         WmsRequest::GetMap(m) => m.version,
     }
 }
@@ -83,12 +81,7 @@ fn request_error(err: &crate::protocol::error::OgcError, version: WmsVersion) ->
     xml_response(exception::for_error(err, version), StatusCode::OK)
 }
 
-fn pipeline_error(
-    err: &anyhow::Error,
-    operation: &str,
-    rid: &RequestId,
-    version: WmsVersion,
-) -> Response {
+fn pipeline_error(err: &anyhow::Error, operation: &str, rid: &RequestId, version: WmsVersion) -> Response {
     let reply = error_reply(err, operation, rid);
     let status = if reply.status == StatusCode::TOO_MANY_REQUESTS {
         StatusCode::TOO_MANY_REQUESTS
@@ -97,18 +90,10 @@ fn pipeline_error(
     };
     with_retry_after(
         status,
-        xml_response(
-            service_exception(reply.code, None, &reply.message, version),
-            status,
-        ),
+        xml_response(service_exception(reply.code, None, &reply.message, version), status),
     )
 }
 
 fn xml_response(body: String, status: StatusCode) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
-        body,
-    )
-        .into_response()
+    (status, [(header::CONTENT_TYPE, "text/xml; charset=utf-8")], body).into_response()
 }

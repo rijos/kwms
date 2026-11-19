@@ -17,14 +17,13 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
     // Before anything can run a coordinate transform.
     crate::crs::disable_proj_network()?;
 
-    let (config, secrets) =
-        crate::config::load::load(&config_path, &secrets_path).with_context(|| {
-            format!(
-                "loading config (`{}`) and secrets (`{}`)",
-                config_path.display(),
-                secrets_path.display()
-            )
-        })?;
+    let (config, secrets) = crate::config::load::load(&config_path, &secrets_path).with_context(|| {
+        format!(
+            "loading config (`{}`) and secrets (`{}`)",
+            config_path.display(),
+            secrets_path.display()
+        )
+    })?;
 
     let bind = config.server.bind.clone();
     let metrics_bind = config.server.metrics_bind.clone();

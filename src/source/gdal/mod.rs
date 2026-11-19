@@ -8,9 +8,9 @@ pub mod dataset;
 pub mod footprint;
 pub mod mask;
 pub mod pool;
+pub(crate) mod raster;
 pub mod sample;
 pub mod tile_index;
-pub(crate) mod raster;
 pub mod warp;
 
 use anyhow::{anyhow, Context, Result};
@@ -24,8 +24,8 @@ use std::sync::Arc;
 use crate::crs::{identify_crs, transform_bbox, Bbox, Coord, Crs};
 
 use self::pool::DatasetPool;
-use self::tile_index::{IndexTile, TileIndex};
 use self::raster::pixel_type_from_gdal;
+use self::tile_index::{IndexTile, TileIndex};
 use self::warp::read_window as warp_read_window;
 
 use super::{Area, PixelBuffer, PixelValue, Source, SourceMetadata, WindowRequest};
@@ -74,7 +74,8 @@ impl GdalSource {
     /// run for the whole config first.
     pub fn open(config: &SourceConfig) -> Result<Self> {
         let (uri, configured) = (&config.uri, &config.open_options);
-        let Some(index) = tile_index::probe(uri, configured).with_context(|| format!("probing tile index '{uri}'"))? else {
+        let Some(index) = tile_index::probe(uri, configured).with_context(|| format!("probing tile index '{uri}'"))?
+        else {
             return Self::open_with(uri, configured, DEFAULT_POOL_SIZE);
         };
         let info = &index.info;
@@ -92,7 +93,11 @@ impl GdalSource {
         if info.without_overviews > 0 {
             tracing::warn!(uri = %uri, tiles = info.without_overviews, "tile index: tiles without overviews (slow at coarse scales)");
         }
-        let resolutions = if index.resolution_fixed() { vec![info.finest] } else { index.resolutions() };
+        let resolutions = if index.resolution_fixed() {
+            vec![info.finest]
+        } else {
+            index.resolutions()
+        };
         let mut views = Vec::with_capacity(resolutions.len());
         for res in resolutions {
             let mut options = configured.clone();
@@ -101,9 +106,17 @@ impl GdalSource {
                 .with_context(|| format!("opening '{uri}' at GSD {res:?} with {options:?}"))?;
             views.push(View { res: Some(res), pool });
         }
-        let first = views.first().ok_or_else(|| anyhow!("tile index '{uri}' has no usable tiles"))?;
-        let metadata = futures_executor_block_on(probe_metadata(&first.pool))
+        let first = views
+            .first()
+            .ok_or_else(|| anyhow!("tile index '{uri}' has no usable tiles"))?;
+        let mut metadata = futures_executor_block_on(probe_metadata(&first.pool))
             .with_context(|| format!("failed to probe metadata for '{uri}'"))?;
+        // The mosaic's extent is padded for exact overviews (see
+        // `tile_index`); the data's extent is the index's.
+        if !index.resolution_fixed() {
+            let (minx, miny, maxx, maxy) = index.info.extent;
+            metadata.native_bbox = Bbox { minx, miny, maxx, maxy };
+        }
         let dissolving = std::time::Instant::now();
         // Snap to 1/100 of the finest GSD: far below a pixel, far above
         // float noise, and in the index's own units (metres or degrees).
@@ -111,9 +124,16 @@ impl GdalSource {
         let coverage =
             mask::dissolve(&index.footprints, &metadata.native_crs, snap).context("dissolving tile footprints")?;
         tracing::info!(uri = %uri, ms = dissolving.elapsed().as_millis() as u64, "tile footprints dissolved");
-        let routing = (views.len() > 1)
-            .then(|| Routing { index: Arc::new(index), by_crs: std::sync::Mutex::new(HashMap::new()) });
-        Ok(Self { views, routing, metadata, coverage })
+        let routing = (views.len() > 1).then(|| Routing {
+            index: Arc::new(index),
+            by_crs: std::sync::Mutex::new(HashMap::new()),
+        });
+        Ok(Self {
+            views,
+            routing,
+            metadata,
+            coverage,
+        })
     }
 
     /// Open `uri` as one view with explicit GDAL open options and pool size.
@@ -123,24 +143,42 @@ impl GdalSource {
         let metadata = futures_executor_block_on(probe_metadata(&pool))
             .with_context(|| format!("failed to probe metadata for '{uri}'"))?;
         let coverage = mask::rectangle(&metadata.native_bbox, &metadata.native_crs)?;
-        Ok(Self { views: vec![View { res: None, pool }], routing: None, metadata, coverage })
+        Ok(Self {
+            views: vec![View { res: None, pool }],
+            routing: None,
+            metadata,
+            coverage,
+        })
     }
 
     /// The pool to read `bbox` (in `crs`) from: the view of the finest GSD
     /// among the tiles under it (the finest view if none is).
     async fn pool_for(&self, crs: &Crs, bbox: &Bbox) -> Result<&DatasetPool> {
         let (Some(routing), Some(finest)) = (&self.routing, self.views.first()) else {
-            return self.views.first().map(|v| &v.pool).ok_or_else(|| anyhow!("source has no views"));
+            return self
+                .views
+                .first()
+                .map(|v| &v.pool)
+                .ok_or_else(|| anyhow!("source has no views"));
         };
         let tiles = self.tiles_in(routing, crs).await?;
         let res = TileIndex::finest_under(&tiles, (bbox.minx, bbox.miny, bbox.maxx, bbox.maxy));
-        Ok(self.views.iter().find(|v| v.res.is_some() && v.res == res).map_or(&finest.pool, |v| &v.pool))
+        Ok(self
+            .views
+            .iter()
+            .find(|v| v.res.is_some() && v.res == res)
+            .map_or(&finest.pool, |v| &v.pool))
     }
 
     /// Tile footprints in `crs`: reprojected once per CRS, on the blocking
     /// pool (PROJ never runs on an async worker), then cached.
     async fn tiles_in(&self, routing: &Routing, crs: &Crs) -> Result<Arc<Vec<IndexTile>>> {
-        if let Some(t) = routing.by_crs.lock().map_err(|_| anyhow!("routing cache poisoned"))?.get(crs) {
+        if let Some(t) = routing
+            .by_crs
+            .lock()
+            .map_err(|_| anyhow!("routing cache poisoned"))?
+            .get(crs)
+        {
             return Ok(t.clone());
         }
         let native = self.metadata.native_crs.clone();
@@ -155,14 +193,21 @@ impl GdalSource {
                 .filter_map(|t| {
                     let (minx, miny, maxx, maxy) = t.bbox;
                     let b = transform_bbox(&Bbox { minx, miny, maxx, maxy }, &native, &target).ok()?;
-                    Some(IndexTile { bbox: (b.minx, b.miny, b.maxx, b.maxy), res: t.res })
+                    Some(IndexTile {
+                        bbox: (b.minx, b.miny, b.maxx, b.maxy),
+                        res: t.res,
+                    })
                 })
                 .collect()
         })
         .await
         .context("reprojecting tile footprints")?;
         let tiles = Arc::new(tiles);
-        routing.by_crs.lock().map_err(|_| anyhow!("routing cache poisoned"))?.insert(crs.clone(), tiles.clone());
+        routing
+            .by_crs
+            .lock()
+            .map_err(|_| anyhow!("routing cache poisoned"))?
+            .insert(crs.clone(), tiles.clone());
         Ok(tiles)
     }
 }
@@ -214,7 +259,10 @@ async fn probe_metadata(pool: &DatasetPool) -> Result<SourceMetadata> {
         let count = usize::try_from(band1.overview_count().context("counting overviews")?)
             .context("negative overview count")?;
         let to_u32 = |(w, h): (usize, usize)| -> Result<(u32, u32)> {
-            Ok((u32::try_from(w).context("raster too wide")?, u32::try_from(h).context("raster too tall")?))
+            Ok((
+                u32::try_from(w).context("raster too wide")?,
+                u32::try_from(h).context("raster too tall")?,
+            ))
         };
         let overviews = (0..count)
             .map(|i| to_u32(band1.overview(i).context("reading an overview")?.size()))
@@ -236,9 +284,8 @@ async fn probe_metadata(pool: &DatasetPool) -> Result<SourceMetadata> {
         let (w, h) = ds.raster_size();
         let (w, h) = (w as f64, h as f64);
         let corners = [gt.apply(0.0, 0.0), gt.apply(w, 0.0), gt.apply(0.0, h), gt.apply(w, h)];
-        let fold = |f: fn(f64, f64) -> f64, init: f64, pick: fn(&(f64, f64)) -> f64| {
-            corners.iter().map(pick).fold(init, f)
-        };
+        let fold =
+            |f: fn(f64, f64) -> f64, init: f64, pick: fn(&(f64, f64)) -> f64| corners.iter().map(pick).fold(init, f);
         let native_bbox = Bbox {
             minx: fold(f64::min, f64::INFINITY, |c| c.0),
             maxx: fold(f64::max, f64::NEG_INFINITY, |c| c.0),
@@ -284,7 +331,12 @@ impl Source for GdalSource {
 
     async fn sample(&self, coord: Coord, crs: Crs) -> Result<Vec<PixelValue>> {
         let native_crs = self.metadata.native_crs.clone();
-        let point = Bbox { minx: coord.x, miny: coord.y, maxx: coord.x, maxy: coord.y };
+        let point = Bbox {
+            minx: coord.x,
+            miny: coord.y,
+            maxx: coord.x,
+            maxy: coord.y,
+        };
         self.pool_for(&crs, &point)
             .await?
             .with_dataset(move |ds| sample::sample(ds, &native_crs, coord, crs))

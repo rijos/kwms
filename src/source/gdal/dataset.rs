@@ -37,6 +37,9 @@ impl OpenedDataset {
         let dataset = Dataset::open_ex(Path::new(uri), options)
             .with_context(|| format!("failed to open GDAL dataset at '{uri}'"))?;
 
-        Ok(Self { uri: uri.to_string(), dataset })
+        Ok(Self {
+            uri: uri.to_string(),
+            dataset,
+        })
     }
 }

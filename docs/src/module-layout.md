@@ -83,13 +83,13 @@ src/
 
 ## `tests/` tree
 
-Integration tests live in `tests/` at the repo root. Each `.rs` file is a separate test binary. Fixtures (sample configs, sample source rasters, golden output files) live under `tests/fixtures/` and are checked into the repo.
+Integration tests live in `tests/` at the repo root. Each `.rs` file is a separate test binary. Fixtures (sample configs, sample source rasters, pdok output files) live under `tests/fixtures/` and are checked into the repo.
 
 ```
 tests/
-├── capabilities.rs        # golden-XML tests for WMS 1.1.1, WMS 1.3.0, WMTS 1.0.0, TMS 1.0.0 GetCapabilities
+├── capabilities.rs        # pdok-XML tests for WMS 1.1.1, WMS 1.3.0, WMTS 1.0.0, TMS 1.0.0 GetCapabilities
 ├── conformance.rs         # GetMap / GetTile / GetFeatureInfo response shapes, headers, axis order, ServiceException shapes
-├── tile_render.rs         # golden-tile diffs per layer/format/level (PNG byte-equality, JPEG/WebP perceptual)
+├── tile_render.rs         # pdok-tile diffs per layer/format/level (PNG byte-equality, JPEG/WebP perceptual)
 ├── cache_integration.rs   # hot+persistent tier behavior, TTL expiry, passthrough, level-rule overrides, single-flight
 ├── config_merge.rs        # YAML merge semantics, env-var/CLI overrides, JSON Schema export
 ├── common/
@@ -104,7 +104,7 @@ tests/
     ├── sources/           # tiny COGs / VRTs used as deterministic source rasters
     │   ├── ortho_small.tif
     │   └── dem_small.tif
-    └── golden/
+    └── pdok/
         ├── capabilities/  # one XML per (protocol-version × fixture)
         │   ├── wms_111_pdok_multigrid.xml
         │   ├── wms_130_pdok_multigrid.xml
@@ -116,7 +116,7 @@ tests/
             └── …
 ```
 
-See [Testing](./testing.md) for what each integration-test binary asserts and the golden-file update workflow.
+See [Testing](./testing.md) for what each integration-test binary asserts and the pdok-file update workflow.
 
 ## Internal boundaries
 

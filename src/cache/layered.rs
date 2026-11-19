@@ -176,7 +176,10 @@ impl LayeredCache {
     /// Assemble from already-built tiers, top to bottom — for tests and
     /// callers with custom tiers.
     pub fn from_tiers(tiers: Vec<Arc<dyn CacheTier>>) -> Self {
-        Self { tiers, inflight: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            tiers,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// `name (durable|in-process)` per tier, top to bottom.
@@ -197,7 +200,9 @@ impl LayeredCache {
     /// fails the start instead of silently never caching.
     pub async fn check(&self) -> Result<()> {
         for (i, tier) in self.tiers.iter().enumerate() {
-            tier.check().await.with_context(|| format!("cache tier {i} ({})", tier.name()))?;
+            tier.check()
+                .await
+                .with_context(|| format!("cache tier {i} ({})", tier.name()))?;
         }
         Ok(())
     }
@@ -269,14 +274,20 @@ impl LayeredCache {
         let mut found: Option<Entry> = None;
         let mut missing = Vec::new();
         for tier in self.tiers.iter().filter(|t| t.durable()) {
-            match tier.get(key, ttl).await.with_context(|| format!("cache tier {}: read", tier.name()))? {
+            match tier
+                .get(key, ttl)
+                .await
+                .with_context(|| format!("cache tier {}: read", tier.name()))?
+            {
                 Some(entry) => found = found.or(Some(entry)),
                 None => missing.push(tier),
             }
         }
         let Some(entry) = found else { return Ok(false) };
         for tier in missing {
-            tier.put(key, entry.clone()).await.with_context(|| format!("cache tier {}: write", tier.name()))?;
+            tier.put(key, entry.clone())
+                .await
+                .with_context(|| format!("cache tier {}: write", tier.name()))?;
         }
         Ok(true)
     }
@@ -286,7 +297,9 @@ impl LayeredCache {
     pub async fn store_durable(&self, key: &TileKey, bytes: Bytes) -> Result<()> {
         let entry = Entry::now(bytes);
         for tier in self.tiers.iter().filter(|t| t.durable()) {
-            tier.put(key, entry.clone()).await.with_context(|| format!("cache tier {}: write", tier.name()))?;
+            tier.put(key, entry.clone())
+                .await
+                .with_context(|| format!("cache tier {}: write", tier.name()))?;
         }
         Ok(())
     }
@@ -302,7 +315,13 @@ impl LayeredCache {
     }
 
     /// [`Self::get_or_compute`] over the tiers in `scope` only.
-    pub async fn get_or_compute_in<F, Fut>(&self, scope: Scope, key: TileKey, ttl: Duration, compute: F) -> Result<Bytes>
+    pub async fn get_or_compute_in<F, Fut>(
+        &self,
+        scope: Scope,
+        key: TileKey,
+        ttl: Duration,
+        compute: F,
+    ) -> Result<Bytes>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Computed>>,
@@ -322,9 +341,16 @@ impl LayeredCache {
                     // notify_waiters(), which happens after it removes the key.
                     Some(existing) => Err((existing.clone(), existing.notify.clone().notified_owned())),
                     None => {
-                        let entry = Arc::new(Inflight { notify: Arc::new(Notify::new()), result: OnceLock::new() });
+                        let entry = Arc::new(Inflight {
+                            notify: Arc::new(Notify::new()),
+                            result: OnceLock::new(),
+                        });
                         map.insert(key.clone(), entry.clone());
-                        Ok(InflightGuard { inflight: self.inflight.clone(), key: key.clone(), entry })
+                        Ok(InflightGuard {
+                            inflight: self.inflight.clone(),
+                            key: key.clone(),
+                            entry,
+                        })
                     }
                 }
             };
@@ -362,10 +388,10 @@ impl LayeredCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encode::OutputFormat;
-    use crate::tile::TileCoord;
     use crate::cache::memory::MemoryTier;
     use crate::cache::store::StoreTier;
+    use crate::encode::OutputFormat;
+    use crate::tile::TileCoord;
     use opendal::{services, Operator};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -383,7 +409,11 @@ mod tests {
     }
 
     fn fs_tier(dir: &std::path::Path) -> Arc<StoreTier> {
-        Arc::new(StoreTier::new(Operator::new(services::Fs::default().root(&dir.to_string_lossy())).unwrap().finish()))
+        Arc::new(StoreTier::new(
+            Operator::new(services::Fs::default().root(&dir.to_string_lossy()))
+                .unwrap()
+                .finish(),
+        ))
     }
 
     #[tokio::test]
@@ -391,10 +421,7 @@ mod tests {
         let cache = fresh_cache();
         let k = key("a");
         let v = Bytes::from_static(b"v");
-        cache
-            .put(&k, v.clone(), Duration::from_secs(60))
-            .await
-            .expect("put");
+        cache.put(&k, v.clone(), Duration::from_secs(60)).await.expect("put");
         let got = cache
             .get(&k, Duration::from_secs(60))
             .await
@@ -409,15 +436,26 @@ mod tests {
     #[tokio::test]
     async fn three_tier_stack_promotes_and_writes_through() {
         let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let (mem, mid, bottom) = (Arc::new(MemoryTier::new(1 << 20)), fs_tier(d1.path()), fs_tier(d2.path()));
+        let (mem, mid, bottom) = (
+            Arc::new(MemoryTier::new(1 << 20)),
+            fs_tier(d1.path()),
+            fs_tier(d2.path()),
+        );
         let cache = LayeredCache::from_tiers(vec![mem.clone(), mid.clone(), bottom.clone()]);
         let ttl = Duration::from_secs(60);
 
         let k = key("deep");
-        let old = Entry { bytes: Bytes::from_static(b"v"), written_at: Entry::now(Bytes::new()).written_at - 30 };
+        let old = Entry {
+            bytes: Bytes::from_static(b"v"),
+            written_at: Entry::now(Bytes::new()).written_at - 30,
+        };
         bottom.put(&k, old.clone()).await.unwrap();
         assert_eq!(cache.get(&k, ttl).await.unwrap(), Some(Bytes::from_static(b"v")));
-        assert_eq!(mem.get(&k, ttl).await.unwrap(), Some(old.clone()), "promoted with its render time");
+        assert_eq!(
+            mem.get(&k, ttl).await.unwrap(),
+            Some(old.clone()),
+            "promoted with its render time"
+        );
         assert_eq!(mid.get(&k, ttl).await.unwrap(), Some(old.clone()));
         // The copies expire when the original would.
         assert!(mid.get(&k, Duration::from_secs(20)).await.unwrap().is_none());
@@ -425,9 +463,16 @@ mod tests {
         let n = key("new");
         cache.put(&n, Bytes::from_static(b"n"), ttl).await.unwrap();
         for tier in [mem.clone() as Arc<dyn CacheTier>, mid.clone(), bottom.clone()] {
-            assert!(tier.get(&n, ttl).await.unwrap().is_some(), "{} missing the tile", tier.name());
+            assert!(
+                tier.get(&n, ttl).await.unwrap().is_some(),
+                "{} missing the tile",
+                tier.name()
+            );
         }
-        assert_eq!(cache.describe(), ["memory (in-process)", "fs (durable)", "fs (durable)"]);
+        assert_eq!(
+            cache.describe(),
+            ["memory (in-process)", "fs (durable)", "fs (durable)"]
+        );
     }
 
     /// Deeper than `cache.max_level`: tiles live in memory only — never
@@ -439,15 +484,29 @@ mod tests {
         let cache = LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1 << 20)), disk.clone()]);
         let ttl = Duration::from_secs(60);
         let got = cache
-            .get_or_compute_in(Scope::InProcess, key("deep"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"d"))) })
+            .get_or_compute_in(Scope::InProcess, key("deep"), ttl, || async {
+                Ok(Computed::store(Bytes::from_static(b"d")))
+            })
             .await
             .unwrap();
         assert_eq!(got, Bytes::from_static(b"d"));
-        assert!(disk.get(&key("deep"), ttl).await.unwrap().is_none(), "written to the durable tier");
-        assert_eq!(cache.get_in(Scope::InProcess, &key("deep"), ttl).await.unwrap(), Some(Bytes::from_static(b"d")));
+        assert!(
+            disk.get(&key("deep"), ttl).await.unwrap().is_none(),
+            "written to the durable tier"
+        );
+        assert_eq!(
+            cache.get_in(Scope::InProcess, &key("deep"), ttl).await.unwrap(),
+            Some(Bytes::from_static(b"d"))
+        );
         // A tile only on disk is invisible to an in-process lookup.
-        disk.put(&key("disk"), Entry::now(Bytes::from_static(b"x"))).await.unwrap();
-        assert!(cache.get_in(Scope::InProcess, &key("disk"), ttl).await.unwrap().is_none());
+        disk.put(&key("disk"), Entry::now(Bytes::from_static(b"x")))
+            .await
+            .unwrap();
+        assert!(cache
+            .get_in(Scope::InProcess, &key("disk"), ttl)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// `cache update` helpers: a copy in one durable tier fills the other;
@@ -459,11 +518,16 @@ mod tests {
         let cache = LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1 << 20)), mid.clone(), bottom.clone()]);
         let ttl = Duration::from_secs(60);
         assert!(!cache.durable_fresh(&key("x"), ttl).await.unwrap());
-        bottom.put(&key("x"), Entry::now(Bytes::from_static(b"x"))).await.unwrap();
+        bottom
+            .put(&key("x"), Entry::now(Bytes::from_static(b"x")))
+            .await
+            .unwrap();
         assert!(cache.durable_fresh(&key("x"), ttl).await.unwrap());
         assert!(mid.get(&key("x"), ttl).await.unwrap().is_some());
         cache.store_durable(&key("y"), Bytes::from_static(b"y")).await.unwrap();
-        assert!(mid.get(&key("y"), ttl).await.unwrap().is_some() && bottom.get(&key("y"), ttl).await.unwrap().is_some());
+        assert!(
+            mid.get(&key("y"), ttl).await.unwrap().is_some() && bottom.get(&key("y"), ttl).await.unwrap().is_some()
+        );
     }
 
     #[tokio::test]
@@ -519,7 +583,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let (c, k) = (cache.clone(), key("cancel"));
         let follower = tokio::spawn(async move {
-            c.get_or_compute(k, ttl, || async { Ok(Computed::store(Bytes::from_static(b"fresh"))) }).await
+            c.get_or_compute(k, ttl, || async { Ok(Computed::store(Bytes::from_static(b"fresh"))) })
+                .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         leader.abort();
@@ -530,7 +595,9 @@ mod tests {
         assert_eq!(out.unwrap().unwrap(), Bytes::from_static(b"fresh"));
         let again = tokio::time::timeout(
             Duration::from_secs(2),
-            cache.get_or_compute(key("cancel"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"other"))) }),
+            cache.get_or_compute(key("cancel"), ttl, || async {
+                Ok(Computed::store(Bytes::from_static(b"other")))
+            }),
         )
         .await
         .expect("key stuck in the in-flight map");
@@ -565,7 +632,11 @@ mod tests {
                     .unwrap_or_else(|_| panic!("round {round}: a caller hung"));
                 assert_eq!(r.unwrap().unwrap(), Bytes::from_static(b"v"));
             }
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "round {round}: computed more than once");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "round {round}: computed more than once"
+            );
         }
     }
 
@@ -583,8 +654,12 @@ mod tests {
             .await
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let follower = cache.get_or_compute(key("fail"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"ok"))) });
-        let out = tokio::time::timeout(Duration::from_secs(2), follower).await.expect("follower hung");
+        let follower = cache.get_or_compute(key("fail"), ttl, || async {
+            Ok(Computed::store(Bytes::from_static(b"ok")))
+        });
+        let out = tokio::time::timeout(Duration::from_secs(2), follower)
+            .await
+            .expect("follower hung");
         assert_eq!(out.unwrap(), Bytes::from_static(b"ok"));
         assert!(leader.await.unwrap().is_err());
     }
@@ -607,12 +682,17 @@ mod tests {
         }
         let ttl = Duration::from_secs(60);
         let got = cache
-            .get_or_compute(key("broken"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"tile"))) })
+            .get_or_compute(key("broken"), ttl, || async {
+                Ok(Computed::store(Bytes::from_static(b"tile")))
+            })
             .await
             .expect("request must not fail because a cache tier does");
         assert_eq!(got, Bytes::from_static(b"tile"));
         // Still served from the memory tier afterwards.
-        assert_eq!(cache.get(&key("broken"), ttl).await.unwrap(), Some(Bytes::from_static(b"tile")));
+        assert_eq!(
+            cache.get(&key("broken"), ttl).await.unwrap(),
+            Some(Bytes::from_static(b"tile"))
+        );
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
@@ -631,7 +711,11 @@ mod tests {
         };
         let leader = tokio::spawn({
             let (cache, computed, release) = (cache.clone(), computed.clone(), release.clone());
-            async move { cache.get_or_compute(key("transient"), ttl, compute(computed, release)).await }
+            async move {
+                cache
+                    .get_or_compute(key("transient"), ttl, compute(computed, release))
+                    .await
+            }
         });
         // Wait until the leader is computing, then queue followers behind it.
         while computed.load(Ordering::SeqCst) == 0 {
@@ -640,22 +724,39 @@ mod tests {
         let followers: Vec<_> = (0..16)
             .map(|_| {
                 let (cache, computed, release) = (cache.clone(), computed.clone(), release.clone());
-                tokio::spawn(async move { cache.get_or_compute(key("transient"), ttl, compute(computed, release)).await })
+                tokio::spawn(async move {
+                    cache
+                        .get_or_compute(key("transient"), ttl, compute(computed, release))
+                        .await
+                })
             })
             .collect();
         // All 16 followers hold the entry (map + leader + 16) — each created
         // its wait future under the lock, so none can miss the wake-up.
-        let holders = || lock_inflight(&cache.inflight).get(&key("transient")).map(Arc::strong_count);
+        let holders = || {
+            lock_inflight(&cache.inflight)
+                .get(&key("transient"))
+                .map(Arc::strong_count)
+        };
         while holders() != Some(18) {
             tokio::task::yield_now().await;
         }
         release.notify_waiters();
         assert_eq!(leader.await.unwrap().unwrap(), Bytes::from_static(b"empty"));
         for f in followers {
-            let out = tokio::time::timeout(Duration::from_secs(5), f).await.expect("follower hung");
+            let out = tokio::time::timeout(Duration::from_secs(5), f)
+                .await
+                .expect("follower hung");
             assert_eq!(out.unwrap().unwrap(), Bytes::from_static(b"empty"));
         }
-        assert_eq!(computed.load(Ordering::SeqCst), 1, "one computation for the whole burst");
-        assert!(cache.get(&key("transient"), ttl).await.unwrap().is_none(), "transient result was stored");
+        assert_eq!(
+            computed.load(Ordering::SeqCst),
+            1,
+            "one computation for the whole burst"
+        );
+        assert!(
+            cache.get(&key("transient"), ttl).await.unwrap().is_none(),
+            "transient result was stored"
+        );
     }
 }

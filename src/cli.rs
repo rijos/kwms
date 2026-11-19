@@ -93,9 +93,7 @@ enum ConfigCommand {
 pub async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve { config, secrets } => {
-            crate::subcommand::serve::run(config, secrets).await
-        }
+        Command::Serve { config, secrets } => crate::subcommand::serve::run(config, secrets).await,
         Command::Config(ConfigCommand::Check { config, secrets }) => {
             crate::subcommand::config_check::run(config, secrets)
         }

@@ -16,12 +16,7 @@ use gdal::{Dataset, GeoTransformEx};
 use crate::crs::{same_crs, transform_coord, Coord, Crs};
 use crate::source::PixelValue;
 
-pub fn sample(
-    dataset: &mut Dataset,
-    native_crs: &Crs,
-    coord: Coord,
-    crs: Crs,
-) -> Result<Vec<PixelValue>> {
+pub fn sample(dataset: &mut Dataset, native_crs: &Crs, coord: Coord, crs: Crs) -> Result<Vec<PixelValue>> {
     // Step 1: get the coordinate in the dataset's native CRS.
     let (nx, ny) = if same_crs(&crs, native_crs)? {
         (coord.x, coord.y)
@@ -68,12 +63,7 @@ pub fn sample(
             .rasterband(band_idx)
             .with_context(|| format!("failed to fetch band {band_idx} for sample"))?;
         let buf = band
-            .read_as::<f64>(
-                (px, py),
-                (1, 1),
-                (1, 1),
-                Some(ResampleAlg::NearestNeighbour),
-            )
+            .read_as::<f64>((px, py), (1, 1), (1, 1), Some(ResampleAlg::NearestNeighbour))
             .with_context(|| format!("failed to read 1x1 pixel from band {band_idx}"))?;
         let v = buf
             .data()

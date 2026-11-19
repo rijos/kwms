@@ -88,7 +88,10 @@ impl CacheTier for StoreTier {
 
         // 2) Fresh — read the data.
         match self.op.read(&path).await {
-            Ok(b) => Ok(Some(Entry { bytes: b.to_bytes(), written_at: meta.written_at })),
+            Ok(b) => Ok(Some(Entry {
+                bytes: b.to_bytes(),
+                written_at: meta.written_at,
+            })),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(anyhow!(e).context("read data")),
         }
@@ -98,8 +101,14 @@ impl CacheTier for StoreTier {
     /// its data (a crash in between leaves data without sidecar = a miss).
     async fn put(&self, key: &TileKey, entry: Entry) -> Result<()> {
         let path = key.as_path();
-        self.op.write(&path, entry.bytes).await.map_err(|e| anyhow!(e).context("write data"))?;
-        let sidecar = serde_json::to_vec(&MetaSidecar { written_at: entry.written_at }).context("serialize sidecar")?;
+        self.op
+            .write(&path, entry.bytes)
+            .await
+            .map_err(|e| anyhow!(e).context("write data"))?;
+        let sidecar = serde_json::to_vec(&MetaSidecar {
+            written_at: entry.written_at,
+        })
+        .context("serialize sidecar")?;
         self.op
             .write(&meta_path(&path), sidecar)
             .await
@@ -115,7 +124,11 @@ impl CacheTier for StoreTier {
                 "cannot write (check backend, container/root and credentials; the token must allow write and delete)",
             )
         })?;
-        let back = self.op.read(PROBE).await.map_err(|e| anyhow!(e).context("cannot read back what was written"))?;
+        let back = self
+            .op
+            .read(PROBE)
+            .await
+            .map_err(|e| anyhow!(e).context("cannot read back what was written"))?;
         if back.to_bytes() != body.as_bytes() {
             return Err(anyhow!("read back different bytes than were written"));
         }
@@ -164,7 +177,8 @@ pub fn build_operator(cfg: &StoreTierConfig, credentials: &HashMap<String, Crede
         }
     }
 
-    Operator::via_iter(scheme, options).with_context(|| format!("building opendal operator for backend '{}'", cfg.backend))
+    Operator::via_iter(scheme, options)
+        .with_context(|| format!("building opendal operator for backend '{}'", cfg.backend))
 }
 
 #[cfg(test)]
@@ -176,11 +190,20 @@ mod tests {
     use opendal::services;
 
     fn memory_tier() -> StoreTier {
-        StoreTier::new(Operator::new(services::Memory::default()).expect("memory builder").finish())
+        StoreTier::new(
+            Operator::new(services::Memory::default())
+                .expect("memory builder")
+                .finish(),
+        )
     }
 
     fn key() -> TileKey {
-        TileKey { layer: "L".into(), grid_dir: "3857".into(), coord: TileCoord::new(0, 0, 0), format: OutputFormat::Png }
+        TileKey {
+            layer: "L".into(),
+            grid_dir: "3857".into(),
+            coord: TileCoord::new(0, 0, 0),
+            format: OutputFormat::Png,
+        }
     }
 
     const TTL: Duration = Duration::from_secs(60);
@@ -188,7 +211,10 @@ mod tests {
     #[tokio::test]
     async fn put_then_get_keeps_bytes_and_write_time() {
         let tier = memory_tier();
-        let e = Entry { bytes: Bytes::from_static(b"abc"), written_at: now_unix_seconds() - 10 };
+        let e = Entry {
+            bytes: Bytes::from_static(b"abc"),
+            written_at: now_unix_seconds() - 10,
+        };
         tier.put(&key(), e.clone()).await.expect("put");
         assert_eq!(tier.get(&key(), TTL).await.unwrap(), Some(e));
         assert!(!tier.durable(), "opendal memory is not durable");
@@ -197,7 +223,10 @@ mod tests {
     #[tokio::test]
     async fn expired_entry_is_a_miss() {
         let tier = memory_tier();
-        let old = Entry { bytes: Bytes::from_static(b"abc"), written_at: now_unix_seconds() - 120 };
+        let old = Entry {
+            bytes: Bytes::from_static(b"abc"),
+            written_at: now_unix_seconds() - 120,
+        };
         tier.put(&key(), old).await.expect("put");
         assert!(tier.get(&key(), TTL).await.unwrap().is_none());
     }
@@ -213,7 +242,8 @@ mod tests {
     async fn fs_backend_stores_tiles_per_layer_on_disk() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = StoreTierConfig::default();
-        cfg.options.insert("root".into(), dir.path().to_string_lossy().into_owned());
+        cfg.options
+            .insert("root".into(), dir.path().to_string_lossy().into_owned());
         let tier = StoreTier::from_config(&cfg, &HashMap::new()).expect("fs backend builds");
         assert_eq!(tier.name(), "fs");
         assert!(tier.durable());
@@ -225,9 +255,18 @@ mod tests {
         b.layer = "layer_b".into();
         tier.put(&a, Entry::now(Bytes::from_static(b"A"))).await.unwrap();
         tier.put(&b, Entry::now(Bytes::from_static(b"B"))).await.unwrap();
-        assert_eq!(std::fs::read(dir.path().join("layer_a/3857/png/0/0/0.png")).unwrap(), b"A");
-        assert_eq!(std::fs::read(dir.path().join("layer_b/3857/png/0/0/0.png")).unwrap(), b"B");
-        assert_eq!(tier.get(&a, TTL).await.unwrap().unwrap().bytes, Bytes::from_static(b"A"));
+        assert_eq!(
+            std::fs::read(dir.path().join("layer_a/3857/png/0/0/0.png")).unwrap(),
+            b"A"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("layer_b/3857/png/0/0/0.png")).unwrap(),
+            b"B"
+        );
+        assert_eq!(
+            tier.get(&a, TTL).await.unwrap().unwrap().bytes,
+            Bytes::from_static(b"A")
+        );
     }
 
     /// `azblob` is compiled in; it only needs its options.
@@ -235,10 +274,13 @@ mod tests {
     fn build_operator_knows_azblob() {
         let cfg = StoreTierConfig {
             backend: "azblob".into(),
-            options: [("container", "tiles"), ("endpoint", "https://acct.blob.core.windows.net")]
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            options: [
+                ("container", "tiles"),
+                ("endpoint", "https://acct.blob.core.windows.net"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
             credentials: None,
         };
         let tier = StoreTier::from_config(&cfg, &HashMap::new()).expect("azblob backend builds");
@@ -260,9 +302,16 @@ mod tests {
 
     #[test]
     fn build_operator_rejects_unknown_scheme() {
-        let cfg = StoreTierConfig { backend: "definitely-not-a-scheme".into(), options: HashMap::new(), credentials: None };
+        let cfg = StoreTierConfig {
+            backend: "definitely-not-a-scheme".into(),
+            options: HashMap::new(),
+            credentials: None,
+        };
         let msg = format!("{:#}", build_operator(&cfg, &HashMap::new()).unwrap_err());
-        assert!(msg.contains("definitely-not-a-scheme"), "error should name the offending backend, got: {msg}");
+        assert!(
+            msg.contains("definitely-not-a-scheme"),
+            "error should name the offending backend, got: {msg}"
+        );
     }
 
     #[test]
@@ -270,17 +319,31 @@ mod tests {
         let mut creds = HashMap::new();
         creds.insert(
             "mycreds".into(),
-            Credentials([("from_secrets".to_string(), "value".to_string())].into_iter().collect()),
+            Credentials(
+                [("from_secrets".to_string(), "value".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
         );
-        let cfg = StoreTierConfig { backend: "memory".into(), options: HashMap::new(), credentials: Some("mycreds".into()) };
+        let cfg = StoreTierConfig {
+            backend: "memory".into(),
+            options: HashMap::new(),
+            credentials: Some("mycreds".into()),
+        };
         build_operator(&cfg, &creds).expect("memory backend with merged creds builds");
     }
 
     #[test]
     fn build_operator_missing_credentials_block_errors() {
-        let cfg =
-            StoreTierConfig { backend: "memory".into(), options: HashMap::new(), credentials: Some("does_not_exist".into()) };
+        let cfg = StoreTierConfig {
+            backend: "memory".into(),
+            options: HashMap::new(),
+            credentials: Some("does_not_exist".into()),
+        };
         let msg = format!("{:#}", build_operator(&cfg, &HashMap::new()).unwrap_err());
-        assert!(msg.contains("does_not_exist"), "error should name the missing credentials block, got: {msg}");
+        assert!(
+            msg.contains("does_not_exist"),
+            "error should name the missing credentials block, got: {msg}"
+        );
     }
 }

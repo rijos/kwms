@@ -33,8 +33,7 @@ pub fn validate(config: &Config) -> Result<()> {
         if well_known_grid(name).is_some() {
             bail!("grid '{name}' would shadow the built-in grid of the same name; rename it");
         }
-        crate::crs::validate(&grid.crs)
-            .with_context(|| format!("grid '{}': invalid crs '{}'", name, grid.crs))?;
+        crate::crs::validate(&grid.crs).with_context(|| format!("grid '{}': invalid crs '{}'", name, grid.crs))?;
         if grid.levels.is_some_and(|n| n == 0 || n > 30) {
             bail!("grid '{name}': levels must be 1-30");
         }
@@ -68,7 +67,8 @@ pub fn validate(config: &Config) -> Result<()> {
                 if first != source {
                     bail!(
                         "layer '{}': source '{}' is declared elsewhere with different open_options or credentials",
-                        layer.name, source.uri
+                        layer.name,
+                        source.uri
                     );
                 }
             }
@@ -77,8 +77,7 @@ pub fn validate(config: &Config) -> Result<()> {
 
     // Per-layer checks.
     for layer in &config.layers {
-        validate_layer(layer, config)
-            .with_context(|| format!("layer '{}'", layer.name))?;
+        validate_layer(layer, config).with_context(|| format!("layer '{}'", layer.name))?;
     }
 
     Ok(())
@@ -93,7 +92,9 @@ fn check_cache_segment(kind: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('.')
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
     if !ok {
         bail!(
             "{kind} name '{name}' must be 1-128 characters of A-Z, a-z, 0-9, '_', '-' or '.', \
@@ -141,10 +142,7 @@ fn validate_layer(layer: &LayerConfig, config: &Config) -> Result<()> {
         let is_well_known = well_known_grid(g).is_some();
         let is_custom = config.grids.contains_key(g);
         if !is_well_known && !is_custom {
-            bail!(
-                "grid '{}' is not a well-known name and is not defined in `grids:`",
-                g
-            );
+            bail!("grid '{}' is not a well-known name and is not defined in `grids:`", g);
         }
     }
 
@@ -193,12 +191,22 @@ fn validate_wmts(config: &Config) -> Result<()> {
     let w = &config.wmts;
     // A plain absolute path: it becomes an axum route and part of every
     // advertised URL.
-    let segment_ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    let segment_ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
     let path_ok = w.path.starts_with('/') && w.path.len() > 1 && w.path[1..].split('/').all(segment_ok);
     if !path_ok {
-        bail!("path '{}' must be like /wmts or /hwh/luchtfotorgb/wmts/v1_0 (A-Z a-z 0-9 _ - . segments)", w.path);
+        bail!(
+            "path '{}' must be like /wmts or /hwh/luchtfotorgb/wmts/v1_0 (A-Z a-z 0-9 _ - . segments)",
+            w.path
+        );
     }
-    if ["/wms", "/tms", "/healthz", "/readyz"].iter().any(|p| w.path == *p || w.path.starts_with(&format!("{p}/"))) {
+    if ["/wms", "/tms", "/healthz", "/readyz"]
+        .iter()
+        .any(|p| w.path == *p || w.path.starts_with(&format!("{p}/")))
+    {
         bail!("path '{}' collides with another kwms endpoint", w.path);
     }
     if w.tile_matrix_digits > 9 {
@@ -207,13 +215,21 @@ fn validate_wmts(config: &Config) -> Result<()> {
     let mut ids = HashSet::new();
     for t in &w.tile_matrix_sets {
         if well_known_grid(&t.grid).is_none() && !config.grids.contains_key(&t.grid) {
-            bail!("tile_matrix_sets: grid '{}' is not a well-known name and is not defined in `grids:`", t.grid);
+            bail!(
+                "tile_matrix_sets: grid '{}' is not a well-known name and is not defined in `grids:`",
+                t.grid
+            );
         }
         // Becomes a URL path segment: no '/', '?', '#', whitespace or '%'.
         let id_ok = !t.identifier.is_empty()
-            && t.identifier.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '?' | '#' | '%' | '&' | '<' | '>' | '"'));
+            && t.identifier
+                .chars()
+                .all(|c| c.is_ascii_graphic() && !matches!(c, '/' | '?' | '#' | '%' | '&' | '<' | '>' | '"'));
         if !id_ok {
-            bail!("tile_matrix_sets: identifier '{}' must be printable ASCII without / ? # % & < > \"", t.identifier);
+            bail!(
+                "tile_matrix_sets: identifier '{}' must be printable ASCII without / ? # % & < > \"",
+                t.identifier
+            );
         }
         if !ids.insert(t.identifier.as_str()) {
             bail!("tile_matrix_sets: identifier '{}' is used twice", t.identifier);
@@ -245,7 +261,8 @@ fn validate_server(server: &ServerConfig) -> Result<()> {
         let ok = rest.is_some_and(|r| {
             let host = r.split('/').next().unwrap_or_default();
             !host.is_empty()
-                && r.chars().all(|c| c.is_ascii_graphic() && !matches!(c, '?' | '#' | '"' | '\'' | '<' | '>' | '&' | '\\'))
+                && r.chars()
+                    .all(|c| c.is_ascii_graphic() && !matches!(c, '?' | '#' | '"' | '\'' | '<' | '>' | '&' | '\\'))
         });
         if !ok {
             bail!("public_url '{url}' must be an absolute http(s) URL without query or fragment, e.g. http://localhost:8080");
@@ -322,11 +339,11 @@ fn ranges_overlap(a: &RangeInclusive<u32>, b: &RangeInclusive<u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tile::grid::WELL_KNOWN_GRIDS;
     use crate::config::model::{
         CacheMode, Config, LayerCacheConfig, LayerConfig, LevelRule, MaxResolution, SourceConfig,
     };
     use crate::encode::OutputFormat;
+    use crate::tile::grid::WELL_KNOWN_GRIDS;
 
     /// Build a minimal, valid `LayerConfig` that uses only well-known grids
     /// (so validation never touches `crs::validate`).
@@ -395,7 +412,15 @@ mod tests {
             c.server.public_url = Some(good.into());
             validate(&c).unwrap_or_else(|e| panic!("{good}: {e:#}"));
         }
-        for bad in ["localhost:8080", "ftp://x", "http://", "http://x/?a=1", "http://x/#f", "http://a b", "http://x/\"<"] {
+        for bad in [
+            "localhost:8080",
+            "ftp://x",
+            "http://",
+            "http://x/?a=1",
+            "http://x/#f",
+            "http://a b",
+            "http://x/\"<",
+        ] {
             let mut c = cfg(vec![good_layer("a")]);
             c.server.public_url = Some(bad.into());
             assert!(validate(&c).is_err(), "{bad}");
@@ -406,7 +431,10 @@ mod tests {
     fn layer_names_must_be_plain_path_segments() {
         for bad in ["", "a/b", "..", ".hidden", "a b", "a\\b", "ünï"] {
             let err = validate(&cfg(vec![good_layer(bad)])).unwrap_err();
-            assert!(format!("{err:#}").contains("directory name in the tile cache"), "{bad:?}: {err:#}");
+            assert!(
+                format!("{err:#}").contains("directory name in the tile cache"),
+                "{bad:?}: {err:#}"
+            );
         }
         validate(&cfg(vec![good_layer("2026_orthoHR"), good_layer("ortho-2024.v2")])).unwrap();
     }
@@ -448,9 +476,18 @@ mod tests {
     fn valid_config_passes() {
         let mut l = good_layer("a");
         l.cache.level_rules = vec![
-            LevelRule { levels: "0-5".into(), mode: CacheMode::Cache },
-            LevelRule { levels: "10".into(), mode: CacheMode::Passthrough },
-            LevelRule { levels: "18-21".into(), mode: CacheMode::Passthrough },
+            LevelRule {
+                levels: "0-5".into(),
+                mode: CacheMode::Cache,
+            },
+            LevelRule {
+                levels: "10".into(),
+                mode: CacheMode::Passthrough,
+            },
+            LevelRule {
+                levels: "18-21".into(),
+                mode: CacheMode::Passthrough,
+            },
         ];
         validate(&cfg(vec![l])).expect("should be valid");
     }
@@ -522,9 +559,7 @@ mod tests {
         // and the "does not match" phrase rather than the exact list, so a
         // future GDAL release adding a kernel doesn't break this test.
         assert!(
-            s.contains("layer 'ortho2024'")
-                && s.contains("'foo'")
-                && s.contains("does not match"),
+            s.contains("layer 'ortho2024'") && s.contains("'foo'") && s.contains("does not match"),
             "got: {s}"
         );
     }
@@ -582,8 +617,14 @@ mod tests {
     fn overlapping_level_ranges_fail() {
         let mut l = good_layer("a");
         l.cache.level_rules = vec![
-            LevelRule { levels: "0-10".into(), mode: CacheMode::Cache },
-            LevelRule { levels: "5-15".into(), mode: CacheMode::Passthrough },
+            LevelRule {
+                levels: "0-10".into(),
+                mode: CacheMode::Cache,
+            },
+            LevelRule {
+                levels: "5-15".into(),
+                mode: CacheMode::Passthrough,
+            },
         ];
         let err = validate(&cfg(vec![l])).unwrap_err();
         let s = format!("{err:#}");

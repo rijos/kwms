@@ -27,16 +27,8 @@ pub fn validate(req: TmsRequest, catalog: &Catalog) -> Result<TmsQuery<'_>, OgcE
     match req {
         TmsRequest::Root => Ok(TmsQuery::Root),
         TmsRequest::ServiceMetadata => Ok(TmsQuery::ServiceMetadata),
-        TmsRequest::TileMapResource { layer } => {
-            layer_named(catalog, &layer).map(TmsQuery::TileMap)
-        }
-        TmsRequest::GetTile {
-            layer,
-            z,
-            x,
-            y,
-            format,
-        } => {
+        TmsRequest::TileMapResource { layer } => layer_named(catalog, &layer).map(TmsQuery::TileMap),
+        TmsRequest::GetTile { layer, z, x, y, format } => {
             let layer = layer_named(catalog, &layer)?;
             let grid = layer.primary_grid();
             let g = grid.grid();
@@ -65,8 +57,7 @@ pub fn validate(req: TmsRequest, catalog: &Catalog) -> Result<TmsQuery<'_>, OgcE
                     Some(Param::Y),
                     "tile row is outside the tile pyramid at this zoom level",
                 ))?;
-            TileQuery::new(layer, grid, TileCoord::new(z, x, top_down), format)
-                .map(TmsQuery::GetTile)
+            TileQuery::new(layer, grid, TileCoord::new(z, x, top_down), format).map(TmsQuery::GetTile)
         }
     }
 }
@@ -108,14 +99,8 @@ mod tests {
     fn rows_are_flipped_to_top_down() {
         let cat = catalog();
         // Level 1 has 2 rows: TMS y=0 (bottom) is internal row 1.
-        assert_eq!(
-            tile(&cat, "/1.0.0/ortho/1/0/0.png").unwrap(),
-            TileCoord::new(1, 0, 1)
-        );
-        assert_eq!(
-            tile(&cat, "/1.0.0/ortho/1/1/1.png").unwrap(),
-            TileCoord::new(1, 1, 0)
-        );
+        assert_eq!(tile(&cat, "/1.0.0/ortho/1/0/0.png").unwrap(), TileCoord::new(1, 0, 1));
+        assert_eq!(tile(&cat, "/1.0.0/ortho/1/1/1.png").unwrap(), TileCoord::new(1, 1, 0));
     }
 
     #[test]
@@ -126,19 +111,13 @@ mod tests {
             (e.code, e.locator_name())
         };
         assert_eq!(err("/1.0.0/nope/0/0/0.png").0, OgcCode::LayerNotDefined);
-        assert_eq!(
-            err("/1.0.0/ortho/22/0/0.png"),
-            (OgcCode::TileOutOfRange, Some("Z"))
-        );
+        assert_eq!(err("/1.0.0/ortho/22/0/0.png"), (OgcCode::TileOutOfRange, Some("Z")));
         assert_eq!(
             err("/1.0.0/ortho/64/0/0.png").0,
             OgcCode::TileOutOfRange,
             "no shift overflow"
         );
-        assert_eq!(
-            err("/1.0.0/ortho/1/0/2.png"),
-            (OgcCode::TileOutOfRange, Some("Y"))
-        );
+        assert_eq!(err("/1.0.0/ortho/1/0/2.png"), (OgcCode::TileOutOfRange, Some("Y")));
         assert_eq!(
             err("/1.0.0/ortho/1/2/0.png"),
             (OgcCode::TileOutOfRange, Some("TILECOL"))

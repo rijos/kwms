@@ -33,8 +33,7 @@ pub enum TmsRequest {
 }
 
 pub fn parse_path(path: &str) -> Result<TmsRequest, OgcError> {
-    const SHAPE: OgcError =
-        OgcError::invalid(Param::Path, "path must be /tms/1.0.0[/{layer}[/{z}/{x}/{y}.{ext}]]");
+    const SHAPE: OgcError = OgcError::invalid(Param::Path, "path must be /tms/1.0.0[/{layer}[/{z}/{x}/{y}.{ext}]]");
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     if trimmed.is_empty() {
         return Ok(TmsRequest::Root);
@@ -53,7 +52,9 @@ pub fn parse_path(path: &str) -> Result<TmsRequest, OgcError> {
     }
     match segments[..] {
         [_] => Ok(TmsRequest::ServiceMetadata),
-        [_, layer] => Ok(TmsRequest::TileMapResource { layer: layer.to_string() }),
+        [_, layer] => Ok(TmsRequest::TileMapResource {
+            layer: layer.to_string(),
+        }),
         [_, layer, z, x, last] if !trailing_slash => {
             let (y, ext) = last.rsplit_once('.').ok_or(SHAPE)?;
             Ok(TmsRequest::GetTile {
@@ -83,7 +84,11 @@ fn format_from_ext(ext: &str) -> Result<OutputFormat, OgcError> {
         "jpeg" | "jpg" => Ok(OutputFormat::Jpeg),
         "webp" => Ok(OutputFormat::Webp),
         "tif" | "tiff" => Ok(OutputFormat::GeoTiff),
-        _ => Err(OgcError::new(OgcCode::InvalidFormat, Some(Param::Format), "tile extension is not supported")),
+        _ => Err(OgcError::new(
+            OgcCode::InvalidFormat,
+            Some(Param::Format),
+            "tile extension is not supported",
+        )),
     }
 }
 
@@ -130,10 +135,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_paths() {
-        assert_eq!(
-            parse_path("/0.9.0/foo").unwrap_err().locator_name(),
-            Some("VERSION")
-        );
+        assert_eq!(parse_path("/0.9.0/foo").unwrap_err().locator_name(), Some("VERSION"));
         for p in [
             "/1.0.0/layer/0/0/no_ext",
             "/1.0.0/layer/a/0/0.png",
