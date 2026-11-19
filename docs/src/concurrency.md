@@ -11,7 +11,7 @@ check each claim. GDAL statements refer to GDAL 3.11.4
 |---|---|---|---|
 | **Startup** (inside `kwms serve`'s runtime, before the listener is bound) | 1 | PROJ network switched off, config load, `Catalog::build`, opening sources, coverage computation and the source-read budget check (`Renderer::new`), rendering all capabilities documents (`Documents::build`) | yes — before any request can arrive, so nothing can be starved |
 | **Source probe** | 1 per source, transient | `GdalSource::open` probes metadata on a temporary thread + runtime | yes — startup only |
-| **tokio workers** | CPU count | HTTP handling, `Kvp` parsing and validation, single-flight coordination, hot/persistent cache I/O, serving pre-rendered documents | **no** — no GDAL/PROJ call runs on a runtime worker during request handling |
+| **tokio workers** | CPU count | HTTP handling, `Kvp` parsing and validation, single-flight coordination, cache tier I/O, serving pre-rendered documents | **no** — no GDAL/PROJ call runs on a runtime worker during request handling |
 | **Dataset-pool workers** (`gdal-pool[n]`) | 4 per source | source reads: `GDALWarp` from the worker's own dataset into a fresh MEM dataset | yes |
 | **tokio blocking pool** (`spawn_blocking`) | up to 512 threads, *concurrency* capped at `server.render_concurrency` | encoding (MEM → `/vsimem/` → bytes), WMS compositing (`/vsimem/` tiles + `GDALWarp`) | yes |
 | GDAL internal threads | 0 by default | GDAL creates worker threads only if `GDAL_NUM_THREADS` is set | — |
@@ -57,7 +57,8 @@ startup.
 - **Slots are never nested.** A request holds at most one dataset-pool or
   render slot at a time, and releases it before taking the next: a tile is
   read (pool slot), *then* encoded (render slot); a WMS GetMap renders its
-  tiles one after another, *then* composites. Jobs running in a slot never
+  tiles one after another, *then* composites — or, beyond the cached
+  pyramid, reads its window (pool slot), *then* encodes (render slot). Jobs running in a slot never
   submit to a pool. With no request holding one resource while waiting for
   another, no wait cycle can form.
 - **Single-flight can't strand a key.** The leader's registration is removed
@@ -169,9 +170,11 @@ The concurrency tests were run 10 times in a row without a failure.
   from concurrent threads can interleave.
 - **Not run under ThreadSanitizer.** GDAL isn't instrumented, so TSan would
   report false positives in GDAL; the stress tests above are used instead.
-- **WMS fan-out.** One GetMap renders up to (WIDTH/256 + 2) × (HEIGHT/256 + 2)
-  tiles (144 at 2500²) through the source's 4 pool workers, about 0.75 s of
-  CPU at the maximum size. Bounded, but a few concurrent GetMaps can push
+- **WMS fan-out.** Within the cached pyramid, one GetMap renders up to
+  (WIDTH/256 + 2) × (HEIGHT/256 + 2) tiles (144 at 2500²) through the
+  source's 4 pool workers, about 0.75 s of CPU at the maximum size. Beyond
+  it, a GetMap is a single read holding one pool slot, capped at
+  `read_budget::MAX_DIRECT_READ_PIXELS`. Bounded, but a few concurrent GetMaps can push
   WMTS/TMS requests for the same source into 429. Lower
   `server.max_request_pixels` if that matters.
 - **`GDAL_CACHEMAX`** defaults to 5% of RAM and is process-wide; set it in

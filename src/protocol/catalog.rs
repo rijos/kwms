@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::config::{Config, LayerConfig};
 use crate::crs::{identify_crs, native_axis_order, AxisOrder, Crs};
 use crate::encode::OutputFormat;
-use crate::tile::grid::{lookup_grid, tile_matrix_set_name, well_known_grid, TileGrid};
+use crate::tile::grid::{lookup_grid, well_known_grid, TileGrid};
 
 /// Index of a CRS in the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,8 +49,9 @@ impl CatalogCrs {
 pub struct CatalogGrid {
     /// Config-level grid name (`webmercator`, or a custom grid's key).
     name: String,
-    /// WMTS TileMatrixSet identifier.
-    tile_matrix_set: String,
+    /// WMTS TileMatrixSet identifiers it is published under (`wmts:
+    /// tile_matrix_sets`, else the grid's default name); first = primary.
+    tile_matrix_sets: Vec<String>,
     grid: Arc<dyn TileGrid>,
     crs: CrsId,
 }
@@ -59,8 +60,13 @@ impl CatalogGrid {
     pub fn name(&self) -> &str {
         &self.name
     }
+    /// The primary TileMatrixSet identifier.
     pub fn tile_matrix_set(&self) -> &str {
-        &self.tile_matrix_set
+        self.tile_matrix_sets.first().map_or("", String::as_str)
+    }
+    /// Every TileMatrixSet identifier the grid is published under.
+    pub fn tile_matrix_sets(&self) -> &[String] {
+        &self.tile_matrix_sets
     }
     pub fn grid(&self) -> &Arc<dyn TileGrid> {
         &self.grid
@@ -108,7 +114,7 @@ impl CatalogLayer {
     /// identifier exactly, or a registered legacy alias of a built-in grid.
     pub fn grid_for_tile_matrix_set(&self, tile_matrix_set: &str) -> Option<&CatalogGrid> {
         self.grids.iter().find(|g| {
-            g.tile_matrix_set == tile_matrix_set
+            g.tile_matrix_sets.iter().any(|t| t == tile_matrix_set)
                 || well_known_grid(&g.name)
                     .is_some_and(|w| w.tile_matrix_set_aliases.contains(&tile_matrix_set))
         })
@@ -152,7 +158,7 @@ impl Catalog {
                     .with_context(|| format!("grid `{name}` of layer `{}`", layer.name))?;
                 grids.push(CatalogGrid {
                     name: name.clone(),
-                    tile_matrix_set: tile_matrix_set_name(name).to_string(),
+                    tile_matrix_sets: config.wmts.tile_matrix_set_ids(name),
                     grid,
                     crs,
                 });
@@ -422,6 +428,8 @@ mod tests {
                 tile_size: [256, 256],
                 base_resolution: 1024.0,
                 origin: Default::default(),
+                extent: None,
+                levels: None,
             },
         );
         let cat = Catalog::build(&config).unwrap();
@@ -449,6 +457,8 @@ mod tests {
                 tile_size: [256, 256],
                 base_resolution: 1.0,
                 origin: Default::default(),
+                extent: None,
+                levels: None,
             },
         );
         let err = format!("{:#}", Catalog::build(&config).err().expect("must fail"));

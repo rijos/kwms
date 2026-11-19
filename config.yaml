@@ -1,0 +1,150 @@
+# kwms configuration — see docs/src/configuration.md.
+#
+# Credentials live in secrets.yaml (not in git), e.g.:
+#
+#   credentials:
+#     open_tiles:
+#       AZURE_STORAGE_ACCOUNT: "salvbprod"
+#       AZURE_STORAGE_SAS_TOKEN: "sv=…&sig=…"   # read-only SAS, without the leading '?'
+
+server:
+  # The URL clients use to reach kwms. Capabilities documents link to it,
+  # and clients such as QGIS follow those links. Override per environment
+  # with KWMS_SERVER__PUBLIC_URL.
+  public_url: http://localhost:8080
+
+# ---- capabilities: published like PDOK's luchtfotorgb WMTS ----
+# https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0?request=GetCapabilities
+# Same service metadata, endpoint path, TileMatrixSet and TileMatrix
+# identifiers and tile URL layout, so clients configured for PDOK work by
+# swapping the host.
+service:
+  title: Landelijke Voorziening Beeldmateriaal
+  abstract: Een jaarlijks te vernieuwen dataset van luchtopnamen van Nederland in hoge en lage resolutie.
+  keywords: [rgb, landelijke voorziening beeldmateriaal, lvb, beeldmateriaal, luchtbeelden, luchtfoto,
+             orthofoto, ortho, ortho25, orthofotomozaïek, orthofotomozaiek, mozaïek, mozaiek, lage resolutie,
+             lr, open data cc-by, orthobeeldvorming, nationaal, orhtoHR, quick ortho, hoge resolutie, hr]
+  fees: none
+  access_constraints: none
+  provider:
+    name: PDOK
+    site: https://www.pdok.nl
+    contact:
+      individual_name: KlantContactCenter PDOK
+      delivery_point: PDOK
+      email: BeheerPDOK@kadaster.nl
+
+wmts:
+  # KVP at this path, tiles below it: {path}/{layer}/{TileMatrixSet}/{TileMatrix}/{col}/{row}.jpeg
+  path: /hwh/luchtfotorgb/wmts/v1_0
+  tile_matrix_digits: 2          # TileMatrix 00, 01, …
+  crs_identifier: epsg           # SupportedCRS EPSG:28992 (not the URN)
+  tile_matrix_sets:              # advertised in this order
+    - { grid: rd_new_quad, identifier: "EPSG:28992" }
+    - { grid: webmercator, identifier: "EPSG:3857" }
+    - { grid: nl_4258, identifier: "EPSG:4258" }
+    - { grid: nl_4326, identifier: "EPSG:4326" }
+    - { grid: nl_25831, identifier: "EPSG:25831" }
+    - { grid: nl_25832, identifier: "EPSG:25832" }
+    - { grid: webmercator, identifier: "OGC:1.0:GoogleMapsCompatible" }
+
+# PDOK's bounded tile matrix sets for the Netherlands (values derived from
+# its capabilities: level-0 scale -> base_resolution, deepest matrix size ->
+# extent). x = easting / longitude; TopLeftCorner is advertised in each
+# CRS's own axis order (lat lon for 4258/4326).
+grids:
+  nl_4258:
+    crs: EPSG:4258
+    top_left: [3.013754, 53.637608]
+    base_resolution: 0.01748040234375      # degrees per pixel at level 0
+    extent: [3.013754, 50.57881925648308, 7.488737, 53.637608]
+    levels: 20
+  nl_4326:
+    crs: EPSG:4326
+    top_left: [3.013754, 53.637608]
+    base_resolution: 0.01748040234375
+    extent: [3.013754, 50.57881925648308, 7.488737, 53.637608]
+    levels: 20
+  nl_25831:
+    crs: EPSG:25831
+    top_left: [209006.82709241798, 6236733.705757082]
+    base_resolution: 3554.483170607363
+    extent: [209006.82709241798, 5326786.014081597, 1117699.6890157792, 6236733.705757082]
+    levels: 20
+  nl_25832:
+    crs: EPSG:25832
+    top_left: [-208930.41015879204, 6247908.700083113]
+    base_resolution: 3611.5983240278247
+    extent: [-208930.41015879204, 5323339.52913199, 714458.995519492, 6247908.700083113]
+    levels: 20
+
+# Encoder settings per output format; a layer can override them with its
+# own `output_formats:`.
+output_formats:
+  jpeg: { quality: 85 }
+  png: { compression: 6 }
+
+# Default for every layer: only areas inside these polygons are shown; the
+# rest (here: Belgium) is no data, like areas without tiles — transparent in
+# PNG, white in JPEG. A layer can set its own `source_mask`, or `none`.
+source_mask: data/source_mask.shp
+
+cache:
+  # An ordered stack of tiers, checked top to bottom. A hit in a lower tier
+  # is copied into the tiers above it; a rendered tile is written to all.
+  # Durable tiers store tiles per layer and grid:
+  #   <root>/<layer>/<epsg>/<format>/<z>/<x>/<y>.<ext>   (+ a .meta TTL sidecar)
+  # e.g. 2026_orthoHR/28992/jpeg/6/30/32.jpeg — shared by WMTS, TMS and WMS.
+  # At startup every tier is checked (stores: write/read/delete a probe).
+  # `kwms cache update` fills the durable tiers ahead of requests.
+  tiers:
+    - type: memory
+      max_bytes: 512MB
+    # Testing: local file system.
+    - type: store
+      backend: fs
+      options:
+        root: /var/cache/kwms
+    #
+    # Production: a separate Azure storage account, e.g. below a local disk
+    # tier (memory -> local fs -> shared azblob). The container must exist;
+    # the credentials need read, write and delete. Keys are opendal azblob
+    # options (lower case), not GDAL options — in secrets.yaml:
+    #   credentials:
+    #     tile_cache:
+    #       account_name: "<account>"
+    #       sas_token: "sv=…&sig=…"   # or: account_key: "…"
+    #
+    # - type: store
+    #   backend: azblob
+    #   options:
+    #     endpoint: https://<account>.blob.core.windows.net
+    #     container: kwms-tiles
+    #   credentials: tile_cache
+
+layers:
+  - name: 2026_orthoHR
+    title: "Luchtfoto 2026 Ortho 5 en 8cm RGB"
+    abstract: "Landsdekkende dataset in 8cm resolutie kleuren luchtfoto's van 2026"
+    metadata_url: "https://www.nationaalgeoregister.nl/geonetwork/srv/dut/xml.metadata.get?uuid=4d8e14a9-302c-48e7-a0ee-1b23ed2a2122"
+    grids: [rd_new_quad, webmercator, nl_4258, nl_4326, nl_25831, nl_25832]
+    formats: [jpeg, png]
+    # No bbox: capabilities advertise the source's own extent (the tile
+    # footprints, in RD New), exactly in EPSG:28992 and reprojected for the
+    # other CRSes. Set `bbox:` (+ `bbox_crs:`) only to override it.
+    sources:
+      # Tile index shipped with kwms (data/2026_orthoHR/tiles.shp, a copy of
+      # /vsiaz/open-tiles/2026hrrgb/tiles.shp): 498 COGs of 10x10 km,
+      # EPSG:28992, referenced by absolute /vsiaz/open-tiles/2026hrrgb/ paths.
+      # Read through GDAL's GTI driver; the path is relative to the working
+      # directory kwms is started from.
+      #
+      # Nothing about the tiles is configured: at startup kwms reads every
+      # tile's header, finds their GSDs (here 5 cm and 8 cm) and serves each
+      # area at its own resolution, with overviews generated for the mosaic.
+      # (open_options can still pin RESX/RESY or overviews if ever needed.)
+      - uri: "GTI:data/2026_orthoHR/tiles.shp"
+        credentials: open_tiles
+        # The tiles live in the bucket, not at the URI, so say where the
+        # credentials apply.
+        credentials_prefix: /vsiaz/open-tiles/

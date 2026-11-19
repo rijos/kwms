@@ -1,0 +1,4 @@
+# Code style for `cargo fmt`. The existing code wraps at ~120 columns, so
+# this keeps the eventual one-off reformat (its own commit) small.
+edition = "2021"
+max_width = 120

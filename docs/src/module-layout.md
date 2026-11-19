@@ -11,6 +11,7 @@ src/
 ├── cli.rs                 # clap definitions
 ├── subcommand/
 │   ├── serve.rs
+│   ├── cache_update.rs  # `kwms cache update`: fill durable tiers (auto level from source file size)
 │   ├── config_check.rs
 │   └── config_schema.rs
 ├── config/
@@ -36,17 +37,23 @@ src/
 │       ├── pool.rs        # bounded dataset-handle pool; checkouts via spawn_blocking
 │       ├── warp.rs        # read_window: one GDALWarp path for every read
 │       ├── raster.rs      # shared MEM/geotransform/interleave helpers + the single GDALWarp entry point
-│       └── sample.rs      # pixel sampling for GetFeatureInfo
+│       ├── sample.rs      # pixel sampling for GetFeatureInfo
+│       ├── tile_index.rs  # GTI index probe: per-tile GSD, one view per GSD, auto overviews
+│       ├── footprint.rs   # typical source-file size (for cache.max_level auto)
+│       └── credentials.rs # per-bucket GDAL path-specific credentials
 ├── cache/
 │   ├── mod.rs             # Cache facade
-│   ├── key.rs             # TileKey { layer, z, x, y, format, crs } + OpenDAL path serialization
+│   ├── key.rs             # TileKey { layer, grid_dir, z, x, y, format } + object path
 │   ├── policy.rs          # per-layer / per-level mode resolution
-│   ├── hot.rs             # moka in-process tier
-│   ├── persistent.rs      # opendal-backed tier
-│   └── layered.rs         # two-tier composition + single-flight
+│   ├── tier.rs            # CacheTier trait + Entry (tile + render time)
+│   ├── memory.rs          # moka in-process tier
+│   ├── store.rs           # opendal-backed tier (fs, azblob, …)
+│   └── layered.rs         # tier stack (lookup, promotion, write-through) + single-flight
 ├── encode.rs              # GDAL-backed encoder for PNG / JPEG / WebP / GeoTIFF (see Output encoding chapter)
 ├── pipeline/
 │   ├── render.rs          # TileKey -> cache lookup -> source -> encode -> populate
+│   ├── cache_levels.rs    # cache.max_level: how deep each (layer, grid) is stored durably
+│   ├── stage.rs           # kwms_stage_seconds timings (where request time goes)
 │   └── wms_assemble.rs    # WMS GetMap: cover bbox with tiles, render, reassemble
 ├── protocol/
 │   ├── wms/

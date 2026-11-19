@@ -40,9 +40,28 @@ Small sources (≤ 4096² pixels) need no overviews. Large ones need a pyramid d
 
 ### Credentials & VSI configuration
 
-GDAL open options are scoped **per source**, not process-wide. `secrets.yaml` declares named credentials blocks; a layer's source references one by name. At dataset open time those become GDAL config options on that specific dataset (e.g. `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_ACCESS_KEY`, `AWS_ACCESS_KEY_ID`, …). This lets one server host layers from multiple accounts/buckets/tenants without bleeding credentials across them.
+GDAL credentials are scoped **per object-store path prefix**, not process-wide. `secrets.yaml` declares named credentials blocks; a layer's source references one by name and, optionally, the prefix it applies to (`credentials_prefix`, default: the `/vsiXXX/<bucket>/` of the source URI). At startup, before any dataset is opened, kwms registers each block with `VSISetPathSpecificOption` (`source::gdal::credentials`). This lets one server host layers from multiple accounts/buckets/tenants without bleeding credentials across them.
 
-VSI prefixes supported via GDAL: `vsiaz://`, `vsis3://`, `vsicurl://`, `vsigs://`, plus VRT files referencing any of the above. The source URI is taken verbatim from config — no rewriting.
+Two simpler mechanisms don't work, which is why it is done this way:
+
+- **Dataset open options.** VSI handlers never read credentials from open options; drivers just warn about unknown options.
+- **Thread-local config options** on the dataset-pool worker. Mosaic drivers (GTI, VRT) read tiles on GDAL's own thread pool, which doesn't inherit them, so remote reads fail with "No valid Azure credentials". Forcing those drivers to one thread makes it work, but a country-wide GTI read then took 68 s instead of 4 s.
+
+Path-specific options are process-wide state that GDAL reads without holding its lock, so kwms writes each (prefix, option) at most once and never changes it while serving (see [Unsafe code audit](./unsafe-audit.md), F18).
+
+VSI prefixes supported via GDAL: `/vsiaz/`, `/vsis3/`, `/vsicurl/`, `/vsigs/`, plus VRT files and GTI tile indexes referencing any of them. The source URI is taken verbatim from config — no rewriting — and `open_options` are passed as GDAL open options (`KEY=VALUE`).
+
+### Tile indexes (GTI)
+
+A mosaic of many COGs can be served from a vector tile index (shapefile, GeoPackage, FlatGeobuf with a location field) through GDAL's GTI driver: `uri: "GTI:data/2026_orthoHR/tiles.shp"`. Nothing about the tiles needs configuring. At startup kwms reads every tile's header, 32 in parallel (`source::gdal::tile_index`). For the 498 remote COGs of the 2026 ortho that takes about 2.5 s.
+
+- **GSD per area.** An index doesn't record the tiles' resolution, and GTI on its own takes it from the *first* tile, squeezing every other tile onto that grid with nearest neighbour. On the 2026 ortho (148 tiles at 5 cm, 350 at 8 cm) that made the 5 cm areas blocky. kwms instead groups the tiles by GSD and opens one GTI view per GSD. Each read uses the view of the finest tiles under the requested window, so an 8 cm area is read at 8 cm and a 5 cm area at 5 cm. A window spanning both is read on the finer grid, with the coarser tiles resampled bilinearly (`RESAMPLING=bilinear`, not GTI's nearest). Tile footprints are reprojected once per request CRS, on the blocking pool.
+- **Overviews.** A mosaic has none, so a coarse tile would read the full raster and the read budget above would refuse it. kwms adds virtual ones per view (`OVERVIEW_<n>_FACTOR` = 2, 4, …, until the whole mosaic fits 4096 px). GTI serves them from each tile's own overviews.
+- **Reporting.** The startup log reports tiles per GSD, tiles that couldn't be opened and tiles without overviews.
+
+Options set in `open_options`, or stored in the index (e.g. layer metadata of a `.gti.gpkg`), are never overridden. Setting `RESX`/`RESY` pins one resolution for the whole mosaic.
+
+Coarse levels touch many tiles: one tile covering the whole country opens all of them, which took about 2.3 s cold for the 498-COG 2026 ortho mosaic. A coarse WMS GetMap is composed from such grid tiles, so a cold country-wide GetMap renders dozens of them and can exceed `request_timeout`. Seed the coarse levels with `kwms cache update` (see [Caching](./caching.md)). Finer GetMaps are read directly and don't depend on the cache.
 
 ### Reprojection
 

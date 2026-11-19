@@ -382,7 +382,8 @@ impl CustomGrid {
     /// covers any plausible deep-zoom layer; callers can cap further via
     /// `Pyramid::max_level`.
     pub fn new(name: impl Into<String>, cfg: GridConfig) -> Self {
-        Self::with_level_count(name, cfg, 24)
+        let levels = cfg.levels.unwrap_or(24);
+        Self::with_level_count(name, cfg, levels)
     }
 
     pub fn with_level_count(name: impl Into<String>, cfg: GridConfig, level_count: u32) -> Self {
@@ -411,9 +412,20 @@ impl TileGrid for CustomGrid {
         self.cfg.base_resolution / pow2(level)
     }
     fn matrix_size(&self, level: u32) -> (u64, u64) {
-        // Custom grids are power-of-two ladders that are one tile at level 0
-        // (the same assumption WMTS capabilities make when advertising them).
-        (matrix_dim(1, level), matrix_dim(1, level))
+        // A bounded grid has as many tiles as cover its extent; otherwise
+        // a power-of-two ladder that is one tile at level 0.
+        let Some([_, miny, maxx, _]) = self.cfg.extent else {
+            return (matrix_dim(1, level), matrix_dim(1, level));
+        };
+        let res = self.resolution(level);
+        let (tlx, tly) = self.top_left;
+        // A hair of tolerance: an extent that ends exactly on a tile edge
+        // must not gain a column/row from float noise.
+        let count = |span: f64, tile: u32| {
+            let n = (span / (f64::from(tile) * res) - 1e-9).ceil();
+            if n.is_finite() && n >= 1.0 { n as u64 } else { 1 }
+        };
+        (count(maxx - tlx, self.cfg.tile_size[0]), count(tly - miny, self.cfg.tile_size[1]))
     }
     fn level_count(&self) -> u32 {
         self.level_count
@@ -605,6 +617,8 @@ mod tests {
                 tile_size: [256, 256],
                 base_resolution: 8192.0,
                 origin: GridOrigin::TopLeft,
+                extent: None,
+                levels: None,
             },
         );
         let g = lookup_grid("my_local", &custom).expect("custom present");
@@ -644,6 +658,28 @@ mod tests {
         assert_eq!(super::matrix_dim(2, 63), u64::MAX);
     }
 
+    /// PDOK's bounded EPSG:4258 grid: 1x1 at level 0, 524288 x 358367 at 19.
+    #[test]
+    fn bounded_custom_grid_matches_pdok_epsg4258() {
+        let grid = CustomGrid::new(
+            "nl_4258",
+            GridConfig {
+                crs: Crs::new("EPSG:4258"),
+                top_left: [3.013754, 53.637608],
+                tile_size: [256, 256],
+                base_resolution: 0.01748040234375,
+                origin: GridOrigin::TopLeft,
+                extent: Some([3.013754, 50.57881925648308, 7.488737, 53.637608]),
+                levels: None,
+            },
+        );
+        assert_eq!(grid.matrix_size(0), (1, 1));
+        assert_eq!(grid.matrix_size(1), (2, 2));
+        assert_eq!(grid.matrix_size(19), (524_288, 358_367));
+        assert!(grid.check_coord(TileCoord::new(19, 0, 358_366)).is_ok());
+        assert!(grid.check_coord(TileCoord::new(19, 0, 358_367)).is_err());
+    }
+
     #[test]
     fn bottom_left_custom_grid_is_addressed_top_down() {
         let cfg = |origin| GridConfig {
@@ -652,6 +688,8 @@ mod tests {
             tile_size: [256, 256],
             base_resolution: 1.0,
             origin,
+            extent: None,
+            levels: None,
         };
         // Bottom-left anchor (0,0) with a 256-unit level-0 tile is the same
         // grid as a top-left anchor at (0,256).

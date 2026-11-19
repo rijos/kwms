@@ -90,8 +90,18 @@ fn pixels_read(meta: &SourceMetadata, grid: &dyn TileGrid, level: u32, coverage:
     let fx = (footprint.maxx - footprint.minx) / (nb.maxx - nb.minx) * src_w;
     let fy = (footprint.maxy - footprint.miny) / (nb.maxy - nb.miny) * src_h;
 
-    // GDAL's -ovr AUTO choice for this ratio.
-    let ratio = (fx / out_w).min(fy / out_h);
+    let (kx, ky) = gdal_overview(meta, (fx / out_w).min(fy / out_h));
+    let pixels = (fx / kx).ceil() * (fy / ky).ceil();
+    if !pixels.is_finite() {
+        bail!("non-finite source footprint {footprint:?}");
+    }
+    Ok(Some(Read { pixels, full_res_pixels: fx * fy }))
+}
+
+/// The (x, y) decimation of the overview GDAL's `-ovr AUTO` picks for
+/// `ratio` source pixels per output pixel (1, 1 = full resolution).
+fn gdal_overview(meta: &SourceMetadata, ratio: f64) -> (f64, f64) {
+    let (src_w, src_h) = (f64::from(meta.size.0), f64::from(meta.size.1));
     let (mut kx, mut ky) = (1.0, 1.0);
     if ratio > 1.0 {
         for &(ow, oh) in &meta.overviews {
@@ -101,11 +111,36 @@ fn pixels_read(meta: &SourceMetadata, grid: &dyn TileGrid, level: u32, coverage:
             }
         }
     }
-    let pixels = (fx / kx).ceil() * (fy / ky).ceil();
+    (kx, ky)
+}
+
+/// Most source pixels (per band) one direct WMS read may take: four tiles'
+/// worth (~67 M, about half a second at the measured read rate). Larger
+/// reads are composed from tiles instead, each bounded by
+/// [`MAX_SOURCE_READ_PIXELS`].
+pub const MAX_DIRECT_READ_PIXELS: f64 = 4.0 * MAX_SOURCE_READ_PIXELS;
+
+/// Source pixels (per band) GDAL reads to render `bbox` (in `crs`) at
+/// `size`, mirroring its overview choice; 0 when the window misses the
+/// source. The ratio of source to output pixels comes from the whole
+/// window; only the part over the source is read.
+pub fn window_read_pixels(meta: &SourceMetadata, crs: &Crs, bbox: &Bbox, size: (u32, u32)) -> Result<f64> {
+    let footprint = if same_token(crs, &meta.native_crs) { *bbox } else { transform_bbox(bbox, crs, &meta.native_crs)? };
+    let (src_w, src_h) = (f64::from(meta.size.0), f64::from(meta.size.1));
+    let nb = &meta.native_bbox;
+    let px = |f: &Bbox| {
+        ((f.maxx - f.minx) / (nb.maxx - nb.minx) * src_w, (f.maxy - f.miny) / (nb.maxy - nb.miny) * src_h)
+    };
+    let (fx, fy) = px(&footprint);
+    let ratio = (fx / f64::from(size.0.max(1))).min(fy / f64::from(size.1.max(1)));
+    let (kx, ky) = gdal_overview(meta, ratio);
+    let Some(clipped) = clip(&footprint, nb) else { return Ok(0.0) };
+    let (cx, cy) = px(&clipped);
+    let pixels = (cx / kx).ceil() * (cy / ky).ceil();
     if !pixels.is_finite() {
         bail!("non-finite source footprint {footprint:?}");
     }
-    Ok(Some(Read { pixels, full_res_pixels: fx * fy }))
+    Ok(pixels)
 }
 
 fn clip(a: &Bbox, b: &Bbox) -> Option<Bbox> {
@@ -142,6 +177,22 @@ mod tests {
 
     fn pyramid(size: u32, factors: &[u32]) -> Vec<(u32, u32)> {
         factors.iter().map(|f| (size.div_ceil(*f), size.div_ceil(*f))).collect()
+    }
+
+    /// Direct WMS reads: with a full pyramid a 2500² image reads at most
+    /// ~(2 x 2500)²; without overviews a coarse image would read the source.
+    #[test]
+    fn window_read_estimate_follows_overviews() {
+        let rd = Crs::new("EPSG:28992");
+        let with = big_rd(pyramid(40_000, &[2, 4, 8, 16, 32, 64, 128, 256]));
+        let bbox = Bbox::from([100_000.0, 400_000.0, 135_000.0, 435_000.0]); // 5000 src px across
+        let n = window_read_pixels(&with, &rd, &bbox, (2500, 2500)).unwrap();
+        assert!((2500.0 * 2500.0..=5000.0 * 5000.0).contains(&n), "{n}");
+        let without = big_rd(Vec::new());
+        let whole = Bbox::from([0.0, 300_000.0, 280_000.0, 625_000.0]);
+        assert!(window_read_pixels(&without, &rd, &whole, (2500, 2500)).unwrap() > MAX_DIRECT_READ_PIXELS);
+        let outside = Bbox::from([900_000.0, 0.0, 901_000.0, 1_000.0]);
+        assert_eq!(window_read_pixels(&with, &rd, &outside, (256, 256)).unwrap(), 0.0);
     }
 
     #[test]

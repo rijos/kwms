@@ -15,7 +15,7 @@
 //!   call, the memory passed, what is allocated and freed and by whom, its
 //!   side effects and failure behaviour — and every entry has a tag here.
 
-use std::ffi::{c_int, CStr};
+use std::ffi::{c_int, CStr, CString};
 use std::ptr::{self, NonNull};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -275,6 +275,31 @@ pub(crate) fn proj_network_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// VSI path-specific options (credentials)
+// ---------------------------------------------------------------------------
+
+/// Set GDAL option `key` to `value` for every VSI path starting with
+/// `prefix` (`VSISetPathSpecificOption`). Process-wide, but consulted only
+/// for paths under `prefix` — by every thread, including GDAL's own worker
+/// threads (e.g. GTI's multi-threaded tile reads).
+///
+/// Must only be called at startup, before any dataset is opened under
+/// `prefix`: GDAL hands out pointers into the stored values without holding
+/// its lock, so overwriting a value while it is read would be a
+/// use-after-free.
+pub(crate) fn vsi_set_path_specific_option(prefix: &str, key: &str, value: &str) -> Result<()> {
+    let prefix = CString::new(prefix).context("path prefix contains a NUL byte")?;
+    let key = CString::new(key).context("option name contains a NUL byte")?;
+    let value = CString::new(value).context("option value contains a NUL byte")?;
+    // UNSAFE-AUDIT: F18
+    // SAFETY: three valid NUL-terminated strings that outlive the call; GDAL
+    // copies them into its own map under its own mutex and keeps no pointer
+    // to them. None is NULL (NULL value would mean "erase").
+    unsafe { gdal_sys::VSISetPathSpecificOption(prefix.as_ptr(), key.as_ptr(), value.as_ptr()) }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Test-only
 // ---------------------------------------------------------------------------
 
@@ -291,4 +316,27 @@ pub(crate) fn dataset_ref_count(ds: &Dataset) -> c_int {
     // because `ds` holds its own, so the dataset is never freed here.
     unsafe { gdal_sys::GDALDereferenceDataset(ds.c_dataset()) };
     with_ours.saturating_sub(1)
+}
+
+/// The value GDAL's VSI handlers would use for option `key` at `path`
+/// (`VSIGetPathSpecificOption`), copied out. Tests use it to check what
+/// [`vsi_set_path_specific_option`] registered.
+#[cfg(test)]
+pub(crate) fn vsi_get_path_specific_option(path: &str, key: &str) -> Result<Option<String>> {
+    let path = CString::new(path).context("path contains a NUL byte")?;
+    let key = CString::new(key).context("option name contains a NUL byte")?;
+    // UNSAFE-AUDIT: T3
+    // SAFETY: two valid NUL-terminated strings that outlive the call; the
+    // default is NULL. The result is NULL or points into GDAL's option map
+    // (or config options), valid while nobody changes that option — tests
+    // never change a registered option.
+    let value = unsafe { gdal_sys::VSIGetPathSpecificOption(path.as_ptr(), key.as_ptr(), ptr::null()) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    // UNSAFE-AUDIT: T4
+    // SAFETY: `value` is non-NULL and NUL-terminated (a `std::string`'s
+    // `c_str()` or a config option value); copied before any other GDAL call.
+    let text = unsafe { CStr::from_ptr(value) };
+    Ok(Some(text.to_string_lossy().into_owned()))
 }

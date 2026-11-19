@@ -10,7 +10,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use crate::config::{Config, LayerConfig};
-use crate::crs::{transform_bbox, Crs};
+
 use crate::tile::grid::{lookup_grid, tms_profile};
 
 // ---------------------------------------------------------------------------
@@ -147,11 +147,7 @@ pub fn generate_tile_map(
     // BoundingBox is in the TileMap's SRS (the grid CRS). `layer.bbox` is
     // WGS84, so reproject it (GDAL) — a failure is an error, not a silent
     // fallback; without a layer bbox, use the grid's extent.
-    let bbox = match layer.bbox {
-        Some(b) => transform_bbox(&b, &Crs::new("EPSG:4326"), grid.crs())
-            .with_context(|| format!("BoundingBox of layer `{}` in {}", layer.name, grid.crs()))?,
-        None => grid.extent(),
-    };
+    let bbox = crate::protocol::layer_bbox_in(layer, grid.crs())?.unwrap_or_else(|| grid.extent());
     let mut bbox_el = BytesStart::new("BoundingBox");
     let (minx, miny, maxx, maxy) = (bbox.minx, bbox.miny, bbox.maxx, bbox.maxy);
     let minx_s = minx.to_string();
@@ -267,10 +263,12 @@ mod tests {
             name: "ortho2024".into(),
             grids: vec!["webmercator".into()],
             max_resolution: MaxResolution::default(),
+            bbox_crs: None,
             bbox: Some(Bbox::from([3.17, 50.58, 7.49, 53.64])),
             sources: vec![SourceConfig {
                 uri: "vsiaz://photos/x.vrt".into(),
                 credentials: None,
+                ..Default::default()
             }],
             cache: LayerCacheConfig::default(),
             title: "Luchtfoto 2024".into(),
@@ -283,6 +281,8 @@ mod tests {
             queryable: true,
             opaque: true,
             nodata: None,
+            source_mask: None,
+            output_formats: Default::default(),
         }
     }
 

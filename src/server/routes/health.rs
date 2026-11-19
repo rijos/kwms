@@ -5,9 +5,8 @@
 //! * `/readyz` — readiness. 200 only when the app is ready to serve real
 //!   traffic, defined here as "at least one source dataset has been opened
 //!   successfully" (i.e. `AppState::new` got past `GdalSource::open`). The
-//!   cache backend's reachability is implicitly proven by `AppState::new`
-//!   succeeding too — `LayeredCache::new` returns an error if the
-//!   persistent operator can't be built.
+//!   cache backend is proven at startup too: `kwms serve` writes, reads and
+//!   deletes a probe object before binding the listener.
 //!
 //! Kept deliberately tiny — these probes are hit dozens of times per
 //! second by orchestrators and shouldn't add allocations or locks.

@@ -92,7 +92,28 @@ impl GtCompress {
 }
 
 impl EncodeOpts {
-    /// Default options per format, tuned for web-tile delivery.
+    /// The configured settings for `format`.
+    pub fn from_config(format: OutputFormat, cfg: &crate::config::OutputFormatsConfig) -> Self {
+        use crate::config::GeoTiffCompression as C;
+        match format {
+            OutputFormat::Png => EncodeOpts::Png { z_level: cfg.png.compression },
+            OutputFormat::Jpeg => EncodeOpts::Jpeg { quality: cfg.jpeg.quality, progressive: cfg.jpeg.progressive },
+            OutputFormat::Webp => EncodeOpts::Webp { quality: cfg.webp.quality, lossless: cfg.webp.lossless },
+            OutputFormat::GeoTiff => EncodeOpts::GeoTiff {
+                compress: match cfg.geotiff.compress {
+                    C::None => GtCompress::None,
+                    C::Deflate => GtCompress::Deflate,
+                    C::Lzw => GtCompress::Lzw,
+                    C::Zstd => GtCompress::Zstd,
+                },
+                predictor: cfg.geotiff.predictor,
+                tiled: cfg.geotiff.tiled,
+            },
+        }
+    }
+
+    /// Default options per format, tuned for web-tile delivery (the same as
+    /// an empty `output_formats:` config).
     pub fn defaults_for(format: OutputFormat) -> Self {
         match format {
             OutputFormat::Png => EncodeOpts::Png { z_level: 6 },
@@ -126,28 +147,102 @@ impl EncodeOpts {
     }
 }
 
+/// Whether a format has an alpha channel. Without one (JPEG), no-data
+/// pixels are painted white.
+fn supports_alpha(format: OutputFormat) -> bool {
+    !matches!(format, OutputFormat::Jpeg)
+}
+
+/// Apply `buffer.alpha` for `format`: an extra alpha band where the format
+/// has one, otherwise blend onto white. Returns the buffer to write and
+/// whether its last band is alpha.
+fn apply_alpha(buffer: &PixelBuffer, format: OutputFormat) -> Result<(std::borrow::Cow<'_, PixelBuffer>, bool)> {
+    use std::borrow::Cow;
+    let Some(alpha) = &buffer.alpha else { return Ok((Cow::Borrowed(buffer), false)) };
+    let bands = buffer.bands as usize;
+    let pixels = (buffer.width as usize).checked_mul(buffer.height as usize).context("image size overflows")?;
+    if alpha.len() != pixels {
+        anyhow::bail!("internal: alpha has {} entries for {pixels} pixels", alpha.len());
+    }
+    let elem = crate::source::gdal::raster::pixel_type_bytes(buffer.pixel_type);
+    let px_bytes = bands.checked_mul(elem).context("pixel size overflows")?;
+    if supports_alpha(format) {
+        // Alpha in the sample type: 8-bit as is, 16-bit scaled; other types
+        // have no conventional alpha range, so they keep nodata only.
+        let to_sample = |a: u8| -> Option<Vec<u8>> {
+            match buffer.pixel_type {
+                crate::source::PixelType::U8 => Some(vec![a]),
+                crate::source::PixelType::U16 => Some(u16::from(a).saturating_mul(257).to_ne_bytes().to_vec()),
+                _ => None,
+            }
+        };
+        if to_sample(0).is_none() {
+            return Ok((Cow::Borrowed(buffer), false));
+        }
+        let mut data = Vec::with_capacity(buffer.data.len().saturating_add(pixels.saturating_mul(elem)));
+        for (px, a) in buffer.data.chunks_exact(px_bytes).zip(alpha.iter()) {
+            data.extend_from_slice(px);
+            data.extend_from_slice(&to_sample(*a).unwrap_or_default());
+        }
+        let bands = buffer.bands.checked_add(1).context("band count overflows")?;
+        let out = PixelBuffer { bands, data: Bytes::from(data), nodata: None, alpha: None, ..buffer.clone() };
+        return Ok((Cow::Owned(out), true));
+    }
+    // No alpha channel: blend onto white (JPEG is 8-bit).
+    if buffer.pixel_type != crate::source::PixelType::U8 {
+        anyhow::bail!("{format:?} output needs 8-bit data");
+    }
+    let mut data = buffer.data.to_vec();
+    for (px, a) in data.chunks_exact_mut(px_bytes).zip(alpha.iter()) {
+        let a = u32::from(*a);
+        let white = 255u32.saturating_mul(255u32.saturating_sub(a));
+        for v in px.iter_mut() {
+            // (v*a + 255*(255-a) + 127) / 255: stays within 0..=255.
+            let blended = u32::from(*v).saturating_mul(a).saturating_add(white).saturating_add(127).checked_div(255).unwrap_or(255);
+            *v = u8::try_from(blended).unwrap_or(u8::MAX);
+        }
+    }
+    let out = PixelBuffer { data: Bytes::from(data), nodata: None, alpha: None, ..buffer.clone() };
+    Ok((Cow::Owned(out), false))
+}
+
 /// Encode a pixel buffer to bytes via GDAL `CreateCopy` into `/vsimem/`.
 ///
-/// `buffer.nodata` is set on every band for every format: GeoTIFF records
-/// it, and the PNG driver writes it as a `tRNS` chunk so nodata pixels come
-/// out transparent. Drivers without a nodata concept (JPEG) ignore it.
+/// Coverage (`buffer.alpha`) becomes an alpha band for PNG, WebP and
+/// GeoTIFF (transparent where there is no data) and white for JPEG.
+/// Without alpha, `buffer.nodata` is set on every band: GeoTIFF records it,
+/// and the PNG driver writes it as a `tRNS` chunk.
 pub fn encode(
     buffer: &PixelBuffer,
     georef: Option<&GeoRef>,
     format: OutputFormat,
     opts: &EncodeOpts,
 ) -> Result<Bytes> {
+    let (buffer, has_alpha_band) = apply_alpha(buffer, format)?;
+    let buffer = buffer.as_ref();
     // 1) Build an in-memory MEM dataset of the appropriate dtype.
     let mut mem = mem_from_pixel_buffer(buffer).context("failed to create in-memory MEM dataset")?;
+    if has_alpha_band {
+        let last = mem.raster_count();
+        mem.rasterband(last)
+            .context("alpha band")?
+            .set_color_interpretation(gdal::raster::ColorInterpretation::AlphaBand)
+            .context("marking the alpha band")?;
+    }
 
-    // 2) Georeferencing (GeoTIFF) and nodata (all formats).
+    // 2) Georeferencing (GeoTIFF) and nodata (all formats, unless alpha
+    //    already says where there is no data).
     if let Some(gr) = georef {
         mem.set_projection(gr.crs.as_str())
             .context("failed to set projection on MEM dataset")?;
         mem.set_geo_transform(&bbox_to_geotransform(&gr.bbox, buffer.width, buffer.height)?)
             .context("failed to set geotransform on MEM dataset")?;
     }
-    set_nodata(&mem, georef.and_then(|g| g.nodata).or(buffer.nodata))?;
+    if !has_alpha_band && buffer.nodata.is_some() {
+        set_nodata(&mem, georef.and_then(|g| g.nodata).or(buffer.nodata))?;
+    } else if !has_alpha_band {
+        set_nodata(&mem, georef.and_then(|g| g.nodata))?;
+    }
 
     // 3) Pick the target driver and assemble its creation options.
     let driver = DriverManager::get_driver_by_name(format.gdal_driver())
@@ -219,6 +314,7 @@ mod tests {
             pixel_type: PixelType::U8,
             data: Bytes::from(data),
             nodata: None,
+            alpha: None,
         }
     }
 
@@ -238,6 +334,39 @@ mod tests {
             &[0x89, 0x50, 0x4E, 0x47],
             "PNG output missing PNG magic"
         );
+    }
+
+    /// No-data pixels: an alpha band in PNG, white in JPEG.
+    #[test]
+    fn alpha_becomes_transparency_or_white() {
+        let buffer = PixelBuffer {
+            width: 2,
+            height: 1,
+            bands: 3,
+            pixel_type: PixelType::U8,
+            data: Bytes::from(vec![10, 20, 30, 0, 0, 0]),
+            nodata: None,
+            alpha: Some(Bytes::from(vec![255, 0])),
+        };
+        let decode = |bytes: Bytes, ext: &str| {
+            let path = vsimem_path("alpha-test", ext);
+            create_mem_file(&path, bytes.to_vec()).unwrap();
+            let ds = Dataset::open(&path).unwrap();
+            let bands: Vec<Vec<u8>> = (1..=ds.raster_count())
+                .map(|b| ds.rasterband(b).unwrap().read_band_as::<u8>().unwrap().into_shape_and_vec().1)
+                .collect();
+            drop(ds);
+            let _ = unlink_mem_file(&path);
+            bands
+        };
+        let png = decode(encode(&buffer, None, OutputFormat::Png, &EncodeOpts::defaults_for(OutputFormat::Png)).unwrap(), "png");
+        assert_eq!(png.len(), 4, "RGBA");
+        assert_eq!(png[3], vec![255, 0]);
+        assert_eq!((png[0][0], png[1][0], png[2][0]), (10, 20, 30));
+        let jpeg = decode(encode(&buffer, None, OutputFormat::Jpeg, &EncodeOpts::defaults_for(OutputFormat::Jpeg)).unwrap(), "jpg");
+        assert_eq!(jpeg.len(), 3);
+        // The no-data pixel is white (JPEG is lossy: allow a little).
+        assert!(jpeg.iter().all(|band| band[1] >= 240), "{jpeg:?}");
     }
 
     #[test]
@@ -261,6 +390,7 @@ mod tests {
             pixel_type: PixelType::U8,
             data: Bytes::from(data),
             nodata: None,
+            alpha: None,
         };
         let bytes = encode(
             &buffer,
@@ -297,6 +427,7 @@ mod tests {
             pixel_type: PixelType::F32,
             data: Bytes::from(data),
             nodata: None,
+            alpha: None,
         };
         let georef = GeoRef {
             crs: Crs::new("EPSG:4326"),

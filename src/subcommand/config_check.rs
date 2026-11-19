@@ -22,16 +22,18 @@ pub fn run(config: PathBuf, secrets: PathBuf) -> anyhow::Result<()> {
     println!("ok");
     println!("  bind:               {}", cfg.server.bind);
     println!("  log_level:          {}", cfg.server.log_level);
-    println!("  cache.hot:          {}", cfg.cache.hot.max_bytes);
-    println!(
-        "  cache.persistent:   backend={} ({} option(s){})",
-        cfg.cache.persistent.backend,
-        cfg.cache.persistent.options.len(),
-        match &cfg.cache.persistent.credentials {
-            Some(name) => format!(", credentials='{name}'"),
-            None => String::new(),
-        },
-    );
+    println!("  cache tiers:        {}", cfg.cache.tiers.len());
+    for tier in &cfg.cache.tiers {
+        match tier {
+            crate::config::TierConfig::Memory(m) => println!("    - memory (max_bytes={})", m.max_bytes),
+            crate::config::TierConfig::Store(st) => println!(
+                "    - store backend={} ({} option(s){})",
+                st.backend,
+                st.options.len(),
+                st.credentials.as_ref().map(|c| format!(", credentials='{c}'")).unwrap_or_default(),
+            ),
+        }
+    }
     println!("  custom grids:       {}", cfg.grids.len());
     println!("  credential blocks:  {}", sec.credentials.len());
     println!("  layers:             {}", cfg.layers.len());

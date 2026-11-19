@@ -4,191 +4,177 @@
 //! document (XML declaration + root) as a `String`.
 //!
 //! The output shape mirrors PDOK's reference WMTS capabilities document at
-//! <https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0?REQUEST=GetCapabilities>.
+//! <https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0?REQUEST=GetCapabilities>:
+//! service metadata from `service:`, OperationsMetadata with KVP and
+//! RESTful bindings, per-layer `ows:Metadata` links, and TileMatrixSet /
+//! TileMatrix identifiers and `SupportedCRS` style from `wmts:`.
 //!
-//! Naming: well-known grids surface under their canonical WMTS TileMatrixSet
-//! identifiers (e.g. `webmercator` → `GoogleMapsCompatible`); custom grids
-//! keep their config key as-is.
+//! Naming: a grid is published under the identifiers listed for it in
+//! `wmts.tile_matrix_sets` (several are allowed), else its default — the
+//! canonical WMTS name for well-known grids (`webmercator` →
+//! `GoogleMapsCompatible`), the config key for custom grids.
 
-use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::events::{BytesDecl, BytesStart, Event};
 use quick_xml::Writer;
 
-use crate::config::{Config, LayerConfig};
+use crate::config::{Config, CrsIdentifierStyle, LayerConfig, WmtsConfig};
 use crate::crs::{meters_per_unit, native_axis_order, AxisOrder};
+use crate::protocol::ows::{
+    end, start, write_href, write_operations_metadata, write_service_identification, write_service_provider,
+    write_text, GetBinding,
+};
 use crate::tile::coord::TileCoord;
-use crate::tile::grid::{lookup_grid, tile_matrix_set_name, TileGrid, OGC_PIXEL_SIZE_M};
+use crate::tile::grid::{lookup_grid, TileGrid, OGC_PIXEL_SIZE_M};
+
+/// One published TileMatrixSet: its identifier and grid.
+struct Published {
+    id: String,
+    grid_name: String,
+    grid: Arc<dyn TileGrid>,
+}
 
 /// Generate a WMTS 1.0.0 `<Capabilities>` document.
 ///
-/// `base_url` is the absolute origin + path prefix used to build the
-/// `<ResourceURL>` templates — e.g. `"https://example.org"`. The handler
-/// supplies this from the inbound request.
+/// `base_url` is the WMTS endpoint as clients reach it — public URL plus
+/// `wmts.path`, e.g. `"https://service.example.org/hwh/luchtfotorgb/wmts/v1_0"`.
+/// KVP operations are advertised at `{base_url}?`, RESTful ones below it.
 pub fn generate(config: &Config, base_url: &str) -> Result<String> {
-    // Pre-resolve all grids referenced by any layer so we can emit a single
-    // `<TileMatrixSet>` block per unique grid even when several layers share
-    // it. Use BTreeMap so output is stable across runs.
-    let mut grids: BTreeMap<String, std::sync::Arc<dyn TileGrid>> = BTreeMap::new();
-    for layer in &config.layers {
-        for grid_name in &layer.grids {
-            let g = lookup_grid(grid_name, &config.grids).ok_or_else(|| {
-                anyhow!(
-                    "WMTS capabilities: layer `{}` references unknown grid `{}`",
-                    layer.name,
-                    grid_name
-                )
-            })?;
-            let tms_name = tile_matrix_set_name(grid_name).to_string();
-            grids.entry(tms_name).or_insert(g);
-        }
-    }
+    let base = base_url.trim_end_matches('/');
+    let published = published_sets(config)?;
 
     let mut writer = Writer::new(Vec::<u8>::new());
     writer
         .write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
         .context("write XML declaration")?;
 
-    // ---- root ----
     let mut root = BytesStart::new("Capabilities");
     root.push_attribute(("xmlns", "http://www.opengis.net/wmts/1.0"));
     root.push_attribute(("xmlns:ows", "http://www.opengis.net/ows/1.1"));
     root.push_attribute(("xmlns:xlink", "http://www.w3.org/1999/xlink"));
     root.push_attribute(("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance"));
     root.push_attribute(("xmlns:gml", "http://www.opengis.net/gml"));
+    root.push_attribute((
+        "xsi:schemaLocation",
+        "http://www.opengis.net/wmts/1.0 http://schemas.opengis.net/wmts/1.0/wmtsGetCapabilities_response.xsd",
+    ));
     root.push_attribute(("version", "1.0.0"));
     writer.write_event(Event::Start(root)).context("start root")?;
 
-    // ---- ServiceIdentification ----
-    write_service_identification(&mut writer)?;
-    // ---- ServiceProvider ----
-    write_service_provider(&mut writer)?;
+    write_service_identification(&mut writer, &config.service, "kwms WMTS", "OGC WMTS", "1.0.0")?;
+    write_service_provider(&mut writer, &config.service)?;
+    let kvp = format!("{base}?");
+    write_operations_metadata(
+        &mut writer,
+        &["GetCapabilities", "GetTile"],
+        &[GetBinding { href: &kvp, encoding: "KVP" }, GetBinding { href: base, encoding: "RESTful" }],
+    )?;
 
-    // ---- Contents ----
-    writer
-        .write_event(Event::Start(BytesStart::new("Contents")))
-        .context("start Contents")?;
-
+    start(&mut writer, "Contents")?;
     for layer in &config.layers {
-        write_layer(&mut writer, layer, base_url)?;
+        write_layer(&mut writer, layer, &published, base)?;
     }
-
-    for (tms_name, grid) in &grids {
-        write_tile_matrix_set(&mut writer, tms_name, grid.as_ref())?;
+    for p in &published {
+        write_tile_matrix_set(&mut writer, p, &config.wmts)?;
     }
+    end(&mut writer, "Contents")?;
+    write_href(
+        &mut writer,
+        "ServiceMetadataURL",
+        &format!("{base}/{}", super::request::REST_CAPABILITIES_PATH),
+    )?;
+    end(&mut writer, "Capabilities")?;
 
-    writer
-        .write_event(Event::End(BytesEnd::new("Contents")))
-        .context("end Contents")?;
-    writer
-        .write_event(Event::End(BytesEnd::new("Capabilities")))
-        .context("end root")?;
-
-    let bytes = writer.into_inner();
-    Ok(String::from_utf8(bytes).context("WMTS capabilities not valid UTF-8")?)
+    String::from_utf8(writer.into_inner()).context("WMTS capabilities not valid UTF-8")
 }
 
-// ---------------------------------------------------------------------------
-// Section writers
-// ---------------------------------------------------------------------------
-
-fn write_service_identification<W: std::io::Write>(writer: &mut Writer<W>) -> Result<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("ows:ServiceIdentification")))
-        .context("start ServiceIdentification")?;
-    write_text(writer, "ows:Title", "kwms WMTS")?;
-    write_text(writer, "ows:Abstract", "kwms — WMTS 1.0.0 service")?;
-    write_text(writer, "ows:ServiceType", "OGC WMTS")?;
-    write_text(writer, "ows:ServiceTypeVersion", "1.0.0")?;
-    writer
-        .write_event(Event::End(BytesEnd::new("ows:ServiceIdentification")))
-        .context("end ServiceIdentification")?;
-    Ok(())
-}
-
-fn write_service_provider<W: std::io::Write>(writer: &mut Writer<W>) -> Result<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("ows:ServiceProvider")))
-        .context("start ServiceProvider")?;
-    write_text(writer, "ows:ProviderName", "kwms")?;
-    writer
-        .write_event(Event::End(BytesEnd::new("ows:ServiceProvider")))
-        .context("end ServiceProvider")?;
-    Ok(())
+/// Every TileMatrixSet to publish, in order: the `wmts.tile_matrix_sets`
+/// entries for grids some layer uses, then (default names) the used grids
+/// not listed there. Identifiers must be unique.
+fn published_sets(config: &Config) -> Result<Vec<Published>> {
+    let mut used: Vec<&String> = Vec::new();
+    for layer in &config.layers {
+        for g in &layer.grids {
+            if !used.contains(&g) {
+                used.push(g);
+            }
+        }
+    }
+    let lookup = |name: &str| {
+        lookup_grid(name, &config.grids).ok_or_else(|| anyhow!("WMTS capabilities: unknown grid `{name}`"))
+    };
+    let mut out: Vec<Published> = Vec::new();
+    for entry in &config.wmts.tile_matrix_sets {
+        if used.contains(&&entry.grid) {
+            out.push(Published { id: entry.identifier.clone(), grid_name: entry.grid.clone(), grid: lookup(&entry.grid)? });
+        }
+    }
+    for name in used {
+        if !out.iter().any(|p| &p.grid_name == name) {
+            for id in config.wmts.tile_matrix_set_ids(name) {
+                out.push(Published { id, grid_name: name.clone(), grid: lookup(name)? });
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    for p in &out {
+        if !seen.insert(p.id.as_str()) {
+            return Err(anyhow!("TileMatrixSet identifier `{}` is used twice", p.id));
+        }
+    }
+    Ok(out)
 }
 
 fn write_layer<W: std::io::Write>(
     writer: &mut Writer<W>,
     layer: &LayerConfig,
-    base_url: &str,
+    published: &[Published],
+    base: &str,
 ) -> Result<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("Layer")))
-        .context("start Layer")?;
-
+    start(writer, "Layer")?;
+    // OWS DatasetDescriptionSummary order: Title, Abstract, Keywords,
+    // WGS84BoundingBox, Identifier, BoundingBox, Metadata.
     write_text(writer, "ows:Title", &layer.title)?;
     write_text(writer, "ows:Abstract", &layer.abstract_)?;
-
     if !layer.keywords.is_empty() {
-        writer
-            .write_event(Event::Start(BytesStart::new("ows:Keywords")))
-            .context("start Keywords")?;
+        start(writer, "ows:Keywords")?;
         for kw in &layer.keywords {
             write_text(writer, "ows:Keyword", kw)?;
         }
-        writer
-            .write_event(Event::End(BytesEnd::new("ows:Keywords")))
-            .context("end Keywords")?;
+        end(writer, "ows:Keywords")?;
     }
-
-    write_text(writer, "ows:Identifier", &layer.name)?;
-
-    if let Some(b) = &layer.bbox {
-        writer
-            .write_event(Event::Start(BytesStart::new("ows:WGS84BoundingBox")))
-            .context("start WGS84BoundingBox")?;
+    if let Some(b) = &crate::protocol::layer_bbox_in(layer, &crate::crs::Crs::new("EPSG:4326"))? {
+        start(writer, "ows:WGS84BoundingBox")?;
         write_text(writer, "ows:LowerCorner", &format!("{} {}", b.minx, b.miny))?;
         write_text(writer, "ows:UpperCorner", &format!("{} {}", b.maxx, b.maxy))?;
-        writer
-            .write_event(Event::End(BytesEnd::new("ows:WGS84BoundingBox")))
-            .context("end WGS84BoundingBox")?;
+        end(writer, "ows:WGS84BoundingBox")?;
+    }
+    write_text(writer, "ows:Identifier", &layer.name)?;
+    if let Some(url) = &layer.metadata_url {
+        write_href(writer, "ows:Metadata", url)?;
     }
 
-    // ---- Style (always one default) ----
     let mut style_el = BytesStart::new("Style");
     style_el.push_attribute(("isDefault", "true"));
-    writer
-        .write_event(Event::Start(style_el))
-        .context("start Style")?;
+    writer.write_event(Event::Start(style_el)).context("start Style")?;
     write_text(writer, "ows:Identifier", "default")?;
-    writer
-        .write_event(Event::End(BytesEnd::new("Style")))
-        .context("end Style")?;
+    end(writer, "Style")?;
 
-    // ---- Format ----
     for fmt in &layer.formats {
         write_text(writer, "Format", fmt.mime_type())?;
     }
-
-    // ---- TileMatrixSetLink ----
-    for grid_name in &layer.grids {
-        let tms_name = tile_matrix_set_name(grid_name);
-        writer
-            .write_event(Event::Start(BytesStart::new("TileMatrixSetLink")))
-            .context("start TileMatrixSetLink")?;
-        write_text(writer, "TileMatrixSet", tms_name)?;
-        writer
-            .write_event(Event::End(BytesEnd::new("TileMatrixSetLink")))
-            .context("end TileMatrixSetLink")?;
+    for p in published.iter().filter(|p| layer.grids.contains(&p.grid_name)) {
+        start(writer, "TileMatrixSetLink")?;
+        write_text(writer, "TileMatrixSet", &p.id)?;
+        end(writer, "TileMatrixSetLink")?;
     }
-
-    // ---- ResourceURL templates (one per format) ----
     for fmt in &layer.formats {
         // Same grammar `request::parse_rest` accepts — one definition.
         let template = format!(
-            "{base}/wmts/{layer}/{tile}.{ext}",
-            base = base_url.trim_end_matches('/'),
+            "{base}/{layer}/{tile}.{ext}",
             layer = layer.name,
             tile = super::request::REST_TILE_TEMPLATE,
             ext = fmt.extension(),
@@ -197,33 +183,21 @@ fn write_layer<W: std::io::Write>(
         el.push_attribute(("format", fmt.mime_type()));
         el.push_attribute(("resourceType", "tile"));
         el.push_attribute(("template", template.as_str()));
-        writer
-            .write_event(Event::Empty(el))
-            .context("write ResourceURL")?;
+        writer.write_event(Event::Empty(el)).context("write ResourceURL")?;
     }
-
-    writer
-        .write_event(Event::End(BytesEnd::new("Layer")))
-        .context("end Layer")?;
-    Ok(())
+    end(writer, "Layer")
 }
 
-fn write_tile_matrix_set<W: std::io::Write>(
-    writer: &mut Writer<W>,
-    tms_name: &str,
-    grid: &dyn TileGrid,
-) -> Result<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new("TileMatrixSet")))
-        .context("start TileMatrixSet")?;
-
-    write_text(writer, "ows:Identifier", tms_name)?;
-    write_text(writer, "ows:SupportedCRS", &supported_crs_urn(grid.crs().as_str()))?;
+fn write_tile_matrix_set<W: std::io::Write>(writer: &mut Writer<W>, p: &Published, wmts: &WmtsConfig) -> Result<()> {
+    let grid = p.grid.as_ref();
+    start(writer, "TileMatrixSet")?;
+    write_text(writer, "ows:Identifier", &p.id)?;
+    write_text(writer, "ows:SupportedCRS", &supported_crs(grid.crs().as_str(), wmts.crs_identifier))?;
 
     let (tile_w, tile_h) = grid.tile_size();
     let top_left = grid.tile_bbox(TileCoord::new(0, 0, 0));
-    // TopLeftCorner is written in the axis order of the SupportedCRS URN,
-    // e.g. "lat lon" for urn:ogc:def:crs:EPSG::4326 and "N E" for ::3035.
+    // TopLeftCorner is written in the CRS's axis order, e.g. "lat lon" for
+    // EPSG:4326 / EPSG:4258 and "N E" for EPSG:3035.
     let corner = match native_axis_order(grid.crs()).context("TileMatrixSet CRS axis order")? {
         AxisOrder::XY => format!("{} {}", top_left.minx, top_left.maxy),
         AxisOrder::YX => format!("{} {}", top_left.maxy, top_left.minx),
@@ -231,64 +205,31 @@ fn write_tile_matrix_set<W: std::io::Write>(
     // ScaleDenominator = resolution in metres / 0.28 mm (OGC standard pixel);
     // degree-based CRSes convert via the ellipsoid (GDAL), not assumed metres.
     let metres_per_unit = meters_per_unit(grid.crs()).context("TileMatrixSet CRS units")?;
-
-    let levels = grid.level_count();
-    for level in 0..levels {
-        let res = grid.resolution(level);
-        let scale_denom = res * metres_per_unit / OGC_PIXEL_SIZE_M;
+    for level in 0..grid.level_count() {
+        let scale_denom = grid.resolution(level) * metres_per_unit / OGC_PIXEL_SIZE_M;
         let (matrix_width, matrix_height) = grid.matrix_size(level);
-
-        writer
-            .write_event(Event::Start(BytesStart::new("TileMatrix")))
-            .context("start TileMatrix")?;
-        write_text(writer, "ows:Identifier", &level.to_string())?;
+        start(writer, "TileMatrix")?;
+        write_text(writer, "ows:Identifier", &wmts.tile_matrix_id(level))?;
         write_text(writer, "ScaleDenominator", &format!("{scale_denom}"))?;
         write_text(writer, "TopLeftCorner", &corner)?;
         write_text(writer, "TileWidth", &tile_w.to_string())?;
         write_text(writer, "TileHeight", &tile_h.to_string())?;
         write_text(writer, "MatrixWidth", &matrix_width.to_string())?;
         write_text(writer, "MatrixHeight", &matrix_height.to_string())?;
-        writer
-            .write_event(Event::End(BytesEnd::new("TileMatrix")))
-            .context("end TileMatrix")?;
+        end(writer, "TileMatrix")?;
     }
-
-    writer
-        .write_event(Event::End(BytesEnd::new("TileMatrixSet")))
-        .context("end TileMatrixSet")?;
-    Ok(())
+    end(writer, "TileMatrixSet")
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Convert an `EPSG:NNNN`-style identifier into the URN form WMTS prefers
-/// in `<ows:SupportedCRS>` (`urn:ogc:def:crs:EPSG::NNNN`). Anything that's
-/// not an `EPSG:` code passes through unchanged.
-fn supported_crs_urn(crs: &str) -> String {
-    if let Some(code) = crs.strip_prefix("EPSG:").or_else(|| crs.strip_prefix("epsg:")) {
-        format!("urn:ogc:def:crs:EPSG::{code}")
-    } else {
-        crs.to_string()
+/// `ows:SupportedCRS` for an `EPSG:NNNN` CRS: the URN
+/// (`urn:ogc:def:crs:EPSG::NNNN`) or the short form, per config. Anything
+/// that's not an `EPSG:` code passes through unchanged.
+fn supported_crs(crs: &str, style: CrsIdentifierStyle) -> String {
+    match (crs.strip_prefix("EPSG:").or_else(|| crs.strip_prefix("epsg:")), style) {
+        (Some(code), CrsIdentifierStyle::Urn) => format!("urn:ogc:def:crs:EPSG::{code}"),
+        (Some(code), CrsIdentifierStyle::Epsg) => format!("EPSG:{code}"),
+        (None, _) => crs.to_string(),
     }
-}
-
-fn write_text<W: std::io::Write>(
-    writer: &mut Writer<W>,
-    tag: &str,
-    text: &str,
-) -> Result<()> {
-    writer
-        .write_event(Event::Start(BytesStart::new(tag)))
-        .with_context(|| format!("start <{tag}>"))?;
-    writer
-        .write_event(Event::Text(BytesText::new(text)))
-        .with_context(|| format!("text for <{tag}>"))?;
-    writer
-        .write_event(Event::End(BytesEnd::new(tag)))
-        .with_context(|| format!("end <{tag}>"))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -309,10 +250,12 @@ mod tests {
             name: "ortho2024".into(),
             grids: vec!["webmercator".into()],
             max_resolution: MaxResolution::default(),
+            bbox_crs: None,
             bbox: Some(Bbox::from([3.17, 50.58, 7.49, 53.64])),
             sources: vec![SourceConfig {
                 uri: "vsiaz://photos/x.vrt".into(),
                 credentials: None,
+                ..Default::default()
             }],
             cache: LayerCacheConfig::default(),
             title: "Luchtfoto 2024".into(),
@@ -325,6 +268,8 @@ mod tests {
             queryable: true,
             opaque: true,
             nodata: None,
+            source_mask: None,
+            output_formats: Default::default(),
         }
     }
 
@@ -376,7 +321,7 @@ mod tests {
 
     #[test]
     fn contains_resource_url_template() {
-        let xml = generate(&minimal_config(), "https://example.org").unwrap();
+        let xml = generate(&minimal_config(), "https://example.org/wmts").unwrap();
         assert!(
             xml.contains("<ResourceURL"),
             "expected ResourceURL element; got:\n{xml}"
@@ -391,6 +336,45 @@ mod tests {
             ),
             "expected template substitution placeholders; got:\n{xml}"
         );
+    }
+
+    /// PDOK-style publication through config: EPSG ids, two names for one
+    /// grid, zero-padded TileMatrix ids, short CRS ids, service metadata,
+    /// layer metadata link, OperationsMetadata and ServiceMetadataURL.
+    #[test]
+    fn pdok_style_publication() {
+        let mut cfg = minimal_config();
+        cfg.wmts.tile_matrix_digits = 2;
+        cfg.wmts.crs_identifier = CrsIdentifierStyle::Epsg;
+        cfg.wmts.tile_matrix_sets = vec![
+            crate::config::TileMatrixSetName { grid: "webmercator".into(), identifier: "EPSG:3857".into() },
+            crate::config::TileMatrixSetName {
+                grid: "webmercator".into(),
+                identifier: "OGC:1.0:GoogleMapsCompatible".into(),
+            },
+        ];
+        cfg.service.title = Some("Landelijke Voorziening Beeldmateriaal".into());
+        cfg.service.fees = Some("none".into());
+        cfg.layers[0].metadata_url = Some("https://example.org/md?uuid=1".into());
+        let base = "https://service.example.org/hwh/luchtfotorgb/wmts/v1_0";
+        let xml = generate(&cfg, base).unwrap();
+        for needle in [
+            "<ows:Title>Landelijke Voorziening Beeldmateriaal</ows:Title>",
+            "<ows:Fees>none</ows:Fees>",
+            "<ows:Get xlink:href=\"https://service.example.org/hwh/luchtfotorgb/wmts/v1_0?\">",
+            "<ows:Value>RESTful</ows:Value>",
+            "<ows:Identifier>ortho2024</ows:Identifier><ows:Metadata xlink:href=\"https://example.org/md?uuid=1\"/>",
+            "<TileMatrixSetLink><TileMatrixSet>EPSG:3857</TileMatrixSet></TileMatrixSetLink>\
+             <TileMatrixSetLink><TileMatrixSet>OGC:1.0:GoogleMapsCompatible</TileMatrixSet></TileMatrixSetLink>",
+            "<ows:Identifier>EPSG:3857</ows:Identifier><ows:SupportedCRS>EPSG:3857</ows:SupportedCRS>",
+            "<ows:Identifier>00</ows:Identifier>",
+            "<ows:Identifier>21</ows:Identifier>",
+            "template=\"https://service.example.org/hwh/luchtfotorgb/wmts/v1_0/ortho2024/{TileMatrixSet}/",
+            "<ServiceMetadataURL xlink:href=\"https://service.example.org/hwh/luchtfotorgb/wmts/v1_0/1.0.0/WMTSCapabilities.xml\"/>",
+        ] {
+            assert!(xml.contains(needle), "missing {needle}\n{xml}");
+        }
+        assert!(!xml.contains("<TileMatrixSet>GoogleMapsCompatible</TileMatrixSet>"), "default name still advertised");
     }
 
     #[test]

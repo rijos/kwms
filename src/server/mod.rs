@@ -45,9 +45,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     let protocols = Router::new()
         // WMS
         .route("/wms", get(routes::wms::handle))
-        // WMTS
-        .route("/wmts", get(routes::wmts::handle_kvp))
-        .route("/wmts/*rest", get(routes::wmts::handle_rest))
+        // WMTS: KVP at `wmts.path`, RESTful below it (validated config).
+        .route(&state.config.wmts.path, get(routes::wmts::handle_kvp))
+        .route(&format!("{}/*rest", state.config.wmts.path), get(routes::wmts::handle_rest))
         // TMS
         .route("/tms/*rest", get(routes::tms::handle));
     let protocols = with_overload_protection(protocols, &state.config.server);
@@ -123,12 +123,10 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use opendal::{services, Operator};
     use tower::ServiceExt;
 
-    use crate::cache::hot::HotTier;
+    use crate::cache::memory::MemoryTier;
     use crate::cache::layered::LayeredCache;
-    use crate::cache::persistent::PersistentTier;
     use crate::config::{
         Config, LayerCacheConfig, LayerConfig, MaxResolution, SourceConfig,
     };
@@ -183,10 +181,12 @@ mod tests {
             name: "ortho".into(),
             grids: vec!["webmercator".into()],
             max_resolution: MaxResolution::default(),
+            bbox_crs: None,
             bbox: Some(Bbox::from([3.0, 50.0, 7.0, 54.0])),
             sources: vec![SourceConfig {
                 uri: "memory://test".into(),
                 credentials: None,
+                ..Default::default()
             }],
             cache: LayerCacheConfig::default(),
             title: "Test Layer".into(),
@@ -199,14 +199,13 @@ mod tests {
             queryable: true,
             opaque: false,
             nodata: None,
+            source_mask: None,
+            output_formats: Default::default(),
         }
     }
 
     fn memory_cache() -> LayeredCache {
-        let op = Operator::new(services::Memory::default())
-            .expect("memory operator")
-            .finish();
-        LayeredCache::from_parts(HotTier::new(1024 * 1024), PersistentTier::new(op))
+        LayeredCache::from_tiers(vec![std::sync::Arc::new(MemoryTier::new(1024 * 1024))])
     }
 
     /// Build an `AppState` with no real sources opened — used by tests

@@ -3,26 +3,32 @@
 //! One of three modules permitted to call into the `gdal` crate directly
 //! (alongside `crs/gdal.rs` and `encode.rs`).
 
+pub mod credentials;
 pub mod dataset;
+pub mod footprint;
+pub mod mask;
 pub mod pool;
 pub mod sample;
+pub mod tile_index;
 pub(crate) mod raster;
 pub mod warp;
-
-use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::SourceConfig;
 use gdal::GeoTransformEx;
 
-use crate::crs::{identify_crs, Bbox, Coord, Crs};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::crs::{identify_crs, transform_bbox, Bbox, Coord, Crs};
 
 use self::pool::DatasetPool;
+use self::tile_index::{IndexTile, TileIndex};
 use self::raster::pixel_type_from_gdal;
 use self::warp::read_window as warp_read_window;
 
-use super::{PixelBuffer, PixelValue, Source, SourceMetadata, WindowRequest};
+use super::{Area, PixelBuffer, PixelValue, Source, SourceMetadata, WindowRequest};
 
 /// Default per-source pool size if not overridden. Kept small because GDAL
 /// dataset handles (especially VRT mosaics and VSI-backed handles) are
@@ -30,8 +36,28 @@ use super::{PixelBuffer, PixelValue, Source, SourceMetadata, WindowRequest};
 const DEFAULT_POOL_SIZE: usize = 4;
 
 pub struct GdalSource {
-    pool: DatasetPool,
+    /// Dataset pools, one per view: a single one for an ordinary dataset;
+    /// for a GTI tile index one per tile GSD, finest first (see
+    /// [`tile_index`]).
+    views: Vec<View>,
+    /// Picks the view for a request (tile index with several GSDs only).
+    routing: Option<Routing>,
+    /// Of the first (finest) view.
     metadata: SourceMetadata,
+    /// Where the source has data (tile footprints, or the raster extent).
+    coverage: Area,
+}
+
+struct View {
+    /// GSD of this view; `None` for a single-view source.
+    res: Option<(f64, f64)>,
+    pool: DatasetPool,
+}
+
+/// Tile footprints and GSDs, reprojected once per request CRS.
+struct Routing {
+    index: Arc<TileIndex>,
+    by_crs: std::sync::Mutex<HashMap<Crs, Arc<Vec<IndexTile>>>>,
 }
 
 impl GdalSource {
@@ -39,27 +65,105 @@ impl GdalSource {
     /// pool's first dataset and probes it for metadata; this catches
     /// bad URIs, missing credentials, and unsupported pixel types at
     /// startup rather than on first request.
+    ///
+    /// A GTI tile index is probed first ([`tile_index::probe`]): every
+    /// tile's GSD is read and one view per GSD is opened, so each area is
+    /// served at its own resolution with no `RESX` in config or index.
+    ///
+    /// Credentials are not applied here: [`credentials::register`] must have
+    /// run for the whole config first.
     pub fn open(config: &SourceConfig) -> Result<Self> {
-        // For phase 2 the `credentials` field is just an opaque named
-        // reference into `secrets.yaml`; full secrets wiring is the job of
-        // a later phase. We accept an empty credential map here and let
-        // the future plumbing layer pass real key/value blocks in.
-        let credentials: HashMap<String, String> = HashMap::new();
-        Self::open_with_credentials(&config.uri, credentials, DEFAULT_POOL_SIZE)
+        let (uri, configured) = (&config.uri, &config.open_options);
+        let Some(index) = tile_index::probe(uri, configured).with_context(|| format!("probing tile index '{uri}'"))? else {
+            return Self::open_with(uri, configured, DEFAULT_POOL_SIZE);
+        };
+        let info = &index.info;
+        tracing::info!(
+            uri = %uri,
+            tiles = info.tiles,
+            gsd = ?info.resolutions,
+            fixed_resolution = index.resolution_fixed(),
+            ms = info.elapsed.as_millis() as u64,
+            "probed tile index"
+        );
+        if info.failed_count > 0 {
+            tracing::warn!(uri = %uri, failed = info.failed_count, first = ?info.failed, "tile index: tiles that could not be opened");
+        }
+        if info.without_overviews > 0 {
+            tracing::warn!(uri = %uri, tiles = info.without_overviews, "tile index: tiles without overviews (slow at coarse scales)");
+        }
+        let resolutions = if index.resolution_fixed() { vec![info.finest] } else { index.resolutions() };
+        let mut views = Vec::with_capacity(resolutions.len());
+        for res in resolutions {
+            let mut options = configured.clone();
+            options.extend(index.options_for(res));
+            let pool = DatasetPool::new(uri, &options, DEFAULT_POOL_SIZE)
+                .with_context(|| format!("opening '{uri}' at GSD {res:?} with {options:?}"))?;
+            views.push(View { res: Some(res), pool });
+        }
+        let first = views.first().ok_or_else(|| anyhow!("tile index '{uri}' has no usable tiles"))?;
+        let metadata = futures_executor_block_on(probe_metadata(&first.pool))
+            .with_context(|| format!("failed to probe metadata for '{uri}'"))?;
+        let dissolving = std::time::Instant::now();
+        // Snap to 1/100 of the finest GSD: far below a pixel, far above
+        // float noise, and in the index's own units (metres or degrees).
+        let snap = info.finest.0.min(info.finest.1) / 100.0;
+        let coverage =
+            mask::dissolve(&index.footprints, &metadata.native_crs, snap).context("dissolving tile footprints")?;
+        tracing::info!(uri = %uri, ms = dissolving.elapsed().as_millis() as u64, "tile footprints dissolved");
+        let routing = (views.len() > 1)
+            .then(|| Routing { index: Arc::new(index), by_crs: std::sync::Mutex::new(HashMap::new()) });
+        Ok(Self { views, routing, metadata, coverage })
     }
 
-    /// Test-friendly constructor that takes explicit credentials and pool
-    /// size. The public `open` is the production entry point.
-    pub fn open_with_credentials(
-        uri: &str,
-        credentials: HashMap<String, String>,
-        pool_size: usize,
-    ) -> Result<Self> {
-        let pool = DatasetPool::new(uri, credentials, pool_size)
+    /// Open `uri` as one view with explicit GDAL open options and pool size.
+    pub fn open_with(uri: &str, open_options: &[String], pool_size: usize) -> Result<Self> {
+        let pool = DatasetPool::new(uri, open_options, pool_size)
             .with_context(|| format!("failed to build dataset pool for '{uri}'"))?;
         let metadata = futures_executor_block_on(probe_metadata(&pool))
             .with_context(|| format!("failed to probe metadata for '{uri}'"))?;
-        Ok(Self { pool, metadata })
+        let coverage = mask::rectangle(&metadata.native_bbox, &metadata.native_crs)?;
+        Ok(Self { views: vec![View { res: None, pool }], routing: None, metadata, coverage })
+    }
+
+    /// The pool to read `bbox` (in `crs`) from: the view of the finest GSD
+    /// among the tiles under it (the finest view if none is).
+    async fn pool_for(&self, crs: &Crs, bbox: &Bbox) -> Result<&DatasetPool> {
+        let (Some(routing), Some(finest)) = (&self.routing, self.views.first()) else {
+            return self.views.first().map(|v| &v.pool).ok_or_else(|| anyhow!("source has no views"));
+        };
+        let tiles = self.tiles_in(routing, crs).await?;
+        let res = TileIndex::finest_under(&tiles, (bbox.minx, bbox.miny, bbox.maxx, bbox.maxy));
+        Ok(self.views.iter().find(|v| v.res.is_some() && v.res == res).map_or(&finest.pool, |v| &v.pool))
+    }
+
+    /// Tile footprints in `crs`: reprojected once per CRS, on the blocking
+    /// pool (PROJ never runs on an async worker), then cached.
+    async fn tiles_in(&self, routing: &Routing, crs: &Crs) -> Result<Arc<Vec<IndexTile>>> {
+        if let Some(t) = routing.by_crs.lock().map_err(|_| anyhow!("routing cache poisoned"))?.get(crs) {
+            return Ok(t.clone());
+        }
+        let native = self.metadata.native_crs.clone();
+        let (index, target) = (routing.index.clone(), crs.clone());
+        let tiles = tokio::task::spawn_blocking(move || -> Vec<IndexTile> {
+            if target == native {
+                return index.tiles.clone();
+            }
+            index
+                .tiles
+                .iter()
+                .filter_map(|t| {
+                    let (minx, miny, maxx, maxy) = t.bbox;
+                    let b = transform_bbox(&Bbox { minx, miny, maxx, maxy }, &native, &target).ok()?;
+                    Some(IndexTile { bbox: (b.minx, b.miny, b.maxx, b.maxy), res: t.res })
+                })
+                .collect()
+        })
+        .await
+        .context("reprojecting tile footprints")?;
+        let tiles = Arc::new(tiles);
+        routing.by_crs.lock().map_err(|_| anyhow!("routing cache poisoned"))?.insert(crs.clone(), tiles.clone());
+        Ok(tiles)
     }
 }
 
@@ -165,15 +269,24 @@ impl Source for GdalSource {
         &self.metadata
     }
 
+    fn coverage_area(&self) -> Option<Area> {
+        Some(self.coverage.clone())
+    }
+
     async fn read_window(&self, req: WindowRequest) -> Result<PixelBuffer> {
-        self.pool
-            .with_dataset(move |ds| warp_read_window(ds, &req))
+        // A tile index returns black where it has no tile (see warp::read_window).
+        let black_is_gap = self.views.first().is_some_and(|v| v.res.is_some());
+        self.pool_for(&req.crs, &req.bbox)
+            .await?
+            .with_dataset(move |ds| warp_read_window(ds, &req, black_is_gap))
             .await
     }
 
     async fn sample(&self, coord: Coord, crs: Crs) -> Result<Vec<PixelValue>> {
         let native_crs = self.metadata.native_crs.clone();
-        self.pool
+        let point = Bbox { minx: coord.x, miny: coord.y, maxx: coord.x, maxy: coord.y };
+        self.pool_for(&crs, &point)
+            .await?
             .with_dataset(move |ds| sample::sample(ds, &native_crs, coord, crs))
             .await
     }
@@ -215,6 +328,7 @@ mod tests {
             pixel_type: PixelType::U8,
             data: Bytes::from(data),
             nodata: None,
+            alpha: None,
         };
         let crs = Crs::new("EPSG:4326");
         let bbox = Bbox::from([0.0, 0.0, 1.0, 1.0]);
@@ -247,6 +361,7 @@ mod tests {
         let cfg = SourceConfig {
             uri: tmp.path().to_string_lossy().into_owned(),
             credentials: None,
+            ..Default::default()
         };
         let src = GdalSource::open(&cfg).expect("open valid fixture");
         assert_eq!(src.metadata().band_count, 3);
@@ -254,6 +369,7 @@ mod tests {
         let bad = SourceConfig {
             uri: "/this/path/does/not/exist/kwms-nope.tif".into(),
             credentials: None,
+            ..Default::default()
         };
         let err = match GdalSource::open(&bad) {
             Ok(_) => panic!("open should fail on bad path"),
@@ -274,6 +390,7 @@ mod tests {
         let cfg = SourceConfig {
             uri: tmp.path().to_string_lossy().into_owned(),
             credentials: None,
+            ..Default::default()
         };
         let src = GdalSource::open(&cfg).expect("open");
         let md = src.metadata();
@@ -307,6 +424,7 @@ mod tests {
         let cfg = SourceConfig {
             uri: tmp.path().to_string_lossy().into_owned(),
             credentials: None,
+            ..Default::default()
         };
         let src = GdalSource::open(&cfg).expect("open");
         let req = WindowRequest {
@@ -332,6 +450,7 @@ mod tests {
         let cfg = SourceConfig {
             uri: tmp.path().to_string_lossy().into_owned(),
             credentials: None,
+            ..Default::default()
         };
         let src = GdalSource::open(&cfg).expect("open");
 
@@ -367,6 +486,7 @@ mod tests {
         let cfg = SourceConfig {
             uri: tmp.path().to_string_lossy().into_owned(),
             credentials: None,
+            ..Default::default()
         };
         let src = GdalSource::open(&cfg).expect("open");
         let centre = Coord {

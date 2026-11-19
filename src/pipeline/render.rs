@@ -8,12 +8,14 @@
 //!    (per `docs/src/per-layer-behavior.md`) *without* reading the source or
 //!    writing the cache — otherwise any client could fill the persistent
 //!    cache with empty tiles from the whole world.
-//! 3. Build the [`TileKey`] from `(layer, coord, format, grid.crs())` and
+//! 3. Build the [`TileKey`] from `(layer, grid dir, coord, format)` and
 //!    resolve the effective cache mode for this tile's level via
 //!    [`cache::policy::resolve_mode`].
 //! 4. `Passthrough` levels render fresh on every request (no cache I/O).
-//!    `Cache` levels go through `LayeredCache::get_or_compute`, which handles
-//!    hot+persistent lookup and single-flight coalescing of concurrent misses.
+//!    `Cache` levels go through every cache tier, `Memory` levels (and
+//!    `Cache` levels deeper than the layer's `cache.max_level`) through the
+//!    in-process tiers only — both via `LayeredCache::get_or_compute_in`,
+//!    which handles lookup, write-through and single-flight coalescing.
 //!
 //! The compute closure is the same for both modes: look up the first source,
 //! read a pixel window covering the tile's bbox at the grid's tile size,
@@ -31,12 +33,12 @@ use bytes::Bytes;
 
 use super::cpu::CpuPool;
 use super::read_budget;
-use crate::cache::{policy::resolve_mode, Computed, LayeredCache, TileKey};
+use crate::cache::{grid_dir, policy::resolve_mode, Computed, LayeredCache, Scope, TileKey};
 use crate::config::{CacheMode, LayerConfig};
 use crate::crs::{transform_bbox, Bbox, Crs};
 use crate::encode::{encode, EncodeOpts, GeoRef, OutputFormat};
 use crate::protocol::query::TileQuery;
-use crate::source::{PixelBuffer, Source, SourceRegistry, WindowRequest};
+use crate::source::{Area, PixelBuffer, Source, SourceRegistry, WindowRequest};
 use crate::tile::{TileCoord, TileGrid};
 
 /// Everything tile rendering needs, shared by all request handlers.
@@ -48,7 +50,23 @@ pub struct Renderer {
     /// construction (GDAL/PROJ never run for this on request threads) and
     /// read-only afterwards, so lookups need no lock.
     coverage: HashMap<(String, Crs), Bbox>,
+    /// Deepest durably cached level per `(layer, grid)` and why
+    /// (`cache.max_level`, see [`super::cache_levels`]). A pair not listed
+    /// has no limit.
+    cache_limits: HashMap<(String, String), (Option<u32>, String)>,
+    /// Each layer's `source_mask` (its own or the global one), loaded at
+    /// startup. A layer not listed has none.
+    masks: HashMap<String, Area>,
+    /// The areas that decide where a layer has data, per CRS: its source's
+    /// coverage and its mask, reprojected once (on the blocking pool).
+    coverage_parts: std::sync::Mutex<HashMap<(String, Crs), CoverageParts>>,
+    /// Encoder settings per layer (`output_formats`, global with the
+    /// layer's overrides). A layer not listed uses kwms's defaults.
+    encoding: HashMap<String, crate::config::OutputFormatsConfig>,
 }
+
+/// Coverage areas of one layer in one CRS.
+type CoverageParts = Arc<Vec<Area>>;
 
 impl Renderer {
     /// Build a renderer for every `(source uri, grid)` pair in `serves`:
@@ -79,7 +97,16 @@ impl Renderer {
             read_budget::check(&uri, meta, grid.as_ref(), &extent)?;
             coverage.insert((uri, crs), extent);
         }
-        Ok(Self { sources, cache, cpu, coverage })
+        Ok(Self {
+            sources,
+            cache,
+            cpu,
+            coverage,
+            cache_limits: HashMap::new(),
+            masks: HashMap::new(),
+            coverage_parts: std::sync::Mutex::new(HashMap::new()),
+            encoding: HashMap::new(),
+        })
     }
 
     /// The precomputed extent of source `uri` in `crs`.
@@ -91,6 +118,97 @@ impl Renderer {
 }
 
 impl Renderer {
+    /// Set each layer's encoder settings.
+    pub fn with_encoding(mut self, encoding: HashMap<String, crate::config::OutputFormatsConfig>) -> Self {
+        self.encoding = encoding;
+        self
+    }
+
+    /// The encoder options `layer` uses for `format`.
+    pub(crate) fn encode_opts(&self, layer: &LayerConfig, format: OutputFormat) -> EncodeOpts {
+        match self.encoding.get(&layer.name) {
+            Some(cfg) => EncodeOpts::from_config(format, cfg),
+            None => EncodeOpts::defaults_for(format),
+        }
+    }
+
+    /// Set each layer's `source_mask` area.
+    pub fn with_masks(mut self, masks: HashMap<String, Area>) -> Self {
+        self.masks = masks;
+        self
+    }
+
+    /// The areas a pixel of `layer` in `crs` must lie in to have data: the
+    /// source's coverage (tile footprints / extent) and the layer's mask.
+    /// Reprojected once per (layer, CRS), off the async workers.
+    pub(crate) async fn coverage_parts(&self, layer: &LayerConfig, crs: &Crs) -> Result<Arc<Vec<Area>>> {
+        let key = (layer.name.clone(), crs.clone());
+        if let Some(parts) = self.coverage_parts.lock().map_err(|_| anyhow!("coverage cache poisoned"))?.get(&key) {
+            return Ok(parts.clone());
+        }
+        let source_area = layer
+            .sources
+            .first()
+            .and_then(|s| self.sources.get(&s.uri))
+            .and_then(|s| s.coverage_area());
+        let areas: Vec<Area> = source_area.into_iter().chain(self.masks.get(&layer.name).cloned()).collect();
+        let target = crs.clone();
+        let parts = tokio::task::spawn_blocking(move || -> Result<Vec<Area>> {
+            areas.iter().map(|a| crate::source::gdal::mask::reproject(a, &target)).collect()
+        })
+        .await
+        .context("reprojecting coverage areas")??;
+        let parts = Arc::new(parts);
+        self.coverage_parts
+            .lock()
+            .map_err(|_| anyhow!("coverage cache poisoned"))?
+            .insert(key, parts.clone());
+        Ok(parts)
+    }
+
+    /// Set the durable-cache depth per `(layer, grid)` (see
+    /// [`super::cache_levels::layer_max_level`]).
+    pub fn with_cache_limits(mut self, limits: HashMap<(String, String), (Option<u32>, String)>) -> Self {
+        self.cache_limits = limits;
+        self
+    }
+
+    /// The deepest durably cached level of `layer` in `grid` and why;
+    /// `None` when unlimited.
+    pub fn cache_limit(&self, layer: &str, grid: &str) -> Option<&(Option<u32>, String)> {
+        self.cache_limits.get(&(layer.to_string(), grid.to_string()))
+    }
+
+    /// Whether a request for `bbox` at `size` in `grid` is finer than the
+    /// deepest durably cached level of `layer` — beyond the cached pyramid.
+    /// Always `false` for a pair without a limit.
+    pub fn finer_than_cached(&self, layer: &str, grid: &dyn TileGrid, bbox: &Bbox, size: (u32, u32)) -> bool {
+        let Some((max, _)) = self.cache_limit(layer, grid.name()) else { return false };
+        match max {
+            None => true,
+            // A hair of tolerance: a request exactly at that level's
+            // resolution is served from its tiles.
+            Some(max) => crate::tile::pyramid::requested_resolution(bbox, size) < grid.resolution(*max) * (1.0 - 1e-9),
+        }
+    }
+
+    /// Whether a direct read of `bbox` (in `crs`) at `size` from `layer`'s
+    /// source stays within [`read_budget::MAX_DIRECT_READ_PIXELS`]. Request
+    /// sizes are client-chosen, so a source with sparse overviews must not
+    /// turn one GetMap into a huge read; such requests use tiles instead.
+    pub fn direct_read_fits(&self, layer: &LayerConfig, crs: &Crs, bbox: &Bbox, size: (u32, u32)) -> Result<bool> {
+        let Some(source) = layer.sources.first().and_then(|s| self.sources.get(&s.uri)) else { return Ok(false) };
+        Ok(read_budget::window_read_pixels(source.metadata(), crs, bbox, size)? <= read_budget::MAX_DIRECT_READ_PIXELS)
+    }
+
+    /// Whether tiles of `level` go to the durable tiers.
+    fn stores_durably(&self, layer: &str, grid: &str, level: u32) -> bool {
+        match self.cache_limit(layer, grid) {
+            None => true,
+            Some((max, _)) => max.is_some_and(|max| level <= max),
+        }
+    }
+
     /// Nodata for a layer: its `nodata:` override, else its first source's.
     pub(crate) fn layer_nodata(&self, layer: &LayerConfig) -> Option<f64> {
         layer.nodata.or_else(|| {
@@ -167,18 +285,126 @@ pub(crate) async fn render_grid_tile(
         layer: layer.name.clone(),
         coord,
         format,
-        crs: grid.crs().clone(),
+        grid_dir: grid_dir(grid.name(), grid.crs()),
     };
 
-    match resolve_mode(&layer.cache, coord.z) {
-        CacheMode::Passthrough => Ok(compute_tile(r, source, layer, grid, bbox, format).await?.bytes),
-        CacheMode::Cache => {
-            r.cache
-                .get_or_compute(key, layer.cache.ttl, || {
-                    compute_tile(r, source.clone(), layer, grid, bbox, format)
-                })
-                .await
-        }
+    // Below `cache.max_level` tiles render about as fast from the source
+    // as they'd load from storage: keep them in memory only.
+    let mode = match resolve_mode(&layer.cache, coord.z) {
+        CacheMode::Cache if !r.stores_durably(&layer.name, grid.name(), coord.z) => CacheMode::Memory,
+        mode => mode,
+    };
+    let scope = match mode {
+        CacheMode::Passthrough => return Ok(compute_tile(r, source, layer, grid, bbox, format).await?.bytes),
+        CacheMode::Cache => Scope::All,
+        CacheMode::Memory => Scope::InProcess,
+    };
+    r.cache
+        .get_or_compute_in(scope, key, layer.cache.ttl, || compute_tile(r, source.clone(), layer, grid, bbox, format))
+        .await
+}
+
+/// Read a whole image straight from the source: `bbox` in `crs` (the
+/// CRS of `grid`) at exactly `size`, in one GDAL warp, encoded on the
+/// render pool. Not cached. WMS uses it for requests finer than the
+/// layer's durably cached levels ([`Renderer::finer_than_cached`]), where
+/// composing from tiles would mean many uncached tile reads plus a second
+/// resampling. A bbox that misses the source gets a fill image without
+/// touching GDAL.
+pub(crate) async fn render_window(
+    r: &Renderer,
+    layer: &LayerConfig,
+    grid: &Arc<dyn TileGrid>,
+    crs: &Crs,
+    bbox: Bbox,
+    size: (u32, u32),
+    format: OutputFormat,
+) -> Result<Bytes> {
+    let uri = &layer.sources.first().ok_or_else(|| anyhow!("layer `{}` has no sources", layer.name))?.uri;
+    let source = r
+        .sources
+        .get(uri)
+        .ok_or_else(|| anyhow!("source `{uri}` of layer `{}` is not open", layer.name))?;
+    if !intersects(&bbox, r.coverage(uri, grid.crs())?) {
+        return fill_image(r, source.as_ref(), layer, crs, bbox, size, format).await;
+    }
+    let started = std::time::Instant::now();
+    let req = WindowRequest {
+        bbox,
+        crs: crs.clone(),
+        width: size.0,
+        height: size.1,
+        resampling: layer_resampling(layer)?,
+        nodata: layer.nodata,
+    };
+    let parts = r.coverage_parts(layer, crs).await?;
+    let buffer = source.read_window(req).await?;
+    let make = move || crate::source::gdal::mask::apply(buffer, &parts, &bbox);
+    let opts = r.encode_opts(layer, format);
+    let encoded = encode_on_pool(r, make, crs.clone(), bbox, format, opts).await?;
+    super::stage::record("wms_direct", started);
+    Ok(encoded.bytes)
+}
+
+/// What [`seed_grid_tile`] did with one tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// Already in the persistent cache and within its TTL; left alone.
+    Fresh,
+    /// Rendered and written to the persistent cache.
+    Stored,
+    /// Rendered, but all nodata: not cached (see `compute_tile`).
+    Empty,
+    /// Outside the source's coverage: nothing to render or cache.
+    Outside,
+}
+
+/// Fill the persistent cache with one tile for `kwms cache update`: skip it
+/// if a fresh copy is cached (unless `force`), otherwise render it from the
+/// source and write it. Same key, same rendering and same "no empty tiles"
+/// rule as serving, so a seeded tile is exactly what a request would have
+/// cached, written to every durable tier. Cache errors are returned, not
+/// degraded.
+pub async fn seed_grid_tile(
+    r: &Renderer,
+    layer: &LayerConfig,
+    grid: &Arc<dyn TileGrid>,
+    coord: TileCoord,
+    format: OutputFormat,
+    force: bool,
+) -> Result<SeedOutcome> {
+    grid.check_coord(coord)
+        .map_err(|e| anyhow!("tile outside grid `{}`: {e}", grid.name()))?;
+    let uri = &layer.sources.first().ok_or_else(|| anyhow!("layer `{}` has no sources", layer.name))?.uri;
+    let source = r
+        .sources
+        .get(uri)
+        .ok_or_else(|| anyhow!("source `{uri}` of layer `{}` is not open", layer.name))?;
+    let bbox = grid.tile_bbox(coord);
+    if !intersects(&bbox, r.coverage(uri, grid.crs())?) {
+        return Ok(SeedOutcome::Outside);
+    }
+    let key = TileKey {
+        layer: layer.name.clone(),
+        grid_dir: grid_dir(grid.name(), grid.crs()),
+        coord,
+        format,
+    };
+    if !force && r.cache.durable_fresh(&key, layer.cache.ttl).await? {
+        return Ok(SeedOutcome::Fresh);
+    }
+    let Computed { bytes, store } = compute_tile(r, source, layer, grid, bbox, format).await?;
+    if !store {
+        return Ok(SeedOutcome::Empty);
+    }
+    r.cache.store_durable(&key, bytes).await?;
+    Ok(SeedOutcome::Stored)
+}
+
+/// The source extent of `uri` in `crs`, as computed at startup.
+impl Renderer {
+    pub fn source_coverage(&self, uri: &str, crs: &Crs) -> Result<Bbox> {
+        self.coverage(uri, crs).copied()
     }
 }
 
@@ -206,13 +432,17 @@ async fn compute_tile(
         resampling: layer_resampling(layer)?,
         nodata: layer.nodata,
     };
+    let parts = r.coverage_parts(layer, grid.crs()).await?;
     let buffer = source.read_window(req).await?;
-    let encoded = encode_on_pool(r, move || Ok(buffer), grid.crs().clone(), bbox, format).await?;
+    let make = move || crate::source::gdal::mask::apply(buffer, &parts, &bbox);
+    let opts = r.encode_opts(layer, format);
+    let encoded = encode_on_pool(r, make, grid.crs().clone(), bbox, format, opts).await?;
     Ok(if encoded.all_fill { Computed::transient(encoded.bytes) } else { Computed::store(encoded.bytes) })
 }
 
-/// A `size` image of nodata (or 0) in the layer's band layout — the
-/// response for a WMS request whose BBOX misses the grid entirely.
+/// A `size` image with no data in the layer's band layout (transparent in
+/// PNG, white in JPEG) — the response for a WMS request whose BBOX misses
+/// the grid entirely.
 pub(crate) async fn blank_image(
     r: &Renderer,
     layer: &LayerConfig,
@@ -233,8 +463,9 @@ pub(crate) async fn blank_image(
     fill_image(r, source.as_ref(), layer, crs, bbox, size, format).await
 }
 
-/// An image entirely outside the source: NoData (or 0) in the source's band
-/// layout. Not cached — it costs no source I/O to produce again.
+/// An image entirely outside the source: no data in the source's band
+/// layout (transparent in PNG, white in JPEG). Not cached — it costs no
+/// source I/O to produce again.
 ///
 /// The buffer (up to `max_request_pixels` × bands × sample size) is created
 /// inside the render-pool job, so it only exists while the request holds a
@@ -249,10 +480,10 @@ async fn fill_image(
     format: OutputFormat,
 ) -> Result<Bytes> {
     let meta = source.metadata();
-    let nodata = layer.nodata.or(meta.nodata);
     let (bands, pixel_type) = (meta.band_count, meta.pixel_type);
-    let make = move || PixelBuffer::filled(w, h, bands, pixel_type, nodata.unwrap_or(0.0), nodata);
-    Ok(encode_on_pool(r, make, crs.clone(), bbox, format).await?.bytes)
+    let make = move || crate::source::gdal::mask::empty_image(w, h, bands, pixel_type);
+    let opts = r.encode_opts(layer, format);
+    Ok(encode_on_pool(r, make, crs.clone(), bbox, format, opts).await?.bytes)
 }
 
 /// An encoded image, and whether every pixel was the fill value.
@@ -263,12 +494,19 @@ struct Encoded {
 
 /// Produce a buffer with `make` and encode it, both on the bounded render
 /// pool.
-async fn encode_on_pool<F>(r: &Renderer, make: F, crs: Crs, bbox: Bbox, format: OutputFormat) -> Result<Encoded>
+async fn encode_on_pool<F>(
+    r: &Renderer,
+    make: F,
+    crs: Crs,
+    bbox: Bbox,
+    format: OutputFormat,
+    opts: EncodeOpts,
+) -> Result<Encoded>
 where
     F: FnOnce() -> Result<PixelBuffer> + Send + 'static,
 {
     r.cpu
-        .run(move || {
+        .run("encode", move || {
             let buffer = make()?;
             // GeoTIFF gets georeferencing; raster web formats do not.
             let georef = match format {
@@ -279,7 +517,7 @@ where
                 }),
                 _ => None,
             };
-            let bytes = encode(&buffer, georef.as_ref(), format, &EncodeOpts::defaults_for(format))?;
+            let bytes = encode(&buffer, georef.as_ref(), format, &opts)?;
             Ok(Encoded { bytes, all_fill: buffer.is_all_fill() })
         })
         .await
@@ -299,12 +537,10 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
-    use opendal::{services, Operator};
     use tempfile::NamedTempFile;
 
-    use crate::cache::hot::HotTier;
+    use crate::cache::memory::MemoryTier;
     use crate::pipeline::cpu::CpuPool;
-    use crate::cache::persistent::PersistentTier;
     use crate::config::model::{
         LayerCacheConfig, MaxResolution, MaxResolutionMode, SourceConfig,
     };
@@ -341,6 +577,7 @@ mod tests {
             pixel_type: PixelType::U8,
             data: Bytes::from(data),
             nodata: None,
+            alpha: None,
         };
         let georef = GeoRef {
             crs: Crs::new("EPSG:4326"),
@@ -366,10 +603,7 @@ mod tests {
     }
 
     fn fresh_cache() -> LayeredCache {
-        let op = Operator::new(services::Memory::default())
-            .expect("memory builder")
-            .finish();
-        LayeredCache::from_parts(HotTier::new(8 * 1024 * 1024), PersistentTier::new(op))
+        LayeredCache::from_tiers(vec![std::sync::Arc::new(MemoryTier::new(8 * 1024 * 1024))])
     }
 
     fn test_renderer(registry: SourceRegistry, uri: &str) -> Renderer {
@@ -388,6 +622,7 @@ mod tests {
             GdalSource::open(&SourceConfig {
                 uri: uri.into(),
                 credentials: None,
+                ..Default::default()
             })
             .expect("open fixture as GdalSource"),
         );
@@ -401,12 +636,15 @@ mod tests {
             grids: vec!["webmercator".into()],
             max_resolution: MaxResolution::Mode(MaxResolutionMode::Native),
             bbox: None,
+            bbox_crs: None,
             sources: vec![SourceConfig {
                 uri: source_uri.into(),
                 credentials: None,
+                ..Default::default()
             }],
             cache: LayerCacheConfig {
                 mode: CacheMode::Cache,
+                max_level: crate::config::model::CacheMaxLevel::default(),
                 ttl: Duration::from_secs(60),
                 level_rules: Vec::new(),
             },
@@ -420,6 +658,8 @@ mod tests {
             queryable: true,
             opaque: false,
             nodata: None,
+            source_mask: None,
+            output_formats: Default::default(),
         }
     }
 
@@ -433,6 +673,7 @@ mod tests {
             GdalSource::open(&SourceConfig {
                 uri: uri.clone(),
                 credentials: None,
+                ..Default::default()
             })
             .expect("open fixture as GdalSource"),
         );
@@ -470,6 +711,7 @@ mod tests {
             GdalSource::open(&SourceConfig {
                 uri: uri.clone(),
                 credentials: None,
+                ..Default::default()
             })
             .expect("open fixture"),
         );
@@ -492,7 +734,7 @@ mod tests {
             layer: layer.name.clone(),
             coord,
             format: OutputFormat::Png,
-            crs: grid.crs().clone(),
+            grid_dir: grid_dir(grid.name(), grid.crs()),
         };
         let got = r
             .cache
@@ -549,7 +791,7 @@ mod tests {
             layer: layer.name.clone(),
             coord: outside,
             format: OutputFormat::Png,
-            crs: grid.crs().clone(),
+            grid_dir: grid_dir(grid.name(), grid.crs()),
         };
         let cached = r.cache.get(&key, Duration::from_secs(60)).await.unwrap();
         assert!(cached.is_none(), "out-of-coverage tiles must not be cached");
@@ -585,7 +827,7 @@ mod tests {
         let r = test_renderer(open_registry(&uri), &uri);
         let layer = build_layer("east", &uri);
         let grid: Arc<dyn TileGrid> = Arc::new(WebMercator::new());
-        let key = |x| TileKey { layer: "east".into(), coord: TileCoord::new(1, x, 0), format: OutputFormat::Png, crs: grid.crs().clone() };
+        let key = |x| TileKey { layer: "east".into(), coord: TileCoord::new(1, x, 0), format: OutputFormat::Png, grid_dir: grid_dir(grid.name(), grid.crs()) };
         for x in [0, 1] {
             render_grid_tile(&r, &layer, &grid, TileCoord::new(1, x, 0), OutputFormat::Png).await.unwrap();
         }

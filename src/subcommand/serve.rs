@@ -31,6 +31,8 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
     tracing::info!(bind = %bind, metrics_bind = ?metrics_bind, "starting kwms server");
 
     let state = Arc::new(AppState::new(config, secrets).context("building application state")?);
+    state.renderer.cache.check().await.context("cache is not usable")?;
+    tracing::info!(tiers = ?state.renderer.cache.describe(), "cache ready");
     let app = crate::server::router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)

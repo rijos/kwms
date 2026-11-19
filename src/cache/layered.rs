@@ -1,4 +1,5 @@
-//! Two-tier cache (hot + persistent) with single-flight coalescing.
+//! The cache stack: configurable tiers (see [`CacheTier`]) with
+//! single-flight coalescing.
 //!
 //! See `docs/src/caching.md` (Stampede protection).
 //!
@@ -44,15 +45,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use bytesize::ByteSize;
 use tokio::sync::Notify;
 
-use super::hot::HotTier;
-use super::persistent::{build_operator, PersistentTier};
-use super::TileKey;
-use crate::config::model::{Credentials, GlobalCacheConfig};
+use super::memory::MemoryTier;
+use super::store::StoreTier;
+use super::{CacheTier, Entry, TileKey};
+use crate::config::model::{Credentials, GlobalCacheConfig, TierConfig};
 
 /// What a `get_or_compute` computation produced.
 pub struct Computed {
@@ -81,9 +82,25 @@ struct Inflight {
 
 type InflightMap = HashMap<TileKey, Arc<Inflight>>;
 
+/// Which tiers a lookup or store uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every tier.
+    All,
+    /// Only tiers that are not durable (in-process memory).
+    InProcess,
+}
+
+impl Scope {
+    fn includes(self, tier: &dyn CacheTier) -> bool {
+        self == Scope::All || !tier.durable()
+    }
+}
+
+/// The cache stack: tiers checked top to bottom (`cache.tiers` order), plus
+/// single-flight coalescing of concurrent misses.
 pub struct LayeredCache {
-    hot: HotTier,
-    persistent: PersistentTier,
+    tiers: Vec<Arc<dyn CacheTier>>,
     inflight: Arc<Mutex<InflightMap>>,
 }
 
@@ -115,57 +132,162 @@ impl Drop for InflightGuard {
     }
 }
 
+/// Log and count a tier failure (the request carries on with the other
+/// tiers, or renders from the source).
+fn tier_error(tier: &dyn CacheTier, op: &'static str, key: &TileKey, e: &anyhow::Error) {
+    metrics::counter!("kwms_cache_errors_total", "tier" => tier.name().to_string(), "op" => op).increment(1);
+    tracing::warn!(
+        tier = tier.name(),
+        op,
+        layer = %key.layer,
+        path = %key.as_path(),
+        error = %format_args!("{e:#}"),
+        "cache tier error; serving without it"
+    );
+}
+
+/// Record one tier operation's duration (`kwms_cache_seconds{tier, op}`).
+fn tier_time(tier: &dyn CacheTier, op: &'static str, started: std::time::Instant) {
+    metrics::histogram!("kwms_cache_seconds", "tier" => tier.name().to_string(), "op" => op)
+        .record(started.elapsed().as_secs_f64());
+}
+
 impl LayeredCache {
-    pub fn new(
-        cfg: &GlobalCacheConfig,
-        credentials: &HashMap<String, Credentials>,
-    ) -> Result<Self> {
-        let max_bytes: u64 = cfg
-            .hot
-            .max_bytes
-            .parse::<ByteSize>()
-            .map_err(|e| anyhow!("invalid cache.hot.max_bytes `{}`: {e}", cfg.hot.max_bytes))?
-            .as_u64();
-        let hot = HotTier::new(max_bytes);
-        let op = build_operator(&cfg.persistent, credentials)?;
-        let persistent = PersistentTier::new(op);
-        Ok(Self {
-            hot,
-            persistent,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
-        })
-    }
-
-    /// Construct from already-built tiers — useful for tests and callers
-    /// that have a custom `Operator` (e.g. wrapped in layers).
-    pub fn from_parts(hot: HotTier, persistent: PersistentTier) -> Self {
-        Self {
-            hot,
-            persistent,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+    /// Build the stack described by `cfg.tiers`, top to bottom.
+    pub fn new(cfg: &GlobalCacheConfig, credentials: &HashMap<String, Credentials>) -> Result<Self> {
+        let mut tiers: Vec<Arc<dyn CacheTier>> = Vec::with_capacity(cfg.tiers.len());
+        for tier in &cfg.tiers {
+            let built: Arc<dyn CacheTier> = match tier {
+                TierConfig::Memory(m) => {
+                    let max = m
+                        .max_bytes
+                        .parse::<ByteSize>()
+                        .map_err(|e| anyhow!("invalid max_bytes `{}`: {e}", m.max_bytes))?
+                        .as_u64();
+                    Arc::new(MemoryTier::new(max))
+                }
+                TierConfig::Store(st) => Arc::new(StoreTier::from_config(st, credentials)?),
+            };
+            tiers.push(built);
         }
+        Ok(Self::from_tiers(tiers))
     }
 
-    /// Look up `key`. Checks the hot tier first, then the persistent tier
-    /// (with TTL). On a persistent-tier hit, the value is promoted to the
-    /// hot tier.
+    /// Assemble from already-built tiers, top to bottom — for tests and
+    /// callers with custom tiers.
+    pub fn from_tiers(tiers: Vec<Arc<dyn CacheTier>>) -> Self {
+        Self { tiers, inflight: Arc::new(Mutex::new(HashMap::new())) }
+    }
+
+    /// `name (durable|in-process)` per tier, top to bottom.
+    pub fn describe(&self) -> Vec<String> {
+        self.tiers
+            .iter()
+            .map(|t| format!("{} ({})", t.name(), if t.durable() { "durable" } else { "in-process" }))
+            .collect()
+    }
+
+    /// Whether any tier survives a restart (what `kwms cache update` fills).
+    pub fn has_durable_tier(&self) -> bool {
+        self.tiers.iter().any(|t| t.durable())
+    }
+
+    /// Run every tier's startup check (a store writes, reads back and
+    /// deletes a probe), so a wrong container, key or a read-only token
+    /// fails the start instead of silently never caching.
+    pub async fn check(&self) -> Result<()> {
+        for (i, tier) in self.tiers.iter().enumerate() {
+            tier.check().await.with_context(|| format!("cache tier {i} ({})", tier.name()))?;
+        }
+        Ok(())
+    }
+
+    /// Look up `key`, top tier first. A hit in a lower tier is copied into
+    /// the tiers above it, keeping its render time (so the TTL still counts
+    /// from the render).
+    ///
+    /// A tier error (backend down, throttled, …) is logged, counted in
+    /// `kwms_cache_errors_total{tier,op="read"}` and treated as a miss in
+    /// that tier: the lookup continues below, and in the end the tile is
+    /// rendered from the source rather than the request failing.
     pub async fn get(&self, key: &TileKey, ttl: Duration) -> Result<Option<Bytes>> {
-        if let Some(b) = self.hot.get(key).await {
-            return Ok(Some(b));
-        }
-        if let Some(b) = self.persistent.get(key, ttl).await? {
-            // Promote into the hot tier.
-            self.hot.put(key.clone(), b.clone()).await;
-            return Ok(Some(b));
+        self.get_in(Scope::All, key, ttl).await
+    }
+
+    /// [`Self::get`] over the tiers in `scope` only.
+    pub async fn get_in(&self, scope: Scope, key: &TileKey, ttl: Duration) -> Result<Option<Bytes>> {
+        for (i, tier) in self.tiers.iter().enumerate() {
+            if !scope.includes(tier.as_ref()) {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let got = tier.get(key, ttl).await;
+            tier_time(tier.as_ref(), "read", started);
+            match got {
+                Ok(Some(entry)) => {
+                    metrics::counter!("kwms_cache_hits_total", "tier" => tier.name().to_string()).increment(1);
+                    for upper in self.tiers[..i].iter().filter(|t| scope.includes(t.as_ref())) {
+                        if let Err(e) = upper.put(key, entry.clone()).await {
+                            tier_error(upper.as_ref(), "write", key, &e);
+                        }
+                    }
+                    return Ok(Some(entry.bytes));
+                }
+                Ok(None) => {}
+                Err(e) => tier_error(tier.as_ref(), "read", key, &e),
+            }
         }
         Ok(None)
     }
 
-    /// Store `bytes` in both tiers. Errors from the persistent tier are
-    /// surfaced; the hot tier insertion is unconditional.
-    pub async fn put(&self, key: &TileKey, bytes: Bytes, _ttl: Duration) -> Result<()> {
-        self.hot.put(key.clone(), bytes.clone()).await;
-        self.persistent.put(key, bytes).await?;
+    /// Store a freshly rendered tile in every tier. A tier error is logged
+    /// and counted (`op="write"`) but does not fail the request.
+    pub async fn put(&self, key: &TileKey, bytes: Bytes, ttl: Duration) -> Result<()> {
+        self.put_in(Scope::All, key, bytes, ttl).await
+    }
+
+    /// [`Self::put`] into the tiers in `scope` only.
+    pub async fn put_in(&self, scope: Scope, key: &TileKey, bytes: Bytes, _ttl: Duration) -> Result<()> {
+        let entry = Entry::now(bytes);
+        for tier in self.tiers.iter().filter(|t| scope.includes(t.as_ref())) {
+            let started = std::time::Instant::now();
+            let put = tier.put(key, entry.clone()).await;
+            tier_time(tier.as_ref(), "write", started);
+            if let Err(e) = put {
+                tier_error(tier.as_ref(), "write", key, &e);
+            }
+        }
+        Ok(())
+    }
+
+    /// For `kwms cache update`: whether every durable tier holds a fresh
+    /// copy of `key`. A copy found in some durable tiers is written to the
+    /// durable tiers missing it (keeping its render time), so the tile need
+    /// not be rendered again. Errors are returned, not degraded: an update
+    /// must not report tiles as cached when a backend failed.
+    pub async fn durable_fresh(&self, key: &TileKey, ttl: Duration) -> Result<bool> {
+        let mut found: Option<Entry> = None;
+        let mut missing = Vec::new();
+        for tier in self.tiers.iter().filter(|t| t.durable()) {
+            match tier.get(key, ttl).await.with_context(|| format!("cache tier {}: read", tier.name()))? {
+                Some(entry) => found = found.or(Some(entry)),
+                None => missing.push(tier),
+            }
+        }
+        let Some(entry) = found else { return Ok(false) };
+        for tier in missing {
+            tier.put(key, entry.clone()).await.with_context(|| format!("cache tier {}: write", tier.name()))?;
+        }
+        Ok(true)
+    }
+
+    /// For `kwms cache update`: write a freshly rendered tile to every
+    /// durable tier, errors returned (see [`Self::durable_fresh`]).
+    pub async fn store_durable(&self, key: &TileKey, bytes: Bytes) -> Result<()> {
+        let entry = Entry::now(bytes);
+        for tier in self.tiers.iter().filter(|t| t.durable()) {
+            tier.put(key, entry.clone()).await.with_context(|| format!("cache tier {}: write", tier.name()))?;
+        }
         Ok(())
     }
 
@@ -176,10 +298,19 @@ impl LayeredCache {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Computed>>,
     {
+        self.get_or_compute_in(Scope::All, key, ttl, compute).await
+    }
+
+    /// [`Self::get_or_compute`] over the tiers in `scope` only.
+    pub async fn get_or_compute_in<F, Fut>(&self, scope: Scope, key: TileKey, ttl: Duration, compute: F) -> Result<Bytes>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Computed>>,
+    {
         let mut compute = Some(compute);
         loop {
             // 1. Fast path.
-            if let Some(b) = self.get(&key, ttl).await? {
+            if let Some(b) = self.get_in(scope, &key, ttl).await? {
                 return Ok(b);
             }
 
@@ -211,13 +342,15 @@ impl LayeredCache {
 
             // 3. Leader: double-check (a peer may have stored it meanwhile),
             //    then compute and store. `guard` unregisters on every exit.
-            if let Some(b) = self.get(&key, ttl).await? {
+            if let Some(b) = self.get_in(scope, &key, ttl).await? {
                 return Ok(b);
             }
+            // A real miss: counted once, by the leader that renders it.
+            metrics::counter!("kwms_cache_misses_total").increment(1);
             let compute = compute.take().expect("compute is used at most once: a leader returns");
             let Computed { bytes, store } = compute().await?;
             if store {
-                self.put(&key, bytes.clone(), ttl).await?;
+                self.put_in(scope, &key, bytes.clone(), ttl).await?;
             }
             // Set at most once: this guard's entry has a single leader.
             let _ = guard.entry.result.set(bytes.clone());
@@ -229,9 +362,10 @@ impl LayeredCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crs::Crs;
     use crate::encode::OutputFormat;
     use crate::tile::TileCoord;
+    use crate::cache::memory::MemoryTier;
+    use crate::cache::store::StoreTier;
     use opendal::{services, Operator};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -240,19 +374,20 @@ mod tests {
             layer: tag.into(),
             coord: TileCoord::new(0, 0, 0),
             format: OutputFormat::Png,
-            crs: Crs::new("EPSG:3857"),
+            grid_dir: "3857".into(),
         }
     }
 
     fn fresh_cache() -> LayeredCache {
-        let op = Operator::new(services::Memory::default())
-            .expect("memory builder")
-            .finish();
-        LayeredCache::from_parts(HotTier::new(1024 * 1024), PersistentTier::new(op))
+        LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1024 * 1024))])
+    }
+
+    fn fs_tier(dir: &std::path::Path) -> Arc<StoreTier> {
+        Arc::new(StoreTier::new(Operator::new(services::Fs::default().root(&dir.to_string_lossy())).unwrap().finish()))
     }
 
     #[tokio::test]
-    async fn put_then_get_hits_hot_tier() {
+    async fn put_then_get_hits_memory_tier() {
         let cache = fresh_cache();
         let k = key("a");
         let v = Bytes::from_static(b"v");
@@ -268,32 +403,67 @@ mod tests {
         assert_eq!(got, v);
     }
 
+    /// memory → disk → disk: a hit in the bottom tier is copied into both
+    /// tiers above it with its original render time; a new tile is written
+    /// to all three.
     #[tokio::test]
-    async fn get_falls_through_to_persistent_then_promotes() {
-        // Construct a cache with a fresh hot tier but a pre-populated
-        // persistent tier — exercises the promotion path.
-        let op = Operator::new(services::Memory::default())
-            .expect("memory builder")
-            .finish();
-        let persistent = PersistentTier::new(op);
-        let k = key("b");
-        let v = Bytes::from_static(b"v");
-        persistent.put(&k, v.clone()).await.expect("seed");
-        let cache = LayeredCache::from_parts(HotTier::new(1024 * 1024), persistent);
+    async fn three_tier_stack_promotes_and_writes_through() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mem, mid, bottom) = (Arc::new(MemoryTier::new(1 << 20)), fs_tier(d1.path()), fs_tier(d2.path()));
+        let cache = LayeredCache::from_tiers(vec![mem.clone(), mid.clone(), bottom.clone()]);
+        let ttl = Duration::from_secs(60);
 
+        let k = key("deep");
+        let old = Entry { bytes: Bytes::from_static(b"v"), written_at: Entry::now(Bytes::new()).written_at - 30 };
+        bottom.put(&k, old.clone()).await.unwrap();
+        assert_eq!(cache.get(&k, ttl).await.unwrap(), Some(Bytes::from_static(b"v")));
+        assert_eq!(mem.get(&k, ttl).await.unwrap(), Some(old.clone()), "promoted with its render time");
+        assert_eq!(mid.get(&k, ttl).await.unwrap(), Some(old.clone()));
+        // The copies expire when the original would.
+        assert!(mid.get(&k, Duration::from_secs(20)).await.unwrap().is_none());
+
+        let n = key("new");
+        cache.put(&n, Bytes::from_static(b"n"), ttl).await.unwrap();
+        for tier in [mem.clone() as Arc<dyn CacheTier>, mid.clone(), bottom.clone()] {
+            assert!(tier.get(&n, ttl).await.unwrap().is_some(), "{} missing the tile", tier.name());
+        }
+        assert_eq!(cache.describe(), ["memory (in-process)", "fs (durable)", "fs (durable)"]);
+    }
+
+    /// Deeper than `cache.max_level`: tiles live in memory only — never
+    /// read from or written to a durable tier.
+    #[tokio::test]
+    async fn in_process_scope_skips_durable_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = fs_tier(dir.path());
+        let cache = LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1 << 20)), disk.clone()]);
+        let ttl = Duration::from_secs(60);
         let got = cache
-            .get(&k, Duration::from_secs(60))
+            .get_or_compute_in(Scope::InProcess, key("deep"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"d"))) })
             .await
-            .expect("get ok")
-            .expect("present");
-        assert_eq!(got, v);
-        // Second get should also succeed (now hot).
-        let got2 = cache
-            .get(&k, Duration::from_secs(60))
-            .await
-            .expect("get ok")
-            .expect("present");
-        assert_eq!(got2, v);
+            .unwrap();
+        assert_eq!(got, Bytes::from_static(b"d"));
+        assert!(disk.get(&key("deep"), ttl).await.unwrap().is_none(), "written to the durable tier");
+        assert_eq!(cache.get_in(Scope::InProcess, &key("deep"), ttl).await.unwrap(), Some(Bytes::from_static(b"d")));
+        // A tile only on disk is invisible to an in-process lookup.
+        disk.put(&key("disk"), Entry::now(Bytes::from_static(b"x"))).await.unwrap();
+        assert!(cache.get_in(Scope::InProcess, &key("disk"), ttl).await.unwrap().is_none());
+    }
+
+    /// `cache update` helpers: a copy in one durable tier fills the other;
+    /// with none, the tile is stale.
+    #[tokio::test]
+    async fn durable_fresh_fills_missing_durable_tiers() {
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mid, bottom) = (fs_tier(d1.path()), fs_tier(d2.path()));
+        let cache = LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1 << 20)), mid.clone(), bottom.clone()]);
+        let ttl = Duration::from_secs(60);
+        assert!(!cache.durable_fresh(&key("x"), ttl).await.unwrap());
+        bottom.put(&key("x"), Entry::now(Bytes::from_static(b"x"))).await.unwrap();
+        assert!(cache.durable_fresh(&key("x"), ttl).await.unwrap());
+        assert!(mid.get(&key("x"), ttl).await.unwrap().is_some());
+        cache.store_durable(&key("y"), Bytes::from_static(b"y")).await.unwrap();
+        assert!(mid.get(&key("y"), ttl).await.unwrap().is_some() && bottom.get(&key("y"), ttl).await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -335,8 +505,7 @@ mod tests {
     /// the same tile would otherwise wait forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_leader_does_not_strand_followers() {
-        let op = Operator::new(services::Memory::default()).unwrap().finish();
-        let cache = Arc::new(LayeredCache::from_parts(HotTier::new(1024 * 1024), PersistentTier::new(op)));
+        let cache = Arc::new(fresh_cache());
         let ttl = Duration::from_secs(60);
 
         let (c, k) = (cache.clone(), key("cancel"));
@@ -418,6 +587,33 @@ mod tests {
         let out = tokio::time::timeout(Duration::from_secs(2), follower).await.expect("follower hung");
         assert_eq!(out.unwrap(), Bytes::from_static(b"ok"));
         assert!(leader.await.unwrap().is_err());
+    }
+
+    /// A failing store tier (outage, throttling, lost permissions)
+    /// must not fail requests: the tile is rendered and served anyway.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failing_store_tier_degrades_to_rendering() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let disk = fs_tier(dir.path());
+        disk.check().await.expect("writable at start");
+        let cache = LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1024 * 1024)), disk]);
+
+        // The backend breaks while serving.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(dir.path().join("probe"), b"x").is_ok() {
+            return; // running as root: permissions aren't enforced, nothing to test
+        }
+        let ttl = Duration::from_secs(60);
+        let got = cache
+            .get_or_compute(key("broken"), ttl, || async { Ok(Computed::store(Bytes::from_static(b"tile"))) })
+            .await
+            .expect("request must not fail because a cache tier does");
+        assert_eq!(got, Bytes::from_static(b"tile"));
+        // Still served from the memory tier afterwards.
+        assert_eq!(cache.get(&key("broken"), ttl).await.unwrap(), Some(Bytes::from_static(b"tile")));
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

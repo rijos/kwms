@@ -244,23 +244,23 @@ fn write_layer<W: std::io::Write>(
 
     // Geographic bbox — element name differs per version, but the
     // numbers (always WGS84) are the same.
-    let wgs84_bbox = layer.bbox.unwrap_or(GLOBAL_WGS84_BBOX);
+    let wgs84 = Crs::new("EPSG:4326");
+    let wgs84_bbox = crate::protocol::layer_bbox_in(layer, &wgs84)?.unwrap_or(GLOBAL_WGS84_BBOX);
     write_geographic_bbox(w, &wgs84_bbox, version)?;
 
     // Per-CRS BoundingBox blocks. Transform the WGS84 bbox into each
     // advertised CRS and respect the version's axis order on output.
-    let wgs84 = Crs::new("EPSG:4326");
     for crs in &crses {
-        let target_bbox = if crs.as_str().eq_ignore_ascii_case("EPSG:4326")
-            || crs.as_str().eq_ignore_ascii_case("CRS:84")
-        {
-            wgs84_bbox
-        } else {
-            // Built once at startup: a CRS GDAL/PROJ can't transform into is
-            // a configuration error, reported — never a silently missing
-            // BoundingBox.
-            transform_bbox(&wgs84_bbox, &wgs84, crs)
-                .with_context(|| format!("BoundingBox of layer `{}` in {crs}", layer.name))?
+        // From the configured bbox directly (exact in its own CRS); built
+        // once at startup: a CRS GDAL/PROJ can't transform into is a
+        // configuration error, reported — never a silently missing box.
+        let target_bbox = match crate::protocol::layer_bbox_in(layer, crs)? {
+            Some(b) => b,
+            None if crs.as_str().eq_ignore_ascii_case("EPSG:4326") || crs.as_str().eq_ignore_ascii_case("CRS:84") => {
+                wgs84_bbox
+            }
+            None => transform_bbox(&wgs84_bbox, &wgs84, crs)
+                .with_context(|| format!("BoundingBox of layer `{}` in {crs}", layer.name))?,
         };
         write_bounding_box(w, crs, &target_bbox, version)?;
     }
@@ -438,6 +438,7 @@ mod tests {
                 name: "ortho2024".into(),
                 grids: vec!["webmercator".into()],
                 max_resolution: MaxResolution::default(),
+                bbox_crs: None,
                 bbox: Some(Bbox {
                     minx: 3.0,
                     miny: 50.0,
@@ -447,6 +448,7 @@ mod tests {
                 sources: vec![SourceConfig {
                     uri: "test.tif".into(),
                     credentials: None,
+                    ..Default::default()
                 }],
                 cache: LayerCacheConfig::default(),
                 title: "Ortho 2024".into(),
@@ -459,6 +461,8 @@ mod tests {
                 queryable: true,
                 opaque: false,
                 nodata: None,
+                source_mask: None,
+                output_formats: Default::default(),
             }],
             ..Default::default()
         }

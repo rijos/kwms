@@ -11,6 +11,14 @@ pub struct Pyramid {
     pub max_level: u32,
 }
 
+/// The resolution a (bbox, output size) request asks for: the coarser of
+/// the x and y CRS-units-per-pixel.
+pub fn requested_resolution(bbox: &Bbox, size: (u32, u32)) -> f64 {
+    let width_px = f64::from(size.0.max(1));
+    let height_px = f64::from(size.1.max(1));
+    ((bbox.maxx - bbox.minx).abs() / width_px).max((bbox.maxy - bbox.miny).abs() / height_px)
+}
+
 impl Pyramid {
     /// Select the pyramid level whose resolution is the coarsest that still
     /// covers the requested (bbox, output size) without oversampling.
@@ -24,10 +32,7 @@ impl Pyramid {
     /// `self.max_level`. Returns `0` if even level 0 oversamples (i.e.
     /// the request is coarser than what level 0 can deliver).
     pub fn select_level(&self, bbox: &Bbox, size: (u32, u32)) -> u32 {
-        let width_px = size.0.max(1) as f64;
-        let height_px = size.1.max(1) as f64;
-        let requested = ((bbox.maxx - bbox.minx).abs() / width_px)
-            .max((bbox.maxy - bbox.miny).abs() / height_px);
+        let requested = requested_resolution(bbox, size);
 
         // Walk from level 0 upwards while the level's resolution is still
         // coarser-or-equal to the requested resolution — that's the deepest

@@ -54,6 +54,7 @@ mod tests {
     fn rule_applies_inside_range() {
         let cache = LayerCacheConfig {
             mode: CacheMode::Cache,
+            max_level: crate::config::model::CacheMaxLevel::default(),
             level_rules: vec![LevelRule {
                 levels: "18-21".into(),
                 mode: CacheMode::Passthrough,
@@ -73,6 +74,7 @@ mod tests {
     fn single_level_rule_parses() {
         let cache = LayerCacheConfig {
             mode: CacheMode::Cache,
+            max_level: crate::config::model::CacheMaxLevel::default(),
             level_rules: vec![LevelRule {
                 levels: "15".into(),
                 mode: CacheMode::Passthrough,
@@ -88,6 +90,7 @@ mod tests {
     fn first_matching_rule_wins() {
         let cache = LayerCacheConfig {
             mode: CacheMode::Cache,
+            max_level: crate::config::model::CacheMaxLevel::default(),
             level_rules: vec![
                 LevelRule { levels: "0-9".into(), mode: CacheMode::Passthrough },
                 LevelRule { levels: "10-19".into(), mode: CacheMode::Cache },
@@ -102,6 +105,7 @@ mod tests {
     fn malformed_rule_is_ignored() {
         let cache = LayerCacheConfig {
             mode: CacheMode::Cache,
+            max_level: crate::config::model::CacheMaxLevel::default(),
             level_rules: vec![LevelRule {
                 levels: "garbage".into(),
                 mode: CacheMode::Passthrough,

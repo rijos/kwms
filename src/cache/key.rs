@@ -1,54 +1,63 @@
-//! Cache key: `(layer, z, x, y, format, crs)`.
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+//! Cache key: `(layer, grid directory, z, x, y, format)`.
 
 use crate::crs::Crs;
 use crate::encode::OutputFormat;
 use crate::tile::TileCoord;
 
+/// The cache directory of a grid: its EPSG code (`28992`, `3857`) when its
+/// CRS is `EPSG:<code>`, otherwise the grid's config name. Config
+/// validation rejects a layer whose grids would share a directory (two
+/// grids in one CRS), so within a layer it identifies the grid.
+pub fn grid_dir(grid_name: &str, crs: &Crs) -> String {
+    let s = crs.as_str();
+    match s.get(..5) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("EPSG:") => {
+            let code = &s[5..];
+            if !code.is_empty() && code.len() <= 9 && code.bytes().all(|b| b.is_ascii_digit()) {
+                return code.to_string();
+            }
+            grid_name.to_string()
+        }
+        _ => grid_name.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TileKey {
     pub layer: String,
+    /// The grid's cache directory, see [`grid_dir`].
+    pub grid_dir: String,
     pub coord: TileCoord,
     pub format: OutputFormat,
-    pub crs: Crs,
 }
 
 impl TileKey {
-    /// Serialize as a forward-slash path suitable for OpenDAL.
+    /// Object path in the persistent cache:
+    /// `<layer>/<grid dir>/<format>/<z>/<x>/<y>.<ext>`, e.g.
+    /// `2026_orthoHR/28992/jpeg/6/30/32.jpeg`.
     ///
-    /// Layout: `<layer>/<crs-hash>/<format>/<z>/<x>/<y>.<ext>`.
-    ///
-    /// The CRS is reduced to a short hex hash because CRS strings can contain
-    /// `:` and other characters that are awkward in object-store paths. The
-    /// hash is taken with `std::collections::hash_map::DefaultHasher`, which
-    /// uses fixed SipHash keys (0, 0) when constructed via `new`, so it is
-    /// deterministic within a binary.
+    /// Every layer lives under its own top-level prefix, so layers never
+    /// share or overwrite entries and one layer can be inspected or cleared
+    /// on its own (e.g. delete `2026_orthoHR/` in the container). The same
+    /// key serves WMTS, TMS and WMS (GetMap is composed from grid tiles).
+    /// Layer and grid names are validated as plain path segments at config load
+    /// (`config::validate`), and nothing here depends on the build (no
+    /// `DefaultHasher`), so paths stay the same across releases.
     pub fn as_path(&self) -> String {
-        let mut hasher = DefaultHasher::new();
-        self.crs.as_str().hash(&mut hasher);
-        let crs_hash = format!("{:016x}", hasher.finish());
-        // Use the first 16 hex chars (full u64) — already short and stable.
-        let crs_short = &crs_hash[..16];
-
-        let ext = self.format.extension();
         let fmt = match self.format {
             OutputFormat::Png => "png",
             OutputFormat::Jpeg => "jpeg",
             OutputFormat::Webp => "webp",
             OutputFormat::GeoTiff => "geotiff",
         };
-
         format!(
-            "{layer}/{crs}/{fmt}/{z}/{x}/{y}.{ext}",
+            "{layer}/{grid}/{fmt}/{z}/{x}/{y}.{ext}",
             layer = self.layer,
-            crs = crs_short,
-            fmt = fmt,
+            grid = self.grid_dir,
             z = self.coord.z,
             x = self.coord.x,
             y = self.coord.y,
-            ext = ext,
+            ext = self.format.extension(),
         )
     }
 }
@@ -57,61 +66,41 @@ impl TileKey {
 mod tests {
     use super::*;
 
-    fn sample_key() -> TileKey {
+    fn key(layer: &str, grid_dir: &str) -> TileKey {
         TileKey {
-            layer: "ortho2024".into(),
+            layer: layer.into(),
+            grid_dir: grid_dir.into(),
             coord: TileCoord::new(12, 345, 678),
             format: OutputFormat::Png,
-            crs: Crs::new("EPSG:3857"),
+        }
+    }
+
+    /// Pinned literally: a change here orphans every persistent cache.
+    #[test]
+    fn as_path_is_stable() {
+        assert_eq!(key("ortho2024", "3857").as_path(), "ortho2024/3857/png/12/345/678.png");
+    }
+
+    #[test]
+    fn grid_dir_is_the_epsg_code_or_the_grid_name() {
+        assert_eq!(grid_dir("rd_new_quad", &Crs::new("EPSG:28992")), "28992");
+        assert_eq!(grid_dir("webmercator", &Crs::new("epsg:3857")), "3857");
+        for odd in ["ESRI:102100", "EPSG:", "EPSG:12a", "EPSG:1234567890", "PROJCS[...]"] {
+            assert_eq!(grid_dir("my_grid", &Crs::new(odd)), "my_grid", "{odd}");
         }
     }
 
     #[test]
-    fn as_path_is_stable_for_known_key() {
-        let key = sample_key();
-        // Compute the expected CRS hash with the same hasher to keep the
-        // assertion deterministic even if the SipHash output ever changes —
-        // we still assert path structure explicitly.
-        let mut hasher = DefaultHasher::new();
-        "EPSG:3857".hash(&mut hasher);
-        let crs = format!("{:016x}", hasher.finish());
-        let expected = format!("ortho2024/{crs}/png/12/345/678.png");
-        assert_eq!(key.as_path(), expected);
-    }
-
-    #[test]
-    fn as_path_round_trips_layout() {
-        let key = sample_key();
-        let path = key.as_path();
-        let parts: Vec<_> = path.split('/').collect();
-        assert_eq!(parts.len(), 6, "expected 6 segments, got {path}");
-        assert_eq!(parts[0], "ortho2024");
-        assert_eq!(parts[2], "png");
-        assert_eq!(parts[3], "12");
-        assert_eq!(parts[4], "345");
-        assert_eq!(parts[5], "678.png");
-    }
-
-    #[test]
-    fn different_crs_yields_different_path() {
-        let a = TileKey {
-            layer: "L".into(),
-            coord: TileCoord::new(0, 0, 0),
-            format: OutputFormat::Png,
-            crs: Crs::new("EPSG:3857"),
-        };
-        let b = TileKey {
-            layer: "L".into(),
-            coord: TileCoord::new(0, 0, 0),
-            format: OutputFormat::Png,
-            crs: Crs::new("EPSG:4326"),
-        };
-        assert_ne!(a.as_path(), b.as_path());
+    fn layers_and_grids_get_separate_paths() {
+        let a = key("a", "28992").as_path();
+        assert_ne!(a, key("b", "28992").as_path());
+        assert_ne!(a, key("a", "3857").as_path());
+        assert!(a.starts_with("a/"), "{a}");
     }
 
     #[test]
     fn format_extension_matches_outputformat() {
-        let mut k = sample_key();
+        let mut k = key("L", "3857");
         k.format = OutputFormat::GeoTiff;
         assert!(k.as_path().ends_with(".tif"), "got: {}", k.as_path());
         assert!(k.as_path().contains("/geotiff/"), "got: {}", k.as_path());

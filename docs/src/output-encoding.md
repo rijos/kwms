@@ -8,7 +8,8 @@ For each rendered tile, the pipeline holds:
 
 - A pixel buffer (rows × cols × bands, at the appropriate dtype).
 - Optional georeferencing (CRS + affine geotransform) — populated for GeoTIFF / raw float output, ignored for PNG / JPEG / WebP.
-- NoData is set on the output bands for every format: GeoTIFF records it, PNG writes it as a `tRNS` chunk (nodata pixels become transparent), JPEG has no equivalent and ignores it.
+- A coverage (alpha) plane: where the image has data (see [Per-layer behavior](./per-layer-behavior.md#where-a-layer-has-data)). PNG, WebP and GeoTIFF get it as an alpha band (8-bit, or scaled for 16-bit), so no-data areas are transparent. JPEG has no alpha, so its no-data pixels are blended to white.
+- Without a coverage plane, NoData is set on the output bands: GeoTIFF records it, and PNG writes it as a `tRNS` chunk.
 
 To encode:
 

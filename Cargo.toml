@@ -28,7 +28,9 @@ gdal-sys = "0.10"
 crossbeam-channel = "0.5"
 
 # storage / cache
-opendal = "0.50"
+# Persistent tile cache. Backends are compiled in per opendal feature:
+# `fs` for local/testing, `azblob` for Azure Blob Storage in production.
+opendal = { version = "0.50", features = ["services-fs", "services-azblob"] }
 moka = { version = "0.12", features = ["future"] }
 
 # observability
@@ -50,10 +52,21 @@ bytesize = { version = "1", features = ["serde"] }
 quick-xml = { version = "0.36", features = ["serialize"] }
 percent-encoding = "2"
 
+# kwms-bench (src/bench/kwms-bench.rs) only: `cargo run --release --features bench --bin kwms-bench`.
+ureq = { version = "3", optional = true }
+roxmltree = { version = "0.20", optional = true }
+
 [features]
 # Generate GDAL bindings at build time (needed for GDAL versions newer than
 # gdal-sys's prebuilt bindings, e.g. 3.11): `cargo test --features bindgen`.
 bindgen = ["gdal/bindgen"]
+# The benchmark client (HTTP + XML parsing), kept out of the server build.
+bench = ["dep:ureq", "dep:roxmltree"]
+
+[[bin]]
+name = "kwms-bench"
+path = "src/bench/kwms-bench.rs"
+required-features = ["bench"]
 
 [lints.rust]
 # `cfg(fuzzing)` is set by cargo-fuzz; see fuzz/ and protocol::fuzz_harness.

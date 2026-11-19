@@ -1,14 +1,12 @@
-//! Open a `gdal::Dataset` with scoped credentials (per-source GDAL open options).
+//! Open a `gdal::Dataset` read-only with the source's GDAL open options.
 //!
-//! Credentials are applied as **dataset-scoped open options** via
-//! `gdal::DatasetOptions::open_options` — not as process-wide config — so
-//! multiple sources can carry distinct credentials in the same process
-//! (see `docs/src/source-abstraction.md`, "Credentials & VSI configuration").
+//! Credentials are *not* open options: GDAL's VSI handlers read them from
+//! path-specific options, registered once at startup by
+//! [`super::credentials::register`].
 //!
 //! This is one of three modules permitted to call into the `gdal` crate
 //! directly (alongside `crs/gdal.rs` and `encode.rs`).
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -22,38 +20,23 @@ pub struct OpenedDataset {
 }
 
 impl OpenedDataset {
-    /// Open the dataset at `uri`, applying every (key, value) in `credentials`
-    /// as a `KEY=VALUE` open option on this dataset only.
-    pub fn open(uri: &str, credentials: &HashMap<String, String>) -> Result<Self> {
-        // Build the `KEY=VALUE` strings. We must keep ownership of these
-        // strings alive for the duration of the `open_ex` call, because
-        // `DatasetOptions::open_options` borrows `&[&str]`.
-        let kv_owned: Vec<String> = credentials
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect();
-        let kv_refs: Vec<&str> = kv_owned.iter().map(String::as_str).collect();
-
+    /// Open the dataset at `uri` with `open_options` (`KEY=VALUE` strings,
+    /// as `gdalinfo -oo` takes them).
+    pub fn open(uri: &str, open_options: &[String]) -> Result<Self> {
+        let refs: Vec<&str> = open_options.iter().map(String::as_str).collect();
         let options = DatasetOptions {
             open_flags: GdalOpenFlags::GDAL_OF_READONLY | GdalOpenFlags::GDAL_OF_RASTER,
             allowed_drivers: None,
-            open_options: if kv_refs.is_empty() {
-                None
-            } else {
-                Some(&kv_refs)
-            },
+            open_options: if refs.is_empty() { None } else { Some(&refs) },
             sibling_files: None,
         };
 
-        // GDAL accepts both local filesystem paths and VSI prefixes
-        // (`/vsiaz/`, `/vsis3/`, `/vsicurl/`, …) through the same path arg —
-        // we pass the configured URI through verbatim.
+        // GDAL accepts local paths, VSI prefixes (`/vsiaz/`, `/vsis3/`, …) and
+        // driver prefixes (`GTI:`) through the same argument — the configured
+        // URI is passed through verbatim.
         let dataset = Dataset::open_ex(Path::new(uri), options)
             .with_context(|| format!("failed to open GDAL dataset at '{uri}'"))?;
 
-        Ok(Self {
-            uri: uri.to_string(),
-            dataset,
-        })
+        Ok(Self { uri: uri.to_string(), dataset })
     }
 }

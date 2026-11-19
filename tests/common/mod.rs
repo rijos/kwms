@@ -17,12 +17,10 @@ use axum::body::Body;
 use axum::http::{Request, Response};
 use axum::Router;
 use bytes::Bytes;
-use opendal::{services, Operator};
 use tower::ServiceExt;
 
-use kwms::cache::hot::HotTier;
+use kwms::cache::memory::MemoryTier;
 use kwms::cache::layered::LayeredCache;
-use kwms::cache::persistent::PersistentTier;
 use kwms::config::load::load;
 use kwms::config::{Config, Secrets};
 use kwms::server::{router, AppState};
@@ -121,10 +119,7 @@ pub fn state_with_sources(name: &str) -> Arc<AppState> {
 /// the persistent tier. Useful when tests want the cache plumbing to work
 /// without touching the filesystem.
 pub fn memory_cache() -> LayeredCache {
-    let op = Operator::new(services::Memory::default())
-        .expect("opendal memory service")
-        .finish();
-    LayeredCache::from_parts(HotTier::new(64 * 1024 * 1024), PersistentTier::new(op))
+    LayeredCache::from_tiers(vec![std::sync::Arc::new(MemoryTier::new(64 * 1024 * 1024))])
 }
 
 /// Build the production axum router around the given state.

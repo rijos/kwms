@@ -1,5 +1,6 @@
 //! CLI subcommand implementations.
 
+pub mod cache_update;
 pub mod config_check;
 pub mod config_schema;
 pub mod serve;

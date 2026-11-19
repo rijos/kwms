@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_yaml::{Mapping, Value};
 
 use super::merge::merge;
@@ -62,6 +62,20 @@ pub fn load(config_path: &Path, secrets_path: &Path) -> Result<(Config, Secrets)
     })?;
 
     validate(&config).context("config validation failed")?;
+    crate::source::gdal::credentials::plan(&config, &secrets).context("config validation failed")?;
+    for layer in &config.layers {
+        if let Some(path) = layer.effective_source_mask(config.source_mask.as_deref()) {
+            crate::source::gdal::mask::load(path)
+                .with_context(|| format!("config validation failed: layer '{}': source_mask", layer.name))?;
+        }
+    }
+    for (i, tier) in config.cache.tiers.iter().enumerate() {
+        if let crate::config::TierConfig::Store(st) = tier {
+            if let Some(name) = st.credentials.as_ref().filter(|n| !secrets.credentials.contains_key(*n)) {
+                bail!("config validation failed: cache.tiers[{i}].credentials '{name}' is not defined in secrets.yaml");
+            }
+        }
+    }
 
     Ok((config, secrets))
 }

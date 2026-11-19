@@ -15,7 +15,14 @@ use super::raster::{create_georeferenced_mem, pixel_type_from_gdal, read_pixel_b
 use crate::source::{PixelBuffer, WindowRequest};
 
 /// Read (warping as needed) `req.bbox` in `req.crs` at `req.width`×`req.height`.
-pub fn read_window(dataset: &Dataset, req: &WindowRequest) -> Result<PixelBuffer> {
+///
+/// `black_is_gap`: for a tile index, where GTI returns pure black (0 in every
+/// band) for places without a tile. The warp then doesn't interpolate those
+/// pixels into their neighbours — otherwise edge pixels of the coverage mix
+/// with the black (a thin grey line against no-data, up to a pixel wide when
+/// zoomed out). Output nodata stays unset, so a genuinely black pixel is
+/// still drawn black, just not blended across gaps.
+pub fn read_window(dataset: &Dataset, req: &WindowRequest, black_is_gap: bool) -> Result<PixelBuffer> {
     let bands = u32::try_from(dataset.raster_count()).context("raster band count overflow u32")?;
     if bands == 0 {
         return Err(anyhow!("dataset has zero raster bands"));
@@ -32,6 +39,10 @@ pub fn read_window(dataset: &Dataset, req: &WindowRequest) -> Result<PixelBuffer
         resampling: req.resampling,
         src_nodata: req.nodata,
         dst_nodata: nodata,
+        src_alpha: false,
+        dst_alpha: false,
+        // A layer nodata override takes precedence.
+        black_is_gap: black_is_gap && req.nodata.is_none(),
     };
     warp(&[dataset], &mut dst, &opts).context("warping source window")?;
     read_pixel_buffer(&dst, pixel_type, nodata)

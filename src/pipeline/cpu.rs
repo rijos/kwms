@@ -34,18 +34,25 @@ impl CpuPool {
     }
 
     /// Run `job` on the blocking pool once a slot is free.
-    pub async fn run<F, R>(&self, job: F) -> Result<R>
+    /// Run `job` on the blocking pool once a slot is free; its run time is
+    /// recorded as `stage` (`kwms_stage_seconds`), the wait as `cpu_wait`.
+    pub async fn run<F, R>(&self, stage: &'static str, job: F) -> Result<R>
     where
         F: FnOnce() -> Result<R> + Send + 'static,
         R: Send + 'static,
     {
+        let waiting = std::time::Instant::now();
         let permit = tokio::time::timeout(self.queue_timeout, self.slots.clone().acquire_owned())
             .await
             .map_err(|_| Busy)?
             .context("render pool closed")?;
+        super::stage::record("cpu_wait", waiting);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            job()
+            let running = std::time::Instant::now();
+            let out = job();
+            super::stage::record(stage, running);
+            out
         })
         .await
         .context("render job panicked")?
@@ -65,14 +72,14 @@ mod tests {
         let running = Arc::new(AtomicUsize::new(0));
 
         let r = running.clone();
-        let slow = pool.run(move || {
+        let slow = pool.run("test", move || {
             r.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(300));
             Ok(())
         });
         let blocked = async {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            pool.run(|| Ok(())).await
+            pool.run("test", || Ok(())).await
         };
         let (slow, blocked) = tokio::join!(slow, blocked);
         slow.unwrap();
@@ -81,6 +88,6 @@ mod tests {
         assert_eq!(running.load(Ordering::SeqCst), 1);
 
         // Once the slot is free again, jobs run normally.
-        assert_eq!(pool.run(|| Ok(7)).await.unwrap(), 7);
+        assert_eq!(pool.run("test", || Ok(7)).await.unwrap(), 7);
     }
 }

@@ -58,6 +58,12 @@ pub async fn middleware(req: Request<Body>, next: Next) -> Response {
     let method = method_label(req.method());
     let path = req.uri().path().to_string();
     let route = route_label(&path);
+    // Access log, off unless `RUST_LOG` enables debug for this module (e.g.
+    // `RUST_LOG=info,kwms::server::middleware::metrics=debug`): what
+    // clients actually ask for (QGIS image sizes, CRS, formats). The URI is
+    // capped so a hostile query string can't bloat the log.
+    let access = tracing::enabled!(tracing::Level::DEBUG)
+        .then(|| req.uri().to_string().chars().take(2048).collect::<String>());
 
     let started = Instant::now();
     let response = next.run(req).await;
@@ -82,6 +88,9 @@ pub async fn middleware(req: Request<Body>, next: Next) -> Response {
     )
     .record(elapsed);
 
+    if let Some(uri) = access {
+        tracing::debug!(method, uri = %uri, status = status.as_u16(), ms = elapsed * 1000.0, "request");
+    }
     response
 }
 

@@ -56,6 +56,8 @@ These apply to every entry and are not repeated per entry.
   cache (`GDAL_CACHEMAX`).
 - **PROJ network access** is switched off process-wide at startup (F16,
   confirmed by F17), so no transform downloads grids.
+- **Source credentials** are registered process-wide, per object-store path
+  prefix, at startup (F18) and never changed afterwards.
 - **Allocation failure inside GDAL** either aborts the process (`CPLMalloc`,
   `CPLCalloc`) or throws `std::bad_alloc`. Where GDAL does not catch it, a
   C++ exception unwinding into Rust through the C ABI is undefined behaviour
@@ -351,6 +353,47 @@ These apply to every entry and are not repeated per entry.
   `crs::disable_proj_network` turns into a startup error.
 - **Verified by:** `crs::gdal::tests::proj_network_access_is_disabled`.
 
+## F18 — `VSISetPathSpecificOption`
+
+- **Location:** `ffi::vsi_set_path_specific_option`, called by
+  `source::gdal::credentials::register` from `AppState::new`.
+- **Threads:** startup thread, before any source is opened and before the
+  listener is bound. Safe from any thread: GDAL guards its map with
+  `oMutexPathSpecificOptions` (`port/cpl_vsil.cpp:3836, 3889`).
+- **Purpose:** give a source's credentials (from `secrets.yaml`) to GDAL's
+  VSI handlers for one object-store path prefix, e.g. `/vsiaz/open-tiles/`.
+  Unlike thread-local config options, these reach GDAL's own worker threads
+  (GTI and VRT read tiles on a thread pool); unlike process-wide config
+  options, they don't apply to other buckets.
+- **Arguments / memory passed:** three `CString`s (prefix, key, value), owned
+  by the caller and alive for the call. None is NULL (a NULL value would
+  erase the option).
+- **Allocates:** GDAL copies prefix, upper-cased key and value into the
+  process-wide `std::map<std::string, std::map<std::string, std::string>>`
+  `oMapPathSpecificOptions` (`cpl_vsil.cpp:3840-3841, 3886-3902`). Owned by
+  GDAL for the life of the process; kwms never clears it.
+- **Frees:** nothing.
+- **Side effects:** from then on `VSIGetPathSpecificOption` returns the value
+  for any path starting with the prefix (`cpl_vsil.cpp:3973-3990`; kwms
+  always ends the prefix with `/`, so `/vsis3/foo/` never matches bucket
+  `foobar`). The value sits in ordinary heap memory: it may reach swap or a
+  core dump, like any secret in the process.
+- **Hazard and mitigation:** `VSIGetPathSpecificOption` returns a pointer to
+  the stored `std::string` *after* releasing the mutex (`:3976-3989`), so
+  overwriting a value while a reader holds that pointer would be a
+  use-after-free. `credentials::register` therefore writes each
+  (prefix, key) at most once per process — repeating the same value is
+  skipped, a different value is a startup error — and only before any
+  dataset is opened.
+- **Failure behaviour:** returns `void` and cannot fail short of an
+  allocation failure (see "Global side effects"). NUL bytes are rejected on
+  the Rust side before the call.
+- **Verified by:**
+  `source::gdal::credentials::tests::register_sets_gdal_path_specific_options_once`
+  (read back through T3/T4: set under the prefix, absent for a sibling
+  bucket) and, against real data, the 2026_orthoHR layer
+  (`/vsiaz/` tiles read on GTI's worker threads).
+
 ## T1 — `GDALReferenceDataset` (tests only)
 
 - **Location:** `ffi::dataset_ref_count`, compiled only under `cfg(test)`.
@@ -368,6 +411,27 @@ These apply to every entry and are not repeated per entry.
   Unlike `GDALReleaseDataset` it **never deletes** the dataset, even if the
   count reached zero, so a mistake here cannot free memory still owned by
   the test.
+
+## T3 — `VSIGetPathSpecificOption` (tests only)
+
+- **Location:** `ffi::vsi_get_path_specific_option`, compiled only under
+  `cfg(test)`.
+- **Threads:** test threads only.
+- **Arguments:** two caller-owned `CString`s (path, key) alive for the call;
+  default NULL.
+- **Effect:** under the mutex, finds the longest-sorted prefix of `path`
+  holding `key`; otherwise falls back to `CPLGetConfigOption(key, NULL)`
+  (`cpl_vsil.cpp:3973-3990`). Allocates nothing. Returns NULL or a pointer
+  into GDAL's map or config options.
+
+## T4 — `CStr::from_ptr` on the path-specific option
+
+- **Location:** `ffi::vsi_get_path_specific_option`.
+- **Why it holds:** the pointer is non-NULL (checked) and is a
+  `std::string::c_str()` or a config option value, both NUL-terminated. It
+  stays valid as long as nobody changes that option; F18 never changes a
+  registered option, and it is copied into a `String` before any other
+  GDAL call.
 
 ---
 

@@ -58,6 +58,21 @@ pub struct WindowRequest {
     pub nodata: Option<f64>,
 }
 
+/// A polygon area as WKB in a CRS: where a source has data (its tile
+/// footprints or extent), or a layer's `source_mask`. Rasterized per
+/// request by `source::gdal::mask`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Area {
+    pub wkb: std::sync::Arc<Vec<u8>>,
+    pub crs: Crs,
+    /// Don't count the pixels its outline passes through. For a source's
+    /// coverage: at coarse scales GTI snaps tile edges to its overview grid,
+    /// so the outermost pixel row can mix imagery with the black "no tile"
+    /// beyond — a thin line against no-data. Not for a `source_mask`
+    /// (the data continues across its edges).
+    pub trim_edges: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PixelBuffer {
     pub width: u32,
@@ -67,6 +82,11 @@ pub struct PixelBuffer {
     /// Row-major, band-interleaved.
     pub data: Bytes,
     pub nodata: Option<f64>,
+    /// Coverage, one byte per pixel (row-major): 255 = data, 0 = no data
+    /// (outside the source or its `source_mask`, or nodata). `encode` turns
+    /// it into an alpha band (PNG, WebP, GeoTIFF) or paints no-data pixels
+    /// white (JPEG). `None`: every pixel is data.
+    pub alpha: Option<Bytes>,
 }
 
 /// One pixel value reported by `Source::sample`.
@@ -128,6 +148,7 @@ impl PixelBuffer {
             pixel_type,
             data: Bytes::from(data),
             nodata,
+            alpha: None,
         })
     }
 
@@ -135,6 +156,9 @@ impl PixelBuffer {
     /// there is none — i.e. the image holds no data. Floats compare by
     /// value (a NaN nodata matches any NaN, whatever its payload).
     pub fn is_all_fill(&self) -> bool {
+        if let Some(alpha) = &self.alpha {
+            return alpha.iter().all(|a| *a == 0);
+        }
         let fill = self.nodata.unwrap_or(0.0);
         let floats = |size: usize, read: fn(&[u8]) -> Option<f64>| {
             let chunks = self.data.chunks_exact(size);
@@ -166,6 +190,12 @@ pub struct PixelValue {
 #[async_trait::async_trait]
 pub trait Source: Send + Sync {
     fn metadata(&self) -> &SourceMetadata;
+    /// Where the source has data, in its native CRS: the footprints of a
+    /// tile index's tiles, or a raster's extent. Pixels outside it render
+    /// as no data. `None`: decided by nodata alone.
+    fn coverage_area(&self) -> Option<Area> {
+        None
+    }
     async fn read_window(&self, req: WindowRequest) -> anyhow::Result<PixelBuffer>;
     async fn sample(&self, coord: Coord, crs: Crs) -> anyhow::Result<Vec<PixelValue>>;
 }
@@ -175,7 +205,7 @@ mod tests {
     use super::*;
 
     fn buffer(pixel_type: PixelType, data: Vec<u8>, nodata: Option<f64>) -> PixelBuffer {
-        PixelBuffer { width: 1, height: 1, bands: 1, pixel_type, data: Bytes::from(data), nodata }
+        PixelBuffer { width: 1, height: 1, bands: 1, pixel_type, data: Bytes::from(data), nodata, alpha: None }
     }
 
     #[test]

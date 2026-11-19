@@ -174,6 +174,7 @@ pub(crate) fn read_pixel_buffer(
         pixel_type: pt,
         data: Bytes::from(interleave(&planes, pixel_type_bytes(pt))?),
         nodata,
+        alpha: None,
     })
 }
 
@@ -202,6 +203,38 @@ fn interleave(planes: &[Vec<u8>], elem: usize) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Move the last band of `buffer` into its alpha plane (8-bit buffers;
+/// 16-bit alpha is scaled down).
+pub(crate) fn split_alpha(buffer: PixelBuffer) -> Result<PixelBuffer> {
+    let elem = pixel_type_bytes(buffer.pixel_type);
+    let bands = buffer.bands as usize;
+    if bands < 2 {
+        bail!("internal: split_alpha needs at least two bands");
+    }
+    let px = bands.checked_mul(elem).context("pixel size overflows")?;
+    let colour = px.saturating_sub(elem);
+    let n = buffer.data.len().checked_div(px).unwrap_or(0);
+    let mut data = Vec::with_capacity(n.saturating_mul(colour));
+    let mut alpha = Vec::with_capacity(n);
+    for pixel in buffer.data.chunks_exact(px) {
+        let (c, a) = pixel.split_at(colour);
+        data.extend_from_slice(c);
+        alpha.push(match buffer.pixel_type {
+            PixelType::U16 => {
+                let v = a.get(..2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map_or(0, u16::from_ne_bytes);
+                u8::try_from(v.checked_div(257).unwrap_or(0)).unwrap_or(u8::MAX)
+            }
+            _ => a.first().copied().unwrap_or(0),
+        });
+    }
+    Ok(PixelBuffer {
+        bands: buffer.bands.saturating_sub(1),
+        data: Bytes::from(data),
+        alpha: Some(Bytes::from(alpha)),
+        ..buffer
+    })
 }
 
 /// Write a band-interleaved [`PixelBuffer`] into a new MEM dataset.
@@ -280,6 +313,16 @@ pub(crate) struct WarpOptions {
     /// deliberately sets no `INIT_DEST`, because GDALWarp re-applies it per
     /// source and a multi-source mosaic would erase all but the last tile.
     pub dst_nodata: Option<f64>,
+    /// The sources' last band is alpha (`-srcalpha`).
+    pub src_alpha: bool,
+    /// The destination's last band receives alpha (`-dstalpha`): 255 where
+    /// a source pixel landed, 0 elsewhere.
+    pub dst_alpha: bool,
+    /// Single-source reads of a tile index: pure black (0 in every band) is
+    /// a gap between tiles, excluded from interpolation (`-srcnodata 0` with
+    /// `UNIFIED_SRC_NODATA`), without an output nodata. Ignored when
+    /// `src_nodata` is set.
+    pub black_is_gap: bool,
 }
 
 /// The `gdalwarp -r` token for a resampling kernel. The warper has no Gauss
@@ -319,6 +362,17 @@ pub(crate) fn warp(sources: &[&Dataset], dst: &mut Dataset, opts: &WarpOptions) 
         push("-dstnodata")?;
         push(&nd.to_string())?;
     }
+    if opts.black_is_gap && opts.src_nodata.is_none() {
+        for a in ["-srcnodata", "0", "-dstnodata", "None", "-wo", "UNIFIED_SRC_NODATA=YES", "-wo", "INIT_DEST=0"] {
+            push(a)?;
+        }
+    }
+    if opts.src_alpha {
+        push("-srcalpha")?;
+    }
+    if opts.dst_alpha {
+        push("-dstalpha")?;
+    }
     let options = ffi::WarpAppOptions::new(&args)?;
     ffi::gdal_warp(sources, dst, &options)
 }
@@ -337,6 +391,7 @@ mod tests {
             pixel_type: PixelType::U8,
             data: Bytes::from((1u8..=16).collect::<Vec<_>>()),
             nodata,
+            alpha: None,
         };
         let mut ds = mem_from_pixel_buffer(&buf).unwrap();
         let sr = SpatialRef::from_epsg(3857).unwrap();
@@ -356,6 +411,7 @@ mod tests {
             pixel_type: PixelType::U16,
             data: Bytes::from(to_ne_bytes(vec![1u16, 2, 3, 4, 5, 6])),
             nodata: None,
+            alpha: None,
         };
         let ds = mem_from_pixel_buffer(&buf).unwrap();
         let back = read_pixel_buffer(&ds, PixelType::U16, None).unwrap();
@@ -374,7 +430,7 @@ mod tests {
         let opts = WarpOptions {
             resampling: ResampleAlg::NearestNeighbour,
             src_nodata: None,
-            dst_nodata: Some(255.0),
+            dst_nodata: Some(255.0), src_alpha: false, dst_alpha: false, black_is_gap: false
         };
         warp(&[&src], &mut dst, &opts).unwrap();
         let out = read_pixel_buffer(&dst, PixelType::U8, Some(255.0)).unwrap();
@@ -391,7 +447,7 @@ mod tests {
             &Bbox::from([0.0, 0.0, 400.0, 400.0]), None,
         )
         .unwrap();
-        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None };
+        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
         warp(&[&src], &mut dst, &opts).unwrap();
         let out = read_pixel_buffer(&dst, PixelType::U8, None).unwrap();
         assert!(out.data.iter().all(|v| (1..=16).contains(v)), "{:?}", out.data);
@@ -405,7 +461,7 @@ mod tests {
             &Bbox::from([-180.0, -85.0, 180.0, 85.0]), Some(7.0),
         )
         .unwrap();
-        let opts = WarpOptions { resampling: ResampleAlg::Bilinear, src_nodata: None, dst_nodata: Some(7.0) };
+        let opts = WarpOptions { resampling: ResampleAlg::Bilinear, src_nodata: None, dst_nodata: Some(7.0) , src_alpha: false, dst_alpha: false, black_is_gap: false};
         warp(&[&src], &mut dst, &opts).unwrap();
         // The tiny source covers almost nothing of the world: everything is nodata.
         let out = read_pixel_buffer(&dst, PixelType::U8, Some(7.0)).unwrap();
@@ -434,7 +490,7 @@ mod tests {
                 PixelType::U8, 16, 16, 1, &Crs::new(crs), &Bbox::from([-10.0, 40.0, 10.0, 60.0]), None,
             )
             .unwrap();
-            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None };
+            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
             warp(&[&src], &mut dst, &opts).unwrap();
             let out = read_pixel_buffer(&dst, PixelType::U8, None).unwrap();
             assert!(out.data.iter().all(|&v| v == 77), "{crs}: {:?}", &out.data[..16]);
@@ -459,7 +515,7 @@ mod tests {
                 &Bbox::from([-170.0, -80.0, 170.0, 80.0]), nodata,
             )
             .unwrap();
-            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: nodata };
+            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: nodata , src_alpha: false, dst_alpha: false, black_is_gap: false};
             warp(&[&west, &east], &mut dst, &opts).unwrap();
             let out = read_pixel_buffer(&dst, PixelType::U8, nodata).unwrap();
             assert!(out.data.iter().all(|&v| v == 77), "nodata={nodata:?}: {:?}", &out.data[..34]);
@@ -481,7 +537,7 @@ mod tests {
             PixelType::U8, 4, 4, 1, &Crs::new("EPSG:3857"), &Bbox::from([0.0, 0.0, 400.0, 400.0]), None,
         )
         .unwrap();
-        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None };
+        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
         assert_eq!(ffi::dataset_ref_count(&dst), 1);
         // Zero pixel size ("Cannot invert geotransform") and no geotransform
         // ("Unable to compute a transformation") make GDALWarp itself fail.
@@ -517,7 +573,7 @@ mod tests {
         let _ = warp(&[&bad_source(None)], &mut create_mem(PixelType::U8, 1, 1, 1).unwrap(), &WarpOptions {
             resampling: ResampleAlg::NearestNeighbour,
             src_nodata: None,
-            dst_nodata: None,
+            dst_nodata: None, src_alpha: false, dst_alpha: false, black_is_gap: false
         });
         ffi::cpl_error_reset();
         assert_eq!(ffi::cpl_error_message(), None);
@@ -533,7 +589,7 @@ mod tests {
                 PixelType::U8, 8, 4, 1, &Crs::new("EPSG:3857"), &Bbox::from([0.0, 0.0, 800.0, 400.0]), Some(255.0),
             )
             .unwrap();
-            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: Some(255.0) };
+            let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: Some(255.0) , src_alpha: false, dst_alpha: false, black_is_gap: false};
             warp(&[&source(None)], &mut dst, &opts).unwrap();
             read_pixel_buffer(&dst, PixelType::U8, None).unwrap().data
         };
@@ -547,7 +603,7 @@ mod tests {
                             PixelType::U8, 8, 4, 1, &Crs::new("EPSG:3857"), &Bbox::from([0.0, 0.0, 800.0, 400.0]), Some(255.0),
                         )
                         .unwrap();
-                        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: Some(255.0) };
+                        let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: Some(255.0) , src_alpha: false, dst_alpha: false, black_is_gap: false};
                         warp(&[&src], &mut dst, &opts).unwrap();
                         assert_eq!(read_pixel_buffer(&dst, PixelType::U8, None).unwrap().data, expected);
                     }
@@ -568,7 +624,7 @@ mod tests {
             .map(|_| {
                 let stop = stop.clone();
                 std::thread::spawn(move || {
-                    let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None };
+                    let opts = WarpOptions { resampling: ResampleAlg::NearestNeighbour, src_nodata: None, dst_nodata: None , src_alpha: false, dst_alpha: false, black_is_gap: false};
                     let mut dst = create_mem(PixelType::U8, 1, 1, 1).unwrap();
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = warp(&[&bad_source(None)], &mut dst, &opts); // raises CPL errors
