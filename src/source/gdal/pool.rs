@@ -119,6 +119,8 @@ fn worker(
     open_options: &[String],
 ) {
     while let Ok(job) = rx.recv() {
+        // Each job reports only its own GDAL errors.
+        crate::ffi::cpl_error_reset();
         if catch_unwind(AssertUnwindSafe(|| job(&mut dataset.dataset))).is_ok() {
             continue;
         }

@@ -29,8 +29,10 @@ pub mod crs;
 pub mod encode;
 #[allow(unsafe_code)]
 pub(crate) mod ffi;
+pub mod logging;
 pub mod pipeline;
 pub mod protocol;
+pub mod redact;
 #[cfg(not(fuzzing))]
 pub mod server;
 pub mod source;

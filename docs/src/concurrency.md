@@ -14,7 +14,7 @@ check each claim. GDAL statements refer to GDAL 3.11.4
 | **tokio workers** | CPU count | HTTP handling, `Kvp` parsing and validation, single-flight coordination, cache tier I/O, serving pre-rendered documents | **no** — no GDAL/PROJ call runs on a runtime worker during request handling |
 | **Dataset-pool workers** (`gdal-pool[n]`) | 4 per source | source reads: `GDALWarp` from the worker's own dataset into a fresh MEM dataset | yes |
 | **tokio blocking pool** (`spawn_blocking`) | up to 512 threads, *concurrency* capped at `server.render_concurrency` | encoding (MEM → `/vsimem/` → bytes), WMS compositing (`/vsimem/` tiles + `GDALWarp`) | yes |
-| GDAL internal threads | 0 by default | GDAL creates worker threads only if `GDAL_NUM_THREADS` is set | — |
+| GDAL internal threads | GTI: up to `server.tile_index_threads` (default 4) per read while serving, all CPUs in `cache update` (`GTI_NUM_THREADS`) | the tile-index driver reads the files under one request in parallel on GDAL's global thread pool | yes — no kwms code |
 
 ## GDAL's rules and how they are met
 
@@ -74,6 +74,9 @@ startup.
 ## Starvation freedom
 
 - **The async runtime never blocks.** No GDAL work runs on tokio workers
+  — including the per-request checks (does a box overlap any source
+  footprint; how many source pixels would a direct WMS read take), which run
+  on the render pool
   (see *Threads*); submitting to the dataset pool waits asynchronously and
   hands over with a non-blocking `try_send` (a held permit guarantees
   channel space). Health probes and timers therefore stay responsive under

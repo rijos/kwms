@@ -9,6 +9,7 @@ pub mod footprint;
 pub mod mask;
 pub mod pool;
 pub(crate) mod raster;
+pub mod runtime;
 pub mod sample;
 pub mod tile_index;
 pub mod warp;
@@ -267,7 +268,6 @@ async fn probe_metadata(pool: &DatasetPool) -> Result<SourceMetadata> {
         let overviews = (0..count)
             .map(|i| to_u32(band1.overview(i).context("reading an overview")?.size()))
             .collect::<Result<Vec<_>>>()?;
-        drop(band1);
 
         // Native CRS: let GDAL identify it (e.g. an ESRI-WKT RD New becomes
         // `EPSG:28992`), so it compares equal to grid CRSes; unidentifiable
@@ -318,6 +318,18 @@ impl Source for GdalSource {
 
     fn coverage_area(&self) -> Option<Area> {
         Some(self.coverage.clone())
+    }
+
+    async fn files_under(&self, crs: &Crs, bbox: &Bbox) -> Result<Option<usize>> {
+        let Some(routing) = &self.routing else {
+            return Ok(None);
+        };
+        let tiles = self.tiles_in(routing, crs).await?;
+        let overlaps = |t: &&IndexTile| {
+            let (minx, miny, maxx, maxy) = t.bbox;
+            minx < bbox.maxx && maxx > bbox.minx && miny < bbox.maxy && maxy > bbox.miny
+        };
+        Ok(Some(tiles.iter().filter(overlaps).count()))
     }
 
     async fn read_window(&self, req: WindowRequest) -> Result<PixelBuffer> {
@@ -492,7 +504,7 @@ mod tests {
         assert_eq!(pixels.height, height);
         assert_eq!(pixels.bands, bands);
         assert_eq!(pixels.pixel_type, PixelType::U8);
-        let expected_bytes = (width as usize) * (height as usize) * (bands as usize) * 1;
+        let expected_bytes = (width as usize) * (height as usize) * (bands as usize);
         assert_eq!(pixels.data.len(), expected_bytes);
     }
 
@@ -528,7 +540,7 @@ mod tests {
         assert_eq!(pixels.width, target_w);
         assert_eq!(pixels.height, target_h);
         assert_eq!(pixels.bands, bands);
-        let expected_bytes = (target_w as usize) * (target_h as usize) * (bands as usize) * 1;
+        let expected_bytes = (target_w as usize) * (target_h as usize) * (bands as usize);
         assert_eq!(pixels.data.len(), expected_bytes);
     }
 

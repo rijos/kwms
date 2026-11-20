@@ -75,6 +75,16 @@ pub(crate) fn vsimem_path(prefix: &str, ext: &str) -> String {
     format!("/vsimem/kwms-{prefix}-{id}.{ext}")
 }
 
+/// Delete a `/vsimem/` file and the `.aux.xml` sidecar GDAL may have
+/// written next to it: setting georeferencing or nodata on a read-only
+/// PNG/JPEG dataset is kept in a PAM sidecar, written when the dataset
+/// closes. Left behind, those sidecars grow memory with every request.
+/// Call after the dataset is closed; errors (file absent) are ignored.
+pub(crate) fn remove_mem_file(path: &str) {
+    let _ = gdal::vsi::unlink_mem_file(path);
+    let _ = gdal::vsi::unlink_mem_file(format!("{path}.aux.xml"));
+}
+
 /// Create an empty MEM dataset.
 pub(crate) fn create_mem(pt: PixelType, width: u32, height: u32, bands: u32) -> Result<Dataset> {
     let driver = DriverManager::get_driver_by_name("MEM").context("MEM driver not available")?;
@@ -387,6 +397,39 @@ pub(crate) fn warp(sources: &[&Dataset], dst: &mut Dataset, opts: &WarpOptions) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Setting georeferencing on a read-only in-memory PNG makes GDAL write
+    /// a PAM `.aux.xml` sidecar on close; `remove_mem_file` removes both.
+    #[test]
+    fn remove_mem_file_also_removes_the_pam_sidecar() {
+        let png = {
+            let mem = create_mem(PixelType::U8, 8, 8, 3).unwrap();
+            let path = vsimem_path("pam-src", "png");
+            let driver = gdal::DriverManager::get_driver_by_name("PNG").unwrap();
+            drop(mem.create_copy(&driver, &path, &Default::default()).unwrap());
+            let bytes = gdal::vsi::get_vsi_mem_file_bytes_owned(&path).unwrap();
+            remove_mem_file(&path);
+            bytes
+        };
+        let path = vsimem_path("pam-test", "png");
+        gdal::vsi::create_mem_file(&path, png).unwrap();
+        let mut ds = Dataset::open(&path).unwrap();
+        ds.set_geo_transform(&[0.0, 1.0, 0.0, 8.0, 0.0, -1.0]).unwrap();
+        drop(ds);
+        let sidecar = format!("{path}.aux.xml");
+        let exists = |p: &str| {
+            gdal::vsi::read_dir("/vsimem/", false)
+                .unwrap_or_default()
+                .iter()
+                .any(|f| format!("/vsimem/{}", f.display()) == p)
+        };
+        assert!(
+            exists(&sidecar),
+            "GDAL wrote no sidecar; the test no longer covers the leak"
+        );
+        remove_mem_file(&path);
+        assert!(!exists(&path) && !exists(&sidecar));
+    }
 
     /// 4x4 source, values 1..=16 row-major, one band, georeferenced to the
     /// left half of a 3857 box.

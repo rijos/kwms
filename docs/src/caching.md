@@ -29,7 +29,7 @@ The cache is an ordered stack of **tiers** (`cache.tiers` in `config.yaml`, see 
 Two kinds ship:
 
 - **`memory`**: in-process [`moka`](https://crates.io/crates/moka) cache bounded by total bytes. Not durable.
-- **`store`**: any [`opendal`](https://crates.io/crates/opendal) backend. `backend:` is an [opendal `Scheme`](https://docs.rs/opendal/0.50/opendal/enum.Scheme.html) name and `options:` goes verbatim to [`Operator::via_iter`](https://docs.rs/opendal/0.50/opendal/struct.Operator.html#method.via_iter) (keys per backend: <https://docs.rs/opendal/0.50/opendal/services/>). Compiled in: `fs` (local disk), `azblob` (Azure Blob Storage) and `memory`; others need their opendal `services-*` feature in `Cargo.toml`.
+- **`store`**: any [`opendal`](https://crates.io/crates/opendal) backend. `backend:` is an opendal service name and `options:` goes verbatim to [`Operator::via_iter`](https://docs.rs/opendal/0.59/opendal/struct.Operator.html#method.via_iter) (keys per backend: <https://docs.rs/opendal/0.59/opendal/services/>). Compiled in: `fs` (local disk), `azblob` (Azure Blob Storage) and `memory`; others need their opendal `services-*` feature in `Cargo.toml`.
 
 `cache::LayeredCache` composes them:
 
@@ -41,7 +41,7 @@ The default is `memory` (512 MB) over `store`/`fs` (`/var/cache/kwms`). A typica
 
 ### Layout: one prefix per layer
 
-Durable tiers store each tile as one object, plus a small `.meta` JSON sidecar holding its render time (the TTL check):
+Durable tiers store each tile as one object, plus a small `.meta` JSON sidecar holding its render time (Unix seconds, UTC; the TTL check) and its render fingerprint (see *Invalidation*):
 
 ```text
 <root>/<layer>/<epsg>/<format>/<z>/<x>/<y>.<ext>
@@ -54,7 +54,10 @@ Durable tiers store each tile as one object, plus a small `.meta` JSON sidecar h
 - **Names.** Layer and custom-grid names must be plain path segments (`A-Z a-z 0-9 _ - .`, not starting with `.`); config validation enforces it.
 - **Stability.** Paths contain no hashes, so they stay the same across kwms builds and Rust versions.
 
-Renaming a layer starts it with an empty cache. Changing a custom grid's definition under the same name requires clearing `<layer>/<epsg>/` yourself.
+Renaming a layer starts it with an empty cache. Changing a layer's render settings (sources, mask, grids, encoder settings) keeps the paths; the next `kwms cache update` replaces the affected tiles (see *Invalidation*).
+
+- **Atomic writes.** A tile is complete or absent, never partly written. Azure Blob writes are atomic per object. The `fs` backend writes each object to a temporary file in `<root>/.kwms-tmp/` and renames it into place (opendal's `atomic_write_dir`, set automatically; same file system, so the rename is atomic). The data is written before its sidecar, so a reader never sees a sidecar without its data.
+- **Timestamps from the future** (past now plus 60 s of clock skew) are not trusted: such a tile counts as expired. Otherwise it would never expire, and `cache update` would never replace it.
 
 ### Tier health
 
@@ -141,6 +144,8 @@ GDAL's own worker threads inherit the `gdal-pool` name, so that group covers all
 ## Invalidation
 
 TTL per layer (and optionally per level rule). Expired entries are treated as misses and re-rendered. No source-mtime checks (too expensive on remote sources), no manual purge endpoint in v1 — operators wanting forced invalidation drop the TTL or clear the backend out-of-band.
+
+**Settings changes are applied by a cache build, not while serving** (a deliberate trade-off). Every stored tile records a fingerprint of what decided its pixels (`pipeline::fingerprint`): the layer's sources and open options, resampling, nodata, grids (with custom grid definitions), effective encoder settings, the *contents* of its `source_mask` file, and a render revision kwms bumps when it renders the same settings differently. `kwms cache update` treats a tile with another fingerprint (or none) as stale and renders it again. Serving ignores the fingerprint: after changing, say, the mask, the old tiles stay in use until the next update or their TTL, so a deploy never triggers a re-render storm. Titles, abstracts, cache and `Cache-Control` settings are not part of the fingerprint.
 
 ## Stampede protection
 

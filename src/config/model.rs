@@ -378,6 +378,74 @@ pub struct ServerConfig {
     #[serde(default = "default_render_queue_timeout", with = "humantime_serde")]
     #[schemars(with = "String")]
     pub render_queue_timeout: Duration,
+    /// Limit on one HTTP request to a source's object store while serving
+    /// (connect + transfer). A stalled connection fails after this instead
+    /// of holding a source worker forever. Must be below `request_timeout`.
+    /// `kwms cache update` has no limit.
+    #[serde(default = "default_source_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub source_timeout: Duration,
+    /// Threads one tile-index read may use while serving (GDAL's GTI reads
+    /// the files under a request in parallel). `kwms cache update` uses all
+    /// CPUs.
+    #[serde(default = "default_tile_index_threads")]
+    pub tile_index_threads: usize,
+    /// Time a client gets to send a request's headers, and the longest an
+    /// idle keep-alive connection is kept open. Defends against slow-header
+    /// ("slowloris") clients.
+    #[serde(default = "default_header_read_timeout", with = "humantime_serde")]
+    #[schemars(with = "String")]
+    pub header_read_timeout: Duration,
+    /// Open client connections at once; further connections wait in the
+    /// listen backlog until one closes.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// `Cache-Control` response headers (see [`CacheControlConfig`]).
+    #[serde(default)]
+    pub cache_control: CacheControlConfig,
+}
+
+/// `Cache-Control` values kwms sends. Error responses (including WMS
+/// exceptions, which are HTTP 200) always get `no-store`, whatever is set
+/// here, so a shared cache never keeps a transient failure. An empty string
+/// sends no header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CacheControlConfig {
+    /// Tiles (WMTS, TMS) and WMS GetMap images. A layer can override it.
+    #[serde(default = "default_cache_control_images")]
+    pub images: String,
+    /// Capabilities and other metadata documents.
+    #[serde(default = "default_cache_control_capabilities")]
+    pub capabilities: String,
+}
+
+impl Default for CacheControlConfig {
+    fn default() -> Self {
+        Self {
+            images: default_cache_control_images(),
+            capabilities: default_cache_control_capabilities(),
+        }
+    }
+}
+
+fn default_cache_control_images() -> String {
+    "public, max-age=86400".into()
+}
+fn default_cache_control_capabilities() -> String {
+    "public, max-age=3600".into()
+}
+fn default_source_timeout() -> Duration {
+    Duration::from_secs(20)
+}
+fn default_tile_index_threads() -> usize {
+    4
+}
+fn default_header_read_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_max_connections() -> usize {
+    4096
 }
 
 impl Default for ServerConfig {
@@ -392,6 +460,11 @@ impl Default for ServerConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             render_concurrency: None,
             render_queue_timeout: default_render_queue_timeout(),
+            source_timeout: default_source_timeout(),
+            tile_index_threads: default_tile_index_threads(),
+            header_read_timeout: default_header_read_timeout(),
+            max_connections: default_max_connections(),
+            cache_control: CacheControlConfig::default(),
         }
     }
 }
@@ -408,7 +481,9 @@ fn default_bind() -> String {
     "0.0.0.0:8080".into()
 }
 fn default_metrics_bind() -> Option<String> {
-    Some("0.0.0.0:9091".into())
+    // Loopback: scraped by a sidecar (Istio metrics merging) or a local
+    // agent, never exposed by accident.
+    Some("127.0.0.1:9091".into())
 }
 fn default_request_timeout() -> Duration {
     Duration::from_secs(30)
@@ -495,10 +570,10 @@ fn default_memory_max() -> String {
 
 /// A storage-backend tier — delegated to opendal.
 ///
-/// `backend` is an [`opendal::Scheme`] name compiled into kwms (`fs`,
+/// `backend` is an opendal service name compiled into kwms (`fs`,
 /// `azblob`, `memory`). `options` is passed verbatim to
 /// [`opendal::Operator::via_iter`]; per-backend keys:
-/// <https://docs.rs/opendal/0.50/opendal/services/index.html>.
+/// <https://docs.rs/opendal/0.59/opendal/services/index.html>.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StoreTierConfig {
@@ -615,6 +690,11 @@ pub struct LayerConfig {
     /// `output_formats` for the formats listed.
     #[serde(default)]
     pub output_formats: LayerOutputFormats,
+    /// `Cache-Control` for this layer's images, replacing
+    /// `server.cache_control.images` (e.g. `no-cache` for a layer that
+    /// changes often). Empty: no header.
+    #[serde(default)]
+    pub cache_control: Option<String>,
 }
 
 impl LayerConfig {

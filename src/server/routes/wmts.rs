@@ -16,6 +16,7 @@ use crate::protocol::error::OgcError;
 use crate::protocol::wmts::exception;
 use crate::protocol::wmts::request::{parse_kvp, parse_rest, WmtsRequest};
 use crate::protocol::wmts::validate::{validate, WmtsQuery};
+use crate::server::middleware::cache_control::cacheable;
 use crate::server::middleware::request_id::RequestId;
 use crate::server::routes::{error_reply, with_retry_after};
 use crate::server::AppState;
@@ -45,14 +46,20 @@ async fn serve(app: &AppState, parsed: Result<WmtsRequest, OgcError>, rid: &Requ
     };
     match query {
         // Rendered once at startup (see `server::state::Documents`).
-        WmtsQuery::GetCapabilities => xml_response(app.documents.wmts.clone(), StatusCode::OK),
+        WmtsQuery::GetCapabilities => cacheable(
+            xml_response(app.documents.wmts.clone(), StatusCode::OK),
+            app.cache_control.capabilities(),
+        ),
         WmtsQuery::GetTile(tile) => match render_tile(&app.renderer, &tile).await {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, tile.format().mime_type())],
-                bytes,
-            )
-                .into_response(),
+            Ok(bytes) => cacheable(
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, tile.format().mime_type())],
+                    bytes,
+                )
+                    .into_response(),
+                app.cache_control.image(&tile.layer().config().name),
+            ),
             Err(e) => pipeline_error(&e, "GetTile", rid),
         },
     }

@@ -12,6 +12,20 @@ server:
   # and clients such as QGIS follow those links. Override per environment
   # with KWMS_SERVER__PUBLIC_URL.
   public_url: http://localhost:8080
+  # Logs: JSON lines on stdout. RUST_LOG, when set, wins.
+  log_level: info
+  # Tiles and GetMap images may be cached by clients/CDNs for a day,
+  # capabilities for an hour; errors always get `no-store`.
+  cache_control:
+    images: "public, max-age=86400"
+    capabilities: "public, max-age=3600"
+  # Behind Istio: keep /metrics on loopback (metrics merging scrapes it),
+  # and set the DestinationRule idleTimeout below header_read_timeout.
+  metrics_bind: 127.0.0.1:9091
+  header_read_timeout: 10s
+  # A stalled Azure connection fails after this while serving
+  # (`kwms cache update` has no limit).
+  source_timeout: 20s
 
 # ---- capabilities: published like PDOK's luchtfotorgb WMTS ----
 # https://service.pdok.nl/hwh/luchtfotorgb/wmts/v1_0?request=GetCapabilities
@@ -147,4 +161,16 @@ layers:
         credentials: open_tiles
         # The tiles live in the bucket, not at the URI, so say where the
         # credentials apply.
+        credentials_prefix: /vsiaz/open-tiles/
+  - name: 2025_orthoHR
+    title: "Luchtfoto 2025 Ortho 5 en 8cm RGB"
+    abstract: "Landsdekkende dataset in 8cm resolutie kleuren luchtfoto's van 2025"
+    metadata_url: "https://www.nationaalgeoregister.nl/geonetwork/srv/dut/xml.metadata.get?uuid=bc9b2d88-9d6b-46c9-ad0e-23f0b7da657c"
+    grids: [rd_new_quad, webmercator, nl_4258, nl_4326, nl_25831, nl_25832]
+    formats: [jpeg, png]
+    sources:
+      # Same layout as 2026: data/2025_orthoHR/tiles.shp is a copy of
+      # /vsiaz/open-tiles/2025hrrgb/tiles.shp (498 COGs of 10x10 km).
+      - uri: "GTI:data/2025_orthoHR/tiles.shp"
+        credentials: open_tiles
         credentials_prefix: /vsiaz/open-tiles/

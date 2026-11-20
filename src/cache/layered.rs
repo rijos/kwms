@@ -141,7 +141,7 @@ fn tier_error(tier: &dyn CacheTier, op: &'static str, key: &TileKey, e: &anyhow:
         op,
         layer = %key.layer,
         path = %key.as_path(),
-        error = %format_args!("{e:#}"),
+        error = %crate::redact::secrets(&format!("{e:#}")),
         "cache tier error; serving without it"
     );
 }
@@ -270,7 +270,11 @@ impl LayeredCache {
     /// durable tiers missing it (keeping its render time), so the tile need
     /// not be rendered again. Errors are returned, not degraded: an update
     /// must not report tiles as cached when a backend failed.
-    pub async fn durable_fresh(&self, key: &TileKey, ttl: Duration) -> Result<bool> {
+    ///
+    /// A copy rendered with other settings (`render` fingerprint differs,
+    /// or was never recorded) doesn't count: changing a layer's sources,
+    /// mask, grids or encoding takes effect at the next update.
+    pub async fn durable_fresh(&self, key: &TileKey, ttl: Duration, render: Option<&str>) -> Result<bool> {
         let mut found: Option<Entry> = None;
         let mut missing = Vec::new();
         for tier in self.tiers.iter().filter(|t| t.durable()) {
@@ -278,6 +282,7 @@ impl LayeredCache {
                 .get(key, ttl)
                 .await
                 .with_context(|| format!("cache tier {}: read", tier.name()))?
+                .filter(|e| render.is_none() || e.render.as_deref() == render)
             {
                 Some(entry) => found = found.or(Some(entry)),
                 None => missing.push(tier),
@@ -294,8 +299,11 @@ impl LayeredCache {
 
     /// For `kwms cache update`: write a freshly rendered tile to every
     /// durable tier, errors returned (see [`Self::durable_fresh`]).
-    pub async fn store_durable(&self, key: &TileKey, bytes: Bytes) -> Result<()> {
-        let entry = Entry::now(bytes);
+    pub async fn store_durable(&self, key: &TileKey, bytes: Bytes, render: Option<String>) -> Result<()> {
+        let entry = Entry {
+            render,
+            ..Entry::now(bytes)
+        };
         for tier in self.tiers.iter().filter(|t| t.durable()) {
             tier.put(key, entry.clone())
                 .await
@@ -410,9 +418,7 @@ mod tests {
 
     fn fs_tier(dir: &std::path::Path) -> Arc<StoreTier> {
         Arc::new(StoreTier::new(
-            Operator::new(services::Fs::default().root(&dir.to_string_lossy()))
-                .unwrap()
-                .finish(),
+            Operator::new(services::Fs::default().root(&dir.to_string_lossy())).unwrap(),
         ))
     }
 
@@ -448,6 +454,7 @@ mod tests {
         let old = Entry {
             bytes: Bytes::from_static(b"v"),
             written_at: Entry::now(Bytes::new()).written_at - 30,
+            render: None,
         };
         bottom.put(&k, old.clone()).await.unwrap();
         assert_eq!(cache.get(&k, ttl).await.unwrap(), Some(Bytes::from_static(b"v")));
@@ -517,14 +524,17 @@ mod tests {
         let (mid, bottom) = (fs_tier(d1.path()), fs_tier(d2.path()));
         let cache = LayeredCache::from_tiers(vec![Arc::new(MemoryTier::new(1 << 20)), mid.clone(), bottom.clone()]);
         let ttl = Duration::from_secs(60);
-        assert!(!cache.durable_fresh(&key("x"), ttl).await.unwrap());
+        assert!(!cache.durable_fresh(&key("x"), ttl, None).await.unwrap());
         bottom
             .put(&key("x"), Entry::now(Bytes::from_static(b"x")))
             .await
             .unwrap();
-        assert!(cache.durable_fresh(&key("x"), ttl).await.unwrap());
+        assert!(cache.durable_fresh(&key("x"), ttl, None).await.unwrap());
         assert!(mid.get(&key("x"), ttl).await.unwrap().is_some());
-        cache.store_durable(&key("y"), Bytes::from_static(b"y")).await.unwrap();
+        cache
+            .store_durable(&key("y"), Bytes::from_static(b"y"), None)
+            .await
+            .unwrap();
         assert!(
             mid.get(&key("y"), ttl).await.unwrap().is_some() && bottom.get(&key("y"), ttl).await.unwrap().is_some()
         );

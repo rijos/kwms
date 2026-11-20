@@ -63,7 +63,17 @@ pub struct Renderer {
     /// Encoder settings per layer (`output_formats`, global with the
     /// layer's overrides). A layer not listed uses kwms's defaults.
     encoding: HashMap<String, crate::config::OutputFormatsConfig>,
+    /// Render-settings fingerprint per layer (see [`super::fingerprint`]),
+    /// stored with durably cached tiles by `kwms cache update`.
+    fingerprints: HashMap<String, String>,
+    /// Encoded fill images (no data anywhere), by layer, format and size:
+    /// identical for every box outside the data, so encoded once. GeoTIFF
+    /// isn't kept (it carries its box). Bounded: cleared when full.
+    fills: std::sync::Mutex<HashMap<(String, OutputFormat, u32, u32), Bytes>>,
 }
+
+/// Most fill images kept by [`Renderer`].
+const MAX_FILL_IMAGES: usize = 256;
 
 /// Coverage areas of one layer in one CRS.
 type CoverageParts = Arc<Vec<Area>>;
@@ -106,6 +116,8 @@ impl Renderer {
             masks: HashMap::new(),
             coverage_parts: std::sync::Mutex::new(HashMap::new()),
             encoding: HashMap::new(),
+            fingerprints: HashMap::new(),
+            fills: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -122,6 +134,17 @@ impl Renderer {
     pub fn with_encoding(mut self, encoding: HashMap<String, crate::config::OutputFormatsConfig>) -> Self {
         self.encoding = encoding;
         self
+    }
+
+    /// Set every layer's render-settings fingerprint.
+    pub fn with_fingerprints(mut self, fingerprints: HashMap<String, String>) -> Self {
+        self.fingerprints = fingerprints;
+        self
+    }
+
+    /// `layer`'s render-settings fingerprint, if known.
+    pub fn fingerprint(&self, layer: &str) -> Option<&str> {
+        self.fingerprints.get(layer).map(String::as_str)
     }
 
     /// The encoder options `layer` uses for `format`.
@@ -206,14 +229,49 @@ impl Renderer {
     }
 
     /// Whether a direct read of `bbox` (in `crs`) at `size` from `layer`'s
-    /// source stays within [`read_budget::MAX_DIRECT_READ_PIXELS`]. Request
-    /// sizes are client-chosen, so a source with sparse overviews must not
-    /// turn one GetMap into a huge read; such requests use tiles instead.
-    pub fn direct_read_fits(&self, layer: &LayerConfig, crs: &Crs, bbox: &Bbox, size: (u32, u32)) -> Result<bool> {
+    /// source is cheap enough: it opens at most
+    /// [`read_budget::MAX_DIRECT_READ_FILES`] source files and reads at most
+    /// [`read_budget::MAX_DIRECT_READ_PIXELS`]. Request sizes and boxes are
+    /// client-chosen, so neither a wide box nor a source with sparse
+    /// overviews may turn one GetMap into a huge read; such requests use
+    /// tiles instead. The pixel estimate transforms the box (GDAL/PROJ), so
+    /// it runs on the render pool, not on an async worker.
+    pub async fn direct_read_fits(
+        &self,
+        layer: &LayerConfig,
+        crs: &Crs,
+        bbox: &Bbox,
+        size: (u32, u32),
+    ) -> Result<bool> {
         let Some(source) = layer.sources.first().and_then(|s| self.sources.get(&s.uri)) else {
             return Ok(false);
         };
-        Ok(read_budget::window_read_pixels(source.metadata(), crs, bbox, size)? <= read_budget::MAX_DIRECT_READ_PIXELS)
+        if let Some(files) = source.files_under(crs, bbox).await? {
+            if files > read_budget::MAX_DIRECT_READ_FILES {
+                return Ok(false);
+            }
+        }
+        let (meta, crs, bbox) = (source.metadata().clone(), crs.clone(), *bbox);
+        let pixels = self
+            .cpu
+            .run("read_budget", move || {
+                read_budget::window_read_pixels(&meta, &crs, &bbox, size)
+            })
+            .await?;
+        Ok(pixels <= read_budget::MAX_DIRECT_READ_PIXELS)
+    }
+
+    /// Whether `layer` has any data in `bbox` (in `crs`): the box overlaps
+    /// its source files' footprints and its mask. Where it doesn't, nothing
+    /// is read — the answer is a fill image.
+    pub async fn has_data(&self, layer: &LayerConfig, crs: &Crs, bbox: &Bbox) -> Result<bool> {
+        let parts = self.coverage_parts(layer, crs).await?;
+        let bbox = *bbox;
+        self.cpu
+            .run("coverage_test", move || {
+                crate::source::gdal::mask::any_data(&parts, &bbox)
+            })
+            .await
     }
 
     /// Whether tiles of `level` go to the durable tiers.
@@ -290,7 +348,7 @@ pub(crate) async fn render_grid_tile(
     let bbox = grid.tile_bbox(coord);
     {
         let cov = r.coverage(uri, grid.crs())?;
-        if !intersects(&bbox, cov) {
+        if !intersects(&bbox, cov) || !r.has_data(layer, grid.crs(), &bbox).await? {
             let (w, h) = grid.tile_size();
             return fill_image(r, source.as_ref(), layer, grid.crs(), bbox, (w, h), format).await;
         }
@@ -346,7 +404,7 @@ pub(crate) async fn render_window(
         .sources
         .get(uri)
         .ok_or_else(|| anyhow!("source `{uri}` of layer `{}` is not open", layer.name))?;
-    if !intersects(&bbox, r.coverage(uri, grid.crs())?) {
+    if !intersects(&bbox, r.coverage(uri, grid.crs())?) || !r.has_data(layer, crs, &bbox).await? {
         return fill_image(r, source.as_ref(), layer, crs, bbox, size, format).await;
     }
     let started = std::time::Instant::now();
@@ -406,7 +464,7 @@ pub async fn seed_grid_tile(
         .get(uri)
         .ok_or_else(|| anyhow!("source `{uri}` of layer `{}` is not open", layer.name))?;
     let bbox = grid.tile_bbox(coord);
-    if !intersects(&bbox, r.coverage(uri, grid.crs())?) {
+    if !intersects(&bbox, r.coverage(uri, grid.crs())?) || !r.has_data(layer, grid.crs(), &bbox).await? {
         return Ok(SeedOutcome::Outside);
     }
     let key = TileKey {
@@ -415,14 +473,15 @@ pub async fn seed_grid_tile(
         coord,
         format,
     };
-    if !force && r.cache.durable_fresh(&key, layer.cache.ttl).await? {
+    let render = r.fingerprint(&layer.name);
+    if !force && r.cache.durable_fresh(&key, layer.cache.ttl, render).await? {
         return Ok(SeedOutcome::Fresh);
     }
     let Computed { bytes, store } = compute_tile(r, source, layer, grid, bbox, format).await?;
     if !store {
         return Ok(SeedOutcome::Empty);
     }
-    r.cache.store_durable(&key, bytes).await?;
+    r.cache.store_durable(&key, bytes, render.map(String::from)).await?;
     Ok(SeedOutcome::Stored)
 }
 
@@ -493,8 +552,9 @@ pub(crate) async fn blank_image(
 }
 
 /// An image entirely outside the source: no data in the source's band
-/// layout (transparent in PNG, white in JPEG). Not cached — it costs no
-/// source I/O to produce again.
+/// layout (transparent in PNG, white in JPEG). Never stored in the tile
+/// cache; the encoded bytes are kept in memory per layer, format and size
+/// (`Renderer::fills`), so requests for empty areas cost no encode either.
 ///
 /// The buffer (up to `max_request_pixels` × bands × sample size) is created
 /// inside the render-pool job, so it only exists while the request holds a
@@ -508,11 +568,26 @@ async fn fill_image(
     (w, h): (u32, u32),
     format: OutputFormat,
 ) -> Result<Bytes> {
+    let memo = format != OutputFormat::GeoTiff;
+    let key = (layer.name.clone(), format, w, h);
+    if memo {
+        if let Some(bytes) = r.fills.lock().map_err(|_| anyhow!("fill cache poisoned"))?.get(&key) {
+            return Ok(bytes.clone());
+        }
+    }
     let meta = source.metadata();
     let (bands, pixel_type) = (meta.band_count, meta.pixel_type);
     let make = move || crate::source::gdal::mask::empty_image(w, h, bands, pixel_type);
     let opts = r.encode_opts(layer, format);
-    Ok(encode_on_pool(r, make, crs.clone(), bbox, format, opts).await?.bytes)
+    let bytes = encode_on_pool(r, make, crs.clone(), bbox, format, opts).await?.bytes;
+    if memo {
+        let mut fills = r.fills.lock().map_err(|_| anyhow!("fill cache poisoned"))?;
+        if fills.len() >= MAX_FILL_IMAGES {
+            fills.clear();
+        }
+        fills.insert(key, bytes.clone());
+    }
+    Ok(bytes)
 }
 
 /// An encoded image, and whether every pixel was the fill value.
@@ -689,6 +764,7 @@ mod tests {
             nodata: None,
             source_mask: None,
             output_formats: Default::default(),
+            cache_control: None,
         }
     }
 

@@ -9,7 +9,9 @@ From lowest to highest precedence (later overrides earlier):
 1. **Built-in defaults** — compiled-in defaults for every optional field.
 2. **`config.yaml`** — the main user-facing config: layer definitions, pyramids, cache rules, server bind address, etc. Layer order in this file is significant (it determines GetCapabilities order).
 3. **`secrets.yaml`** — credentials only (per-source GDAL credentials, cache store credentials, any future API keys). Separated so it can live outside source control / in a different secrets store.
-4. **Environment variables** — prefix `KWMS_`, double-underscore for nesting (e.g. `KWMS_SERVER__BIND=0.0.0.0:8080`).
+4. **Environment variables** — prefix `KWMS_`, double-underscore for nesting (e.g. `KWMS_SERVER__BIND=0.0.0.0:8080`). Only variables whose first key is a top-level section (`server`, `cache`, `layers`, …) count; others are ignored and logged by name. So the `KWMS_PORT`, `KWMS_SERVICE_HOST`, … that Kubernetes injects for a Service named `kwms` don't stop kwms from starting. Names and values must be UTF-8.
+
+Config errors name the field and the problem but never quote the offending value: secrets.yaml, environment overrides and inline store options carry credentials.
 5. **CLI flags** — explicit overrides for the most common knobs (bind address, config path, log level). Not every field is exposed as a flag.
 
 ## Merge semantics
@@ -43,9 +45,20 @@ server:
                                          # them); absolute http(s), no query. Default: none =
                                          # server-relative links (/wms, /wmts/…)
   max_request_pixels: [2500, 2500]   # WMS GetMap dimension cap (matches PDOK's default)
-  log_level: info
-  metrics_bind: "0.0.0.0:9091"       # /metrics listener; keep it off the public network. null = disabled
+  log_level: info                    # or RUST_LOG-style directives, e.g. "info,gdal=warn,kwms::server=debug".
+                                     # RUST_LOG, when set, wins.
+  metrics_bind: "127.0.0.1:9091"     # /metrics listener (default: loopback, for a sidecar/agent to scrape).
+                                     # null = disabled
   request_timeout: 30s               # per WMS/WMTS/TMS request; exceeded → 503
+  source_timeout: 20s                # one HTTP request to a source's object store while serving; a stalled
+                                     # connection fails after this. Below request_timeout. (cache update: none)
+  tile_index_threads: 4              # threads one tile-index (GTI) read may use while serving
+                                     # (cache update: all CPUs)
+  header_read_timeout: 10s           # time to send request headers; also the idle keep-alive limit
+  max_connections: 4096              # open client connections; more wait in the listen backlog
+  cache_control:                     # Cache-Control headers; errors always get no-store. "" = no header
+    images: "public, max-age=86400"  # tiles and GetMap images (a layer's `cache_control` replaces it)
+    capabilities: "public, max-age=3600"
   max_concurrent_requests: 512       # in-flight protocol requests; excess shed with 429
   # render_concurrency: 8            # parallel encode/composite jobs; default = CPU count
   render_queue_timeout: 5s           # max wait for a render slot before 429
@@ -69,7 +82,7 @@ cache:
     - type: store                    # an opendal storage backend
       # `backend` is an opendal Scheme name; `options` is handed verbatim to
       # Operator::via_iter. Per-backend keys:
-      # https://docs.rs/opendal/0.50/opendal/services/
+      # https://docs.rs/opendal/0.59/opendal/services/
       # Compiled in: `fs`, `azblob`, `memory` (in-process; not durable).
       # Others (s3, gcs, redis, …) need their `services-*` opendal feature
       # in Cargo.toml.
@@ -198,6 +211,7 @@ layers:
     nodata: null                     # override source NoData; null = inherit from source
     # source_mask: data/other_mask.gpkg  # this layer's mask (overrides the global one); `none` = no mask
     # output_formats: { jpeg: { quality: 92 } }  # this layer's encoder settings for the listed formats
+    # cache_control: "public, max-age=300"       # replaces server.cache_control.images for this layer
 ```
 
 ### `secrets.yaml` — credentials only

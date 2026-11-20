@@ -86,8 +86,7 @@ struct Job {
     reason: String,
 }
 
-pub async fn run(args: Args) -> Result<()> {
-    init_tracing();
+pub async fn run(args: Args, logging: &crate::logging::Logging) -> Result<()> {
     crate::crs::disable_proj_network()?;
     if args.concurrency == 0 {
         bail!("--concurrency must be at least 1");
@@ -99,6 +98,9 @@ pub async fn run(args: Args) -> Result<()> {
             args.secrets.display()
         )
     })?;
+    logging.apply(&config.server.log_level)?;
+    // No HTTP timeouts and all CPUs: coarse tiles read many files.
+    crate::source::gdal::runtime::configure(&crate::source::gdal::runtime::GdalRuntime::batch())?;
     let state = Arc::new(AppState::new(config, secrets).context("opening sources and cache")?);
     let cache = &state.renderer.cache;
     if !cache.has_durable_tier() {
@@ -110,7 +112,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let jobs = plan(&state, &args)?;
     let total: u64 = jobs.iter().flat_map(|j| &j.levels).map(|r| r.count).sum();
-    println!("cache tiers: {}", cache.describe().join(" -> "));
+    tracing::info!(tiers = ?cache.describe(), "cache update plan");
     for job in &jobs {
         let (lo, hi) = (job.levels.first().map(|r| r.level), job.levels.last().map(|r| r.level));
         let levels = match (lo, hi) {
@@ -118,9 +120,9 @@ pub async fn run(args: Args) -> Result<()> {
             _ => "no levels".into(),
         };
         let count: u64 = job.levels.iter().map(|r| r.count).sum();
-        println!("  {}  {levels}  {count} tiles  ({})", job_name(job), job.reason);
+        tracing::info!(job = %job_name(job), levels = %levels, tiles = count, reason = %job.reason, "planned");
     }
-    println!("total: {total} tiles");
+    tracing::info!(tiles = total, dry_run = args.dry_run, "planned in total");
     if total > args.max_tiles {
         bail!(
             "{total} tiles exceeds --max-tiles {}; narrow the levels or raise the limit",
@@ -138,36 +140,36 @@ pub async fn run(args: Args) -> Result<()> {
     for job in &jobs {
         for range in &job.levels {
             let counts = run_level(&state, job, *range, &args, &mut failures).await;
-            println!(
-                "  {} level {}: {} tiles: {} stored, {} fresh, {} empty, {} outside, {} failed ({:.1}s)",
-                job_name(job),
-                range.level,
-                range.count,
-                counts.stored,
-                counts.fresh,
-                counts.empty,
-                counts.outside,
-                counts.failed,
-                counts.elapsed.as_secs_f64()
+            tracing::info!(
+                job = %job_name(job),
+                level = range.level,
+                tiles = range.count,
+                stored = counts.stored,
+                fresh = counts.fresh,
+                empty = counts.empty,
+                outside = counts.outside,
+                failed = counts.failed,
+                secs = counts.elapsed.as_secs_f64(),
+                "level done"
             );
             sums.add(&counts);
         }
     }
-    println!(
-        "done in {:.0}s: {} stored, {} fresh, {} empty, {} outside, {} failed",
-        started.elapsed().as_secs_f64(),
-        sums.stored,
-        sums.fresh,
-        sums.empty,
-        sums.outside,
-        sums.failed
+    tracing::info!(
+        secs = started.elapsed().as_secs_f64(),
+        stored = sums.stored,
+        fresh = sums.fresh,
+        empty = sums.empty,
+        outside = sums.outside,
+        failed = sums.failed,
+        "cache update done"
     );
     if !failures.is_empty() {
         for f in failures.iter().take(10) {
-            eprintln!("  failed: {f}");
+            tracing::error!(failure = %crate::redact::secrets(f), "tile failed");
         }
         if failures.len() > 10 {
-            eprintln!("  … and {} more", failures.len().saturating_sub(10));
+            tracing::error!(more = failures.len().saturating_sub(10), "further tiles failed");
         }
         bail!(
             "{} tile(s) failed; run the same command again to retry just those",
@@ -352,7 +354,7 @@ async fn run_level(
             }
         }
         if last_report.elapsed() >= Duration::from_secs(30) {
-            println!("    … {} level {}: {done}/{}", job_name(job), range.level, range.count);
+            tracing::info!(job = %job_name(job), level = range.level, done, tiles = range.count, "progress");
             last_report = Instant::now();
         }
     }
@@ -399,20 +401,13 @@ async fn seed_with_retries(
         let backoff = Duration::from_secs((2u64 << failed_attempts.min(5)).min(60));
         tracing::warn!(
             tile = %format_args!("{}/{}/{}", coord.z, coord.x, coord.y),
-            error = %format_args!("{err:#}"),
+            error = %crate::redact::secrets(&format!("{err:#}")),
             retry_in_s = backoff.as_secs(),
             "tile failed; retrying"
         );
         failed_attempts = failed_attempts.saturating_add(1);
         tokio::time::sleep(backoff).await;
     }
-}
-
-/// Human-readable warnings on stderr (the progress report goes to stdout).
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
 }
 
 #[cfg(test)]

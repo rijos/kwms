@@ -66,6 +66,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // dropped connection, and is logged. Inside request-id/metrics/trace
         // so those still see the response.
         .layer(CatchPanicLayer::custom(panic_response))
+        // Outside the panic and overload layers, so their replies get
+        // `no-store` too.
+        .layer(axum::middleware::from_fn(middleware::cache_control::middleware))
         .layer(axum::middleware::from_fn(middleware::request_id::middleware))
         .layer(axum::middleware::from_fn(middleware::metrics::middleware))
         .layer(middleware::tracing::layer())
@@ -199,6 +202,7 @@ mod tests {
             nodata: None,
             source_mask: None,
             output_formats: Default::default(),
+            cache_control: None,
         }
     }
 
@@ -388,7 +392,7 @@ mod tests {
                 .unwrap();
             let echoed = resp.headers().get("x-request-id").unwrap().to_str().unwrap();
             assert_ne!(echoed, bad);
-            assert_eq!(echoed.len(), 16, "fresh hex id expected, got {echoed}");
+            assert_eq!(echoed.len(), 32, "fresh random hex id expected, got {echoed}");
             assert!(echoed.bytes().all(|b| b.is_ascii_hexdigit()));
         }
     }

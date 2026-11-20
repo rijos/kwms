@@ -5,4 +5,4 @@ docs/book
 # credentials: never commit
 .secret
 secrets.yaml
-cache/
+/cache/

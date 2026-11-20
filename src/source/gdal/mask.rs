@@ -72,18 +72,30 @@ pub fn load(path: &str) -> Result<Area> {
 
 /// A rectangle as an area (a raster's extent: edges trimmed).
 pub fn rectangle(b: &Bbox, crs: &Crs) -> Result<Area> {
-    let wkt = format!(
-        "POLYGON (({x0} {y0}, {x1} {y0}, {x1} {y1}, {x0} {y1}, {x0} {y0}))",
-        x0 = b.minx,
-        y0 = b.miny,
-        x1 = b.maxx,
-        y1 = b.maxy
-    );
     Ok(Area {
-        wkb: Arc::new(Geometry::from_wkt(&wkt)?.wkb()?),
+        wkb: Arc::new(rectangle_geometry(b)?.wkb()?),
         crs: crs.clone(),
         trim_edges: true,
     })
+}
+
+/// `b` as a polygon, built point by point: formatting coordinates into WKT
+/// would fail on values OGR's parser rejects (e.g. subnormals like 5e-324,
+/// which a client can put in a BBOX).
+fn rectangle_geometry(b: &Bbox) -> Result<Geometry> {
+    let mut ring = Geometry::empty(OGRwkbGeometryType::wkbLinearRing)?;
+    for (x, y) in [
+        (b.minx, b.miny),
+        (b.maxx, b.miny),
+        (b.maxx, b.maxy),
+        (b.minx, b.maxy),
+        (b.minx, b.miny),
+    ] {
+        ring.add_point_2d((x, y));
+    }
+    let mut polygon = Geometry::empty(OGRwkbGeometryType::wkbPolygon)?;
+    polygon.add_geometry(ring)?;
+    Ok(polygon)
 }
 
 /// The footprints of a tile index dissolved into one outline (edges
@@ -146,6 +158,25 @@ pub fn reproject(area: &Area, to: &Crs) -> Result<Area> {
         crs: to.clone(),
         trim_edges: area.trim_edges,
     })
+}
+
+/// Whether `bbox` has any area inside every one of `areas` (all in the
+/// bbox's CRS): the source's tile footprints and the layer's mask. `false`
+/// means a read there can only produce fill, so it needn't happen.
+/// Touching only along an edge doesn't count.
+pub fn any_data(areas: &[Area], bbox: &Bbox) -> Result<bool> {
+    let mut inside = rectangle_geometry(bbox)?;
+    for area in areas {
+        let geometry = Geometry::from_wkb(&area.wkb)?;
+        if !inside.intersects(&geometry) {
+            return Ok(false);
+        }
+        inside = match inside.intersection(&geometry) {
+            Some(g) if !g.is_empty() && g.area() > 0.0 => g,
+            _ => return Ok(false),
+        };
+    }
+    Ok(true)
 }
 
 /// One byte per pixel of a `width` x `height` image of `bbox`: 255 where
@@ -265,6 +296,21 @@ pub fn empty_image(width: u32, height: u32, bands: u32, pixel_type: PixelType) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_data_needs_overlap_with_every_area() {
+        let crs = Crs::new("EPSG:28992");
+        let tiles = rectangle(&Bbox::from([0.0, 0.0, 10.0, 10.0]), &crs).unwrap();
+        let mask = rectangle(&Bbox::from([5.0, 0.0, 20.0, 10.0]), &crs).unwrap();
+        let both = [tiles.clone(), mask];
+        assert!(any_data(&both, &Bbox::from([6.0, 1.0, 8.0, 2.0])).unwrap());
+        // In the tiles, outside the mask.
+        assert!(!any_data(&both, &Bbox::from([1.0, 1.0, 4.0, 2.0])).unwrap());
+        // In the mask, outside the tiles.
+        assert!(!any_data(&both, &Bbox::from([12.0, 1.0, 14.0, 2.0])).unwrap());
+        // Touching an edge only.
+        assert!(!any_data(&[tiles], &Bbox::from([10.0, 0.0, 12.0, 2.0])).unwrap());
+    }
 
     fn rd() -> Crs {
         Crs::new("EPSG:28992")

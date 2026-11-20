@@ -19,6 +19,7 @@ use crate::protocol::kvp::Kvp;
 use crate::protocol::wms::exception::{self, service_exception};
 use crate::protocol::wms::request::{parse, WmsRequest, WmsVersion};
 use crate::protocol::wms::validate::{validate, WmsQuery};
+use crate::server::middleware::cache_control::cacheable;
 use crate::server::middleware::request_id::RequestId;
 use crate::server::routes::{error_reply, with_retry_after};
 use crate::server::AppState;
@@ -47,15 +48,21 @@ pub async fn handle(
                 WmsVersion::V1_1_1 => &app.documents.wms_111,
                 WmsVersion::V1_3_0 => &app.documents.wms_130,
             };
-            xml_response(doc.clone(), StatusCode::OK)
+            cacheable(
+                xml_response(doc.clone(), StatusCode::OK),
+                app.cache_control.capabilities(),
+            )
         }
         WmsQuery::GetMap(map) => match serve_get_map(&app.renderer, &map).await {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, map.format().mime_type())],
-                bytes,
-            )
-                .into_response(),
+            Ok(bytes) => cacheable(
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, map.format().mime_type())],
+                    bytes,
+                )
+                    .into_response(),
+                app.cache_control.image(&map.layer().config().name),
+            ),
             Err(e) => pipeline_error(&e, "GetMap", &rid, version),
         },
     }

@@ -124,6 +124,9 @@ fn validate_layer(layer: &LayerConfig, config: &Config) -> Result<()> {
     }
     validate_output_formats(&OutputFormatsConfig::default().with_overrides(&layer.output_formats))
         .context("output_formats")?;
+    if let Some(cc) = &layer.cache_control {
+        validate_cache_control("cache_control", cc)?;
+    }
     for source in &layer.sources {
         for option in &source.open_options {
             match option.split_once('=') {
@@ -268,6 +271,7 @@ fn validate_server(server: &ServerConfig) -> Result<()> {
             bail!("public_url '{url}' must be an absolute http(s) URL without query or fragment, e.g. http://localhost:8080");
         }
     }
+    crate::logging::parse_filter(&server.log_level)?;
     let [w, h] = server.max_request_pixels;
     if w == 0 || h == 0 {
         bail!("max_request_pixels must be positive, got [{w}, {h}]");
@@ -283,6 +287,33 @@ fn validate_server(server: &ServerConfig) -> Result<()> {
     }
     if server.metrics_bind.as_deref() == Some(server.bind.as_str()) {
         bail!("metrics_bind must differ from bind ('{}')", server.bind);
+    }
+    if server.source_timeout < std::time::Duration::from_secs(1) || server.source_timeout >= server.request_timeout {
+        bail!(
+            "source_timeout ({:?}) must be at least 1s and below request_timeout ({:?})",
+            server.source_timeout,
+            server.request_timeout
+        );
+    }
+    if !(1..=256).contains(&server.tile_index_threads) {
+        bail!("tile_index_threads must be between 1 and 256");
+    }
+    if server.header_read_timeout < std::time::Duration::from_secs(1) {
+        bail!("header_read_timeout must be at least 1s");
+    }
+    if server.max_connections == 0 {
+        bail!("max_connections must be positive");
+    }
+    validate_cache_control("server.cache_control.images", &server.cache_control.images)?;
+    validate_cache_control("server.cache_control.capabilities", &server.cache_control.capabilities)?;
+    Ok(())
+}
+
+/// A `Cache-Control` value goes verbatim into a response header: visible
+/// ASCII and spaces only (no CR/LF), or empty for no header.
+pub(crate) fn validate_cache_control(field: &str, value: &str) -> Result<()> {
+    if value.len() > 256 || !value.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
+        bail!("{field} must be a Cache-Control value of visible ASCII (at most 256 characters), e.g. 'public, max-age=3600'");
     }
     Ok(())
 }
@@ -372,6 +403,7 @@ mod tests {
             nodata: None,
             source_mask: None,
             output_formats: Default::default(),
+            cache_control: None,
         }
     }
 

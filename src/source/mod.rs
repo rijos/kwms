@@ -199,6 +199,13 @@ pub trait Source: Send + Sync {
         None
     }
     async fn read_window(&self, req: WindowRequest) -> anyhow::Result<PixelBuffer>;
+
+    /// How many source files a read of `bbox` (in `crs`) opens: for a tile
+    /// index, the tiles whose footprint overlaps it. `None`: a single
+    /// dataset (the default).
+    async fn files_under(&self, _crs: &Crs, _bbox: &Bbox) -> anyhow::Result<Option<usize>> {
+        Ok(None)
+    }
     async fn sample(&self, coord: Coord, crs: Crs) -> anyhow::Result<Vec<PixelValue>>;
 }
 

@@ -140,6 +140,12 @@ fn gdal_overview(meta: &SourceMetadata, ratio: f64) -> (f64, f64) {
 /// [`MAX_SOURCE_READ_PIXELS`].
 pub const MAX_DIRECT_READ_PIXELS: f64 = 4.0 * MAX_SOURCE_READ_PIXELS;
 
+/// Most source files one direct WMS read may open. A request past the
+/// cached pyramid that overlaps more files is composed from tiles instead:
+/// each of those reads at most a few files (tiles there are no larger than
+/// a file, see `cache_levels`) and is kept in memory for the next request.
+pub const MAX_DIRECT_READ_FILES: usize = 4;
+
 /// Source pixels (per band) GDAL reads to render `bbox` (in `crs`) at
 /// `size`, mirroring its overview choice; 0 when the window misses the
 /// source. The ratio of source to output pixels comes from the whole

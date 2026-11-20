@@ -16,6 +16,7 @@ use crate::protocol::error::OgcError;
 use crate::protocol::tms::exception;
 use crate::protocol::tms::request::parse_path;
 use crate::protocol::tms::validate::{validate, TmsQuery};
+use crate::server::middleware::cache_control::cacheable;
 use crate::server::middleware::request_id::RequestId;
 use crate::server::routes::{error_reply, with_retry_after};
 use crate::server::AppState;
@@ -36,18 +37,21 @@ pub async fn handle(
         TmsQuery::TileMap(layer) => app.documents.tms_layers.get(layer.name()).cloned(),
         TmsQuery::GetTile(tile) => {
             return match render_tile(&app.renderer, &tile).await {
-                Ok(bytes) => (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, tile.format().mime_type())],
-                    bytes,
-                )
-                    .into_response(),
+                Ok(bytes) => cacheable(
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, tile.format().mime_type())],
+                        bytes,
+                    )
+                        .into_response(),
+                    app.cache_control.image(&tile.layer().config().name),
+                ),
                 Err(e) => pipeline_error(&e, "GetTile", &rid),
             };
         }
     };
     match doc {
-        Some(xml) => xml_response(xml, StatusCode::OK),
+        Some(xml) => cacheable(xml_response(xml, StatusCode::OK), app.cache_control.capabilities()),
         None => pipeline_error(
             &anyhow::anyhow!("internal: no TileMap document for a catalog layer"),
             "TMS document",

@@ -15,7 +15,7 @@
 //!   call, the memory passed, what is allocated and freed and by whom, its
 //!   side effects and failure behaviour — and every entry has a tag here.
 
-use std::ffi::{c_int, CStr, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::ptr::{self, NonNull};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -71,7 +71,45 @@ pub(crate) fn cpl_error_message() -> Option<String> {
     // buffer for this thread, valid until the next CPL call on this thread;
     // it is copied into a `String` before any other CPL call.
     let text = unsafe { CStr::from_ptr(msg) };
-    Some(text.to_string_lossy().chars().take(MAX_CPL_MESSAGE_CHARS).collect())
+    let text = text.to_string_lossy();
+    Some(
+        crate::redact::secrets(&text)
+            .chars()
+            .take(MAX_CPL_MESSAGE_CHARS)
+            .collect(),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// CPL error handler (GDAL messages -> tracing)
+// ---------------------------------------------------------------------------
+
+/// Route every GDAL message (errors, warnings, debug output) to `handler`
+/// instead of GDAL's default, which prints to stderr. Process-wide; meant to
+/// be called once at startup. The last-error state that
+/// [`cpl_error_message`] reads is kept either way: GDAL records it before
+/// calling the handler.
+pub(crate) fn set_error_handler() {
+    // UNSAFE-AUDIT: F19
+    // SAFETY: `on_gdal_message` is a plain `extern "C"` function with the
+    // signature GDAL expects; it keeps no state, so GDAL may call it from
+    // any thread at once. No user data pointer is registered.
+    unsafe {
+        gdal_sys::CPLSetErrorHandler(Some(on_gdal_message));
+    }
+}
+
+/// Called by GDAL, on whatever thread raised the message.
+extern "C" fn on_gdal_message(class: gdal_sys::CPLErr::Type, number: gdal_sys::CPLErrorNum, msg: *const c_char) {
+    if msg.is_null() {
+        return;
+    }
+    // UNSAFE-AUDIT: F20
+    // SAFETY: `msg` is non-NULL and points to GDAL's NUL-terminated message
+    // for this call, valid until the handler returns; it is copied here.
+    let text = unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned();
+    // Never unwind into C.
+    let _ = std::panic::catch_unwind(|| crate::source::gdal::runtime::log_gdal_message(class, number, &text));
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +149,9 @@ impl Drop for WarpAppOptions {
 
 /// Run `GDALWarp` from `sources` into the existing dataset `dst`.
 pub(crate) fn gdal_warp(sources: &[&Dataset], dst: &mut Dataset, options: &WarpAppOptions) -> Result<()> {
+    // A failure must report its own message, not one left on this pool
+    // thread by an earlier job.
+    cpl_error_reset();
     let mut handles: Vec<gdal_sys::GDALDatasetH> = sources.iter().map(|d| d.c_dataset()).collect();
     if handles.iter().any(|h| h.is_null()) {
         bail!("internal: NULL source dataset handle");

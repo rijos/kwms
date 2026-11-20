@@ -6,13 +6,15 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use gdal::raster::RasterCreationOptions;
-use gdal::vsi::{get_vsi_mem_file_bytes_owned, unlink_mem_file};
+use gdal::vsi::get_vsi_mem_file_bytes_owned;
 use gdal::DriverManager;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::crs::{Bbox, Crs};
-use crate::source::gdal::raster::{bbox_to_geotransform, mem_from_pixel_buffer, set_nodata, vsimem_path};
+use crate::source::gdal::raster::{
+    bbox_to_geotransform, mem_from_pixel_buffer, remove_mem_file, set_nodata, vsimem_path,
+};
 use crate::source::PixelBuffer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -305,14 +307,14 @@ pub fn encode(buffer: &PixelBuffer, georef: Option<&GeoRef>, format: OutputForma
             // Drop the output dataset before reading its bytes, so GDAL flushes
             // any buffered writes to the in-memory file.
             drop(out_ds);
-            let raw = get_vsi_mem_file_bytes_owned(&vsi_path).context("failed to read encoded bytes from /vsimem/")?;
-            // `get_vsi_mem_file_bytes_owned` already frees the underlying buffer,
-            // but the directory entry may linger; explicitly unlink (ignore err).
-            let _ = unlink_mem_file(&vsi_path);
-            Bytes::from(raw)
+            let raw = get_vsi_mem_file_bytes_owned(&vsi_path);
+            // The bytes are copied out; drop the file and any PAM sidecar
+            // (written for nodata on JPEG/WebP).
+            remove_mem_file(&vsi_path);
+            Bytes::from(raw.context("failed to read encoded bytes from /vsimem/")?)
         }
         Err(e) => {
-            let _ = unlink_mem_file(&vsi_path);
+            remove_mem_file(&vsi_path);
             return Err(anyhow!(e))
                 .with_context(|| format!("GDAL CreateCopy failed for driver `{}`", format.gdal_driver()));
         }

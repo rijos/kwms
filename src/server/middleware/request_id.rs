@@ -1,13 +1,13 @@
 //! Request-ID middleware.
 //!
-//! Every request gets an id **we** generate (a monotonic hex counter). That
+//! Every request gets an id **we** generate (128 random bits, hex). That
 //! id is the only one echoed anywhere: the `X-Request-Id` response header,
 //! error bodies, logs. A client-supplied `X-Request-Id` is never echoed; if
 //! it is a plain token (`[A-Za-z0-9._-]{1,64}`) it is kept as the
 //! *upstream* id and logged next to ours, so proxies can still correlate.
 //!
-//! We deliberately avoid pulling in `uuid` / `rand` — a process-local
-//! `AtomicU64` is plenty for log correlation.
+//! Random, not a counter: a sequential id would tell any client how many
+//! requests the server handles and when it restarted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -48,13 +48,20 @@ impl RequestId {
     }
 }
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generate a fresh id. Hex-encoded `AtomicU64` — short, monotonic, and
-/// uniquely identifies a request within a single process lifetime.
+/// A fresh id: 128 bits from the OS random source, as 32 hex digits.
 fn fresh_id() -> String {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{n:016x}")
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        // The OS source doesn't fail on supported platforms; never block a
+        // request on it. Unique enough for log correlation.
+        static FALLBACK: AtomicU64 = AtomicU64::new(0);
+        let n = FALLBACK.fetch_add(1, Ordering::Relaxed);
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        bytes = (t ^ u128::from(n)).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Upstream ids end up in logs, so only plain short tokens are kept.

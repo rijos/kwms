@@ -6,14 +6,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::server::AppState;
 
 /// Run the server with the given config + secrets files. Returns only
 /// when the listener exits (cleanly or with an error).
-pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
-    init_tracing();
+pub async fn run(config_path: PathBuf, secrets_path: PathBuf, logging: &crate::logging::Logging) -> Result<()> {
     // Before anything can run a coordinate transform.
     crate::crs::disable_proj_network()?;
 
@@ -24,6 +22,9 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
             secrets_path.display()
         )
     })?;
+    logging.apply(&config.server.log_level)?;
+    // Before any source is opened.
+    crate::source::gdal::runtime::configure(&crate::source::gdal::runtime::GdalRuntime::serving(&config.server))?;
 
     let bind = config.server.bind.clone();
     let metrics_bind = config.server.metrics_bind.clone();
@@ -32,15 +33,19 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
     let state = Arc::new(AppState::new(config, secrets).context("building application state")?);
     state.renderer.cache.check().await.context("cache is not usable")?;
     tracing::info!(tiers = ?state.renderer.cache.describe(), "cache ready");
+    let limits = Limits {
+        header_read_timeout: state.config.server.header_read_timeout,
+        max_connections: state.config.server.max_connections,
+    };
     let app = crate::server::router(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .with_context(|| format!("binding to `{bind}`"))?;
     let main = async {
-        axum::serve(listener, app)
+        serve_http1(listener, app, limits)
             .await
-            .context("axum serve loop exited with error")
+            .context("HTTP serve loop exited with error")
     };
 
     // `/metrics` lives on its own listener so it can be kept off the
@@ -50,8 +55,12 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
             let metrics_listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .with_context(|| format!("binding metrics listener to `{addr}`"))?;
+            let metrics_limits = Limits {
+                max_connections: 64,
+                ..limits
+            };
             let metrics = async {
-                axum::serve(metrics_listener, crate::server::metrics_router())
+                serve_http1(metrics_listener, crate::server::metrics_router(), metrics_limits)
                     .await
                     .context("metrics serve loop exited with error")
             };
@@ -62,18 +71,56 @@ pub async fn run(config_path: PathBuf, secrets_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Install a JSON-friendly `tracing_subscriber` if one isn't already
-/// installed. We `try_init` so re-entry (e.g. integration tests that boot
-/// the server twice in one process) doesn't panic.
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,kwms=info"))
-        .expect("static env filter parses");
+/// Per-listener connection limits.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Time to receive a request's headers, which is also the longest an
+    /// idle keep-alive connection stays open.
+    pub header_read_timeout: std::time::Duration,
+    /// Connections open at once; more wait in the listen backlog.
+    pub max_connections: usize,
+}
 
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .json()
-        .flatten_event(true)
-        .try_init();
+/// Serve `app` on `listener`: HTTP/1.1 only, with the header-read timeout
+/// enforced (it needs a timer, which `axum::serve` doesn't give hyper, so
+/// there it was silently off) and at most `max_connections` connections.
+/// kwms sits behind a TLS-terminating proxy; HTTP/2 (and cleartext h2c) is
+/// never spoken.
+pub async fn serve_http1(listener: tokio::net::TcpListener, app: axum::Router, limits: Limits) -> Result<()> {
+    use hyper::server::conn::http1;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::service::TowerToHyperService;
+
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    loop {
+        // Wait for a free slot before accepting: excess connections queue in
+        // the kernel's backlog instead of costing a task each.
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("connection limiter closed")?;
+        let (stream, _peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // E.g. out of file descriptors: back off instead of spinning.
+                tracing::warn!(error = %e, "accepting a connection failed");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let service = TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            let connection = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(stream), service);
+            if let Err(e) = connection.await {
+                tracing::debug!(error = %e, "connection ended with an error");
+            }
+        });
+    }
 }

@@ -31,6 +31,8 @@ pub struct AppState {
     /// endpoint needs to answer "is at least one source warmed?" without
     /// poking through the trait.
     pub source_count: usize,
+    /// `Cache-Control` values per layer and for documents.
+    pub cache_control: Arc<crate::server::middleware::cache_control::CacheControl>,
 }
 
 impl AppState {
@@ -129,9 +131,13 @@ impl AppState {
         let renderer = renderer
             .with_cache_limits(limits)
             .with_masks(load_masks(&config)?)
-            .with_encoding(encoding);
+            .with_encoding(encoding)
+            .with_fingerprints(crate::pipeline::fingerprint::layer_fingerprints(&config)?);
         let documents = Documents::build(&config).context("rendering capabilities documents")?;
+        let cache_control = crate::server::middleware::cache_control::CacheControl::from_config(&config)
+            .context("server.cache_control")?;
         Ok(Self {
+            cache_control: Arc::new(cache_control),
             config: Arc::new(config),
             catalog: Arc::new(catalog),
             renderer: Arc::new(renderer),

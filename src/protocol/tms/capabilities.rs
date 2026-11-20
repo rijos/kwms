@@ -89,7 +89,7 @@ pub fn generate_service_metadata(config: &Config, base_url: &str) -> Result<Stri
         .context("end TileMapService")?;
 
     let bytes = writer.into_inner();
-    Ok(String::from_utf8(bytes).context("TMS service metadata not valid UTF-8")?)
+    String::from_utf8(bytes).context("TMS service metadata not valid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +200,7 @@ pub fn generate_tile_map(layer: &LayerConfig, config: &Config, base_url: &str) -
         .context("end TileMap")?;
 
     let bytes = writer.into_inner();
-    Ok(String::from_utf8(bytes).context("TMS TileMap not valid UTF-8")?)
+    String::from_utf8(bytes).context("TMS TileMap not valid UTF-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +256,7 @@ mod tests {
             nodata: None,
             source_mask: None,
             output_formats: Default::default(),
+            cache_control: None,
         }
     }
 

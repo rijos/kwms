@@ -91,9 +91,14 @@ enum ConfigCommand {
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    use crate::logging::{init, Console};
     let cli = Cli::parse();
+    let logging = init(match cli.command {
+        Command::Serve { .. } | Command::Cache(_) => Console::Stdout,
+        Command::Config(_) => Console::Stderr,
+    });
     match cli.command {
-        Command::Serve { config, secrets } => crate::subcommand::serve::run(config, secrets).await,
+        Command::Serve { config, secrets } => crate::subcommand::serve::run(config, secrets, &logging).await,
         Command::Config(ConfigCommand::Check { config, secrets }) => {
             crate::subcommand::config_check::run(config, secrets)
         }
@@ -113,21 +118,24 @@ pub async fn run() -> anyhow::Result<()> {
             retries,
             max_tiles,
         }) => {
-            crate::subcommand::cache_update::run(crate::subcommand::cache_update::Args {
-                config,
-                secrets,
-                layers,
-                grids,
-                formats,
-                min_level,
-                max_level,
-                force,
-                dry_run,
-                concurrency,
-                tile_timeout,
-                retries,
-                max_tiles,
-            })
+            crate::subcommand::cache_update::run(
+                crate::subcommand::cache_update::Args {
+                    config,
+                    secrets,
+                    layers,
+                    grids,
+                    formats,
+                    min_level,
+                    max_level,
+                    force,
+                    dry_run,
+                    concurrency,
+                    tile_timeout,
+                    retries,
+                    max_tiles,
+                },
+                &logging,
+            )
             .await
         }
     }

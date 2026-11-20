@@ -47,13 +47,18 @@ pub fn load(config_path: &Path, secrets_path: &Path) -> Result<(Config, Secrets)
     };
 
     // -- env-var overrides (config side only) --
-    let env_overlay = env_overlay_value()?;
+    let env_overlay = env_overlay_value(std::env::vars_os())?;
     let config_value = merge(config_value, env_overlay).context("applying KWMS_* env-var overrides")?;
 
     // -- deserialize into typed structs --
+    // serde echoes offending values ("invalid type: string \"sv=…\""), and
+    // secrets.yaml, env overrides and inline store options hold credentials:
+    // errors keep the field path and the problem, not the value.
     let config: Config = serde_yaml::from_value(config_value)
+        .map_err(|e| anyhow::anyhow!(without_values(&e.to_string())))
         .with_context(|| format!("validating shape of '{}'", config_path.display()))?;
     let secrets: Secrets = serde_yaml::from_value(secrets_value)
+        .map_err(|e| anyhow::anyhow!(without_values(&e.to_string())))
         .with_context(|| format!("validating shape of '{}'", secrets_path.display()))?;
 
     validate(&config).context("config validation failed")?;
@@ -80,9 +85,16 @@ pub fn load(config_path: &Path, secrets_path: &Path) -> Result<(Config, Secrets)
 }
 
 /// Build a `Value::Mapping` from `KWMS_*` env vars, with `__` denoting nesting.
-fn env_overlay_value() -> Result<Value> {
+///
+/// Only variables whose first key is a top-level config section count:
+/// Kubernetes injects `KWMS_PORT`, `KWMS_SERVICE_HOST`, … into every pod of
+/// a namespace with a Service named `kwms`; those are skipped (logged by
+/// name only). Names and values must be UTF-8.
+fn env_overlay_value(vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>) -> Result<Value> {
+    let sections = config_sections();
     let mut overlay = Value::Mapping(Mapping::new());
-    for (k, v) in std::env::vars() {
+    for (k, v) in vars {
+        let Some(k) = k.to_str() else { continue };
         let Some(suffix) = k.strip_prefix("KWMS_") else {
             continue;
         };
@@ -94,14 +106,62 @@ fn env_overlay_value() -> Result<Value> {
             // Skip pathologically formed names like `KWMS___FOO`.
             continue;
         }
-        let parsed_value: Value = serde_yaml::from_str(&v).with_context(|| {
-            // Don't echo the value: env vars routinely carry secrets.
-            format!("parsing env-var '{k}' value as YAML scalar")
-        })?;
+        if !path.first().is_some_and(|s| sections.contains(s)) {
+            tracing::info!(var = %k, "ignoring env var: not a config override (KWMS_<SECTION>__<KEY>)");
+            continue;
+        }
+        // Don't echo the value: env vars routinely carry secrets.
+        let v = v
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("env-var '{k}' is not valid UTF-8"))?;
+        let parsed_value: Value =
+            serde_yaml::from_str(v).with_context(|| format!("parsing env-var '{k}' value as YAML scalar"))?;
         let nested = nest(&path, parsed_value);
         overlay = merge(overlay, nested)?;
     }
     Ok(overlay)
+}
+
+/// Top-level keys of `config.yaml` (from the config schema).
+fn config_sections() -> Vec<String> {
+    let schema = schemars::schema_for!(Config);
+    schema
+        .schema
+        .object
+        .map(|o| o.properties.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// A serde error message without the values it quotes: `invalid type:
+/// string "abc", expected …` → `invalid type: string <value>, expected …`.
+/// Field and variant names (in backticks after "field"/"variant") stay.
+fn without_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(i) = rest.find(['"', '`']) {
+        let quote = rest[i..].chars().next().unwrap_or('"');
+        let before = &rest[..i];
+        let after = &rest[i.saturating_add(1)..];
+        let Some(end) = after.find(quote) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(before);
+        let keeps_name = ["field ", "variant ", "fields ", "variants ", "of "]
+            .iter()
+            .any(|w| before.ends_with(w))
+            || before.ends_with(", ");
+        if quote == '`' && keeps_name {
+            out.push('`');
+            out.push_str(&after[..end]);
+            out.push('`');
+        } else {
+            out.push_str("<value>");
+        }
+        rest = &after[end.saturating_add(1)..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Wrap `value` in nested mappings keyed by `path`.
@@ -269,8 +329,74 @@ layers:
         // We can't guarantee absence of pre-existing KWMS_* vars in the
         // ambient env, but the helper itself should at minimum produce a
         // mapping (never error in a clean state).
-        let v = env_overlay_value().expect("overlay");
-        assert!(matches!(v, Value::Mapping(_)));
+        let v = env_overlay_value(std::iter::empty()).expect("overlay");
+        assert_eq!(v, Value::Mapping(Mapping::new()));
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.into(), v.into()))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    /// What Kubernetes injects for a Service named `kwms` is ignored; real
+    /// overrides still apply.
+    #[test]
+    fn kubernetes_service_links_are_ignored() {
+        let v = env_overlay_value(vars(&[
+            ("KWMS_PORT", "tcp://10.0.0.1:8080"),
+            ("KWMS_PORT_8080_TCP_ADDR", "10.0.0.1"),
+            ("KWMS_SERVICE_HOST", "10.0.0.1"),
+            ("KWMS_SERVICE_PORT_HTTP", "8080"),
+            ("KWMS_SERVER__BIND", "127.0.0.1:9000"),
+            ("OTHER", "x"),
+        ]))
+        .unwrap();
+        let expected: Value = serde_yaml::from_str("server:\n  bind: 127.0.0.1:9000\n").unwrap();
+        assert_eq!(v, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_override_is_an_error_without_its_value() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![b's', 0xff, b'x']);
+        let err = env_overlay_value(std::iter::once(("KWMS_SERVER__BIND".into(), bad))).unwrap_err();
+        assert_eq!(err.to_string(), "env-var 'KWMS_SERVER__BIND' is not valid UTF-8");
+        // Not an override: skipped, whatever it holds.
+        let other = std::ffi::OsString::from_vec(vec![0xff]);
+        assert!(env_overlay_value(std::iter::once(("PATH".into(), other))).is_ok());
+    }
+
+    #[test]
+    fn shape_errors_keep_names_but_not_values() {
+        assert_eq!(
+            without_values(r#"credentials.a: invalid type: string "sv=1&sig=SECRET", expected a map"#),
+            "credentials.a: invalid type: string <value>, expected a map"
+        );
+        assert_eq!(
+            without_values("invalid type: integer `123456`, expected a string"),
+            "invalid type: integer <value>, expected a string"
+        );
+        assert_eq!(
+            without_values("server: unknown field `prot`, expected one of `bind`, `public_url`"),
+            "server: unknown field `prot`, expected one of `bind`, `public_url`"
+        );
+        assert_eq!(without_values("unknown variant `jpg`"), "unknown variant `jpg`");
+    }
+
+    #[test]
+    fn secrets_file_errors_do_not_echo_values() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let mut cfg = NamedTempFile::new().unwrap();
+        writeln!(cfg, "layers: []").unwrap();
+        let mut sec = NamedTempFile::new().unwrap();
+        writeln!(sec, "credentials:\n  a: \"sv=2024&sig=TOPSECRET\"").unwrap();
+        let err = format!("{:#}", load(cfg.path(), sec.path()).unwrap_err());
+        assert!(!err.contains("TOPSECRET"), "{err}");
+        assert!(err.contains("invalid type"), "{err}");
     }
 
     #[test]

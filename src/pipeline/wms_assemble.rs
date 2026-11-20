@@ -24,10 +24,10 @@
 
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use gdal::raster::ResampleAlg;
-use gdal::vsi::{create_mem_file, unlink_mem_file};
+use gdal::vsi::create_mem_file;
 use gdal::Dataset;
 
 use super::error::client_error;
@@ -37,7 +37,7 @@ use crate::encode::{encode, EncodeOpts, GeoRef, OutputFormat};
 use crate::protocol::wms::validate::WmsGetMap;
 use crate::source::gdal::raster::{
     bbox_to_geotransform, create_georeferenced_mem, gis_order_spatial_ref, pixel_type_from_gdal, read_pixel_buffer,
-    set_nodata, split_alpha, vsimem_path, warp, WarpOptions,
+    remove_mem_file, set_nodata, split_alpha, vsimem_path, warp, WarpOptions,
 };
 use crate::tile::{Pyramid, TileCoord, TileGrid};
 
@@ -61,8 +61,9 @@ pub async fn serve_get_map(r: &Renderer, q: &WmsGetMap<'_>) -> Result<Bytes> {
     let bbox = q.bbox();
     let crs = q.crs().crs();
 
-    // BBOX entirely outside the grid: a blank image, not an error.
-    if !q.intersects_grid() {
+    // BBOX entirely outside the grid, or outside every source file's
+    // footprint or the mask: a blank image, not an error, and no source read.
+    if !q.intersects_grid() || !r.has_data(layer, crs, &bbox).await? {
         return blank_image(r, layer, crs, bbox, (width, height), q.format()).await;
     }
 
@@ -72,7 +73,7 @@ pub async fn serve_get_map(r: &Renderer, q: &WmsGetMap<'_>) -> Result<Bytes> {
     // source reads plus a second resampling (and coarser-level tiles would
     // be upsampled).
     if r.finer_than_cached(&layer.name, grid.as_ref(), &bbox, (width, height))
-        && r.direct_read_fits(layer, grid.crs(), &bbox, (width, height))?
+        && r.direct_read_fits(layer, grid.crs(), &bbox, (width, height)).await?
     {
         return render_window(r, layer, &grid, crs, bbox, (width, height), q.format()).await;
     }
@@ -225,11 +226,14 @@ fn composite_tiles(
     resampling: ResampleAlg,
     nodata: Option<f64>,
 ) -> Result<Bytes> {
-    // Each `/vsimem/` file is unlinked when its guard drops, on every path.
+    // Each `/vsimem/` file (and the PAM sidecar GDAL writes for the
+    // georeferencing set below) is removed when its guard drops, on every
+    // path. `files` is declared before `datasets`, so the datasets close —
+    // writing their sidecars — before the guards run.
     struct MemFile(String);
     impl Drop for MemFile {
         fn drop(&mut self) {
-            let _ = unlink_mem_file(&self.0);
+            remove_mem_file(&self.0);
         }
     }
 
@@ -242,7 +246,22 @@ fn composite_tiles(
         let path = vsimem_path("wms-tile", ext);
         create_mem_file(&path, bytes.to_vec()).with_context(|| format!("composite: stage tile {coord:?}"))?;
         files.push(MemFile(path.clone()));
-        let mut ds = Dataset::open(&path).with_context(|| format!("composite: open tile {coord:?}"))?;
+        // Cached bytes are opened as the format they should be, nothing
+        // else: a planted VRT or WMS document in a cache store must not make
+        // GDAL read local files or other hosts.
+        let options = gdal::DatasetOptions {
+            open_flags: gdal::GdalOpenFlags::GDAL_OF_RASTER | gdal::GdalOpenFlags::GDAL_OF_READONLY,
+            allowed_drivers: Some(&[req.format.gdal_driver()]),
+            ..Default::default()
+        };
+        let mut ds = Dataset::open_ex(&path, options).with_context(|| format!("composite: open tile {coord:?}"))?;
+        if ds.raster_size() != (tw as usize, th as usize) || !(1..=4).contains(&ds.raster_count()) {
+            bail!(
+                "composite: cached tile {coord:?} is {:?} with {} bands, not a {tw}x{th} tile",
+                ds.raster_size(),
+                ds.raster_count()
+            );
+        }
         // Web tile formats carry no georeferencing; place each tile on its cell.
         ds.set_spatial_ref(&tile_sr)
             .with_context(|| format!("composite: set spatial ref on tile {coord:?}"))?;
@@ -330,6 +349,7 @@ mod tests {
     use crate::protocol::wms::validate::{validate, WmsQuery};
     use crate::source::gdal::GdalSource;
     use crate::source::{PixelBuffer, PixelType, Source, SourceRegistry};
+    use gdal::vsi::unlink_mem_file;
 
     /// EPSG:3857 RGB GeoTIFF fixture covering the WebMercator world extent.
     /// Using the grid's native CRS lets the tile renderer skip the reprojection
@@ -379,6 +399,59 @@ mod tests {
         tmp
     }
 
+    /// Cached tile bytes are opened only as their own format and size: a
+    /// VRT document (which could read local files) or an oversized image
+    /// planted in a cache store is refused, not rendered.
+    #[test]
+    fn composite_refuses_foreign_or_misshapen_tiles() {
+        let grid: Arc<dyn TileGrid> = Arc::new(crate::tile::grid::WebMercator::new());
+        let half = 20_037_508.342_789_2_f64;
+        let target = Target {
+            crs: Crs::new("EPSG:3857"),
+            bbox: Bbox::from([-half, 0.0, 0.0, half]),
+            width: 64,
+            height: 64,
+            format: OutputFormat::Png,
+            opts: EncodeOpts::defaults_for(OutputFormat::Png),
+        };
+        let vrt = br#"<VRTDataset rasterXSize="256" rasterYSize="256"><VRTRasterBand dataType="Byte" band="1"><SimpleSource><SourceFilename>/etc/hostname</SourceFilename></SimpleSource></VRTRasterBand></VRTDataset>"#;
+        let err = composite_tiles(
+            &grid,
+            &[(TileCoord::new(1, 0, 0), Bytes::from_static(vrt))],
+            &target,
+            ResampleAlg::Bilinear,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("open tile"), "{err:#}");
+
+        let big = PixelBuffer {
+            width: 300,
+            height: 300,
+            bands: 3,
+            pixel_type: PixelType::U8,
+            data: Bytes::from(vec![7u8; 300 * 300 * 3]),
+            nodata: None,
+            alpha: None,
+        };
+        let png = encode(
+            &big,
+            None,
+            OutputFormat::Png,
+            &EncodeOpts::defaults_for(OutputFormat::Png),
+        )
+        .unwrap();
+        let err = composite_tiles(
+            &grid,
+            &[(TileCoord::new(1, 0, 0), png)],
+            &target,
+            ResampleAlg::Bilinear,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not a 256x256 tile"), "{err:#}");
+    }
+
     fn fresh_cache() -> LayeredCache {
         LayeredCache::from_tiers(vec![std::sync::Arc::new(MemoryTier::new(16 * 1024 * 1024))])
     }
@@ -413,6 +486,7 @@ mod tests {
             nodata: None,
             source_mask: None,
             output_formats: Default::default(),
+            cache_control: None,
         }
     }
 

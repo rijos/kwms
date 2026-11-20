@@ -63,7 +63,7 @@ fn audit_tag(lines: &[&str], idx: usize) -> Option<String> {
         .rev()
         .take_while(|l| l.trim_start().starts_with("//"))
         .find_map(|l| l.split("UNSAFE-AUDIT:").nth(1))
-        .map(|rest| rest.trim().split_whitespace().next().unwrap_or("").to_string())
+        .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
 }
 
 #[test]

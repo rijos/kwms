@@ -444,6 +444,7 @@ mod tests {
                 nodata: None,
                 source_mask: None,
                 output_formats: Default::default(),
+                cache_control: None,
             }],
             ..Default::default()
         }

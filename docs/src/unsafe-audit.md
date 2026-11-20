@@ -394,6 +394,46 @@ These apply to every entry and are not repeated per entry.
   bucket) and, against real data, the 2026_orthoHR layer
   (`/vsiaz/` tiles read on GTI's worker threads).
 
+## F19 — `CPLSetErrorHandler`
+
+- **Location:** `ffi::set_error_handler`, called once (guarded by a `Once`)
+  from `source::gdal::runtime::configure` at the start of `kwms serve` and
+  `kwms cache update`, before any dataset is opened.
+- **Threads:** startup thread. GDAL stores the handler in a global under
+  `hErrorMutex` (`port/cpl_error.cpp`, `CPLSetErrorHandlerEx`).
+- **Purpose:** send GDAL's errors, warnings and debug messages to `tracing`
+  (target `gdal`, credentials removed by `redact::secrets`) instead of
+  GDAL's default handler, which writes them to stderr unredacted — e.g. the
+  full signed URL of a failed `/vsiaz/` request.
+- **Arguments / memory passed:** a function pointer to `on_gdal_message`, a
+  plain `extern "C" fn` with GDAL's `CPLErrorHandler` signature. No user
+  data pointer is registered (unlike `gdal::config::set_error_handler`,
+  which hands GDAL a pointer to a boxed `FnMut` it may then call from
+  several threads at once).
+- **Allocates / frees:** nothing. The previous handler is returned and
+  dropped (it is GDAL's static default).
+- **Side effects:** GDAL keeps recording the last error per thread before
+  calling the handler (`CPLErrorV`), so `cpl_error_message` still works.
+  Handlers pushed per thread (`CPLPushErrorHandler`) still take precedence.
+- **Failure behaviour:** cannot fail.
+- **Verified by:** `source::gdal::runtime::tests`, and the server log: GDAL
+  warnings arrive as JSON lines with `"target":"gdal"`.
+
+## F20 — `CStr::from_ptr` on a GDAL message
+
+- **Location:** `ffi::on_gdal_message`, the handler registered by F19.
+- **Threads:** any thread that raises a GDAL message, concurrently. The
+  handler keeps no state; it copies the message and calls `tracing`, which
+  is thread-safe. A panic inside is caught (`catch_unwind`) so it never
+  unwinds into C.
+- **Contract:** GDAL passes a NUL-terminated message valid for the duration
+  of the call (`CPLErrorV` formats it into the thread's error context).
+  NULL is checked first.
+- **Allocates:** the owned `String` copy, dropped on return.
+- **Frees:** nothing GDAL owns.
+- **Failure behaviour:** invalid UTF-8 is replaced (`to_string_lossy`).
+- **Verified by:** as F19.
+
 ## T1 — `GDALReferenceDataset` (tests only)
 
 - **Location:** `ffi::dataset_ref_count`, compiled only under `cfg(test)`.

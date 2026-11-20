@@ -67,3 +67,13 @@ Coarse levels touch many tiles: one tile covering the whole country opens all of
 ### Reprojection
 
 When the source's native CRS differs from the requested CRS, reprojection happens inside the GDAL implementation using GDAL's warp API (cheaper than re-warping in pure Rust and gives access to the full GDAL resampling kernel list). Per-layer config picks the resampling method (`nearestneighbour` / `bilinear` / `cubic` / `lanczos` / …); the default is `bilinear`. Token spellings are GDAL's — see `gdal::raster::ResampleAlg::from_str`.
+
+## What GDAL may read
+
+Set once at startup (`source::gdal::runtime`), before any source opens:
+
+- **Only GeoTIFFs from remote.** `CPL_VSIL_CURL_ALLOWED_EXTENSIONS=.tif,.tiff`: every network file system (`/vsiaz/`, `/vsis3/`, `/vsicurl/`, …) treats any other name as nonexistent, without asking the server. No `.aux.xml`/`.ovr` sidecars and no `.vrt` documents are fetched. Directory listings are off (`GDAL_DISABLE_READDIR_ON_OPEN=TRUE`), which saves a request per COG; local sidecars are still found by name.
+- **Tile index locations** must all name `.tif`/`.tiff` files, or the source fails to open. The startup probe opens each tile with the GTiff driver only, whatever its bytes claim to be.
+- **Cached tile bytes** (WMS compositing) are opened with the driver of their own format only and must be one tile in size. A VRT or WMS document planted in a cache store is refused, not followed to local files or other hosts.
+- **Timeouts while serving:** `GDAL_HTTP_TIMEOUT` = `server.source_timeout` (default 20 s), connect timeout 5 s, and a low-speed cut-off (under 1 KB/s for 10 s). A stalled object-store connection fails instead of holding a dataset-pool worker forever. `kwms cache update` sets none: rendering a country-wide coarse tile legitimately takes long.
+- **GTI threads:** `GTI_NUM_THREADS` = `server.tile_index_threads` (default 4) while serving. Tiles past the cached levels overlap at most a few files, so more threads buy nothing there, and they would sit outside kwms's own concurrency limits. `cache update` keeps GDAL's default (all CPUs).

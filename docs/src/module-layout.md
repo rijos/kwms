@@ -40,6 +40,7 @@ src/
 │       ├── sample.rs      # pixel sampling for GetFeatureInfo
 │       ├── tile_index.rs  # GTI index probe: per-tile GSD, one view per GSD, auto overviews
 │       ├── footprint.rs   # typical source-file size (for cache.max_level auto)
+│       ├── runtime.rs     # process-wide GDAL settings: remote .tif only, serve timeouts, GTI threads, messages -> tracing
 │       └── credentials.rs # per-bucket GDAL path-specific credentials
 ├── cache/
 │   ├── mod.rs             # Cache facade
@@ -50,10 +51,13 @@ src/
 │   ├── store.rs           # opendal-backed tier (fs, azblob, …)
 │   └── layered.rs         # tier stack (lookup, promotion, write-through) + single-flight
 ├── encode.rs              # GDAL-backed encoder for PNG / JPEG / WebP / GeoTIFF (see Output encoding chapter)
+├── logging.rs             # JSON logs on the console; level from server.log_level (RUST_LOG wins)
+├── redact.rs              # strip credentials (URL queries, sig=, AccountKey=) from anything logged
 ├── pipeline/
 │   ├── render.rs          # TileKey -> cache lookup -> source -> encode -> populate
 │   ├── cache_levels.rs    # cache.max_level: how deep each (layer, grid) is stored durably
 │   ├── stage.rs           # kwms_stage_seconds timings (where request time goes)
+│   ├── fingerprint.rs     # render-settings fingerprint stored with cached tiles (cache update invalidation)
 │   └── wms_assemble.rs    # WMS GetMap: cover bbox with tiles, render, reassemble
 ├── protocol/
 │   ├── wms/
@@ -78,7 +82,8 @@ src/
     └── middleware/
         ├── tracing.rs     # per-request span (id, protocol, layer, tile coords)
         ├── metrics.rs     # request counters, latency histograms
-        └── request_id.rs  # generate or accept X-Request-Id
+        ├── cache_control.rs # Cache-Control from config; no-store for everything else
+        └── request_id.rs  # random X-Request-Id; a client's is only logged
 ```
 
 ## `tests/` tree

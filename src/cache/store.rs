@@ -13,14 +13,13 @@
 //! copied in from another tier keeps its original render time.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use opendal::{ErrorKind, Operator, Scheme};
+use opendal::{ErrorKind, Operator};
 use serde::{Deserialize, Serialize};
 
-use super::tier::now_unix_seconds;
+use super::tier::{now_unix_seconds, stale};
 use super::{CacheTier, Entry, TileKey};
 use crate::config::model::{Credentials, StoreTierConfig};
 
@@ -30,9 +29,21 @@ pub struct StoreTier {
     name: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MetaSidecar {
+    /// Render time, Unix seconds (UTC).
     written_at: u64,
+    /// Render-settings fingerprint (see [`Entry::render`]); absent in
+    /// sidecars written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render: Option<String>,
+}
+
+/// An opendal error as an `anyhow` error with credentials removed: opendal
+/// puts the request URL — with a SAS token in its query — into its error
+/// context.
+fn store_error(e: opendal::Error, what: &'static str) -> anyhow::Error {
+    anyhow!("{}", crate::redact::secrets(&e.to_string())).context(what)
 }
 
 fn meta_path(path: &str) -> String {
@@ -42,6 +53,9 @@ fn meta_path(path: &str) -> String {
 /// Path of the startup probe. Starts with a `.`, which no layer name may
 /// (`config::validate`), so it never collides with a tile.
 const PROBE: &str = ".kwms-startup-check";
+
+/// Temporary files of the fs backend's atomic writes, below its root.
+const FS_TMP_DIR: &str = ".kwms-tmp";
 
 impl StoreTier {
     pub fn new(op: Operator) -> Self {
@@ -63,7 +77,7 @@ impl CacheTier for StoreTier {
 
     /// Everything except opendal's in-memory service.
     fn durable(&self) -> bool {
-        self.op.info().scheme() != Scheme::Memory
+        self.op.info().scheme() != opendal::services::MEMORY_SCHEME
     }
 
     async fn get(&self, key: &TileKey, ttl: Duration) -> Result<Option<Entry>> {
@@ -74,13 +88,13 @@ impl CacheTier for StoreTier {
         let meta_buf = match self.op.read(&meta_path).await {
             Ok(b) => b,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(anyhow!(e).context("read sidecar")),
+            Err(e) => return Err(store_error(e, "read sidecar")),
         };
         let Ok(meta) = serde_json::from_slice::<MetaSidecar>(&meta_buf.to_bytes()) else {
             return Ok(None);
         };
-        if now_unix_seconds().saturating_sub(meta.written_at) > ttl.as_secs() {
-            // Expired — best-effort cleanup, then miss.
+        if stale(meta.written_at, ttl) {
+            // Expired (or from the future) — best-effort cleanup, then miss.
             let _ = self.op.delete(&path).await;
             let _ = self.op.delete(&meta_path).await;
             return Ok(None);
@@ -91,81 +105,90 @@ impl CacheTier for StoreTier {
             Ok(b) => Ok(Some(Entry {
                 bytes: b.to_bytes(),
                 written_at: meta.written_at,
+                render: meta.render,
             })),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow!(e).context("read data")),
+            Err(e) => Err(store_error(e, "read data")),
         }
     }
 
     /// Data first, then the sidecar: a reader never sees a sidecar without
     /// its data (a crash in between leaves data without sidecar = a miss).
+    /// Each write is atomic — whole object or nothing — on Azure Blob, and on
+    /// the file system through `atomic_write_dir` (see [`build_operator`]),
+    /// so a crash or a concurrent rewrite never leaves a truncated tile.
     async fn put(&self, key: &TileKey, entry: Entry) -> Result<()> {
         let path = key.as_path();
         self.op
             .write(&path, entry.bytes)
             .await
-            .map_err(|e| anyhow!(e).context("write data"))?;
+            .map_err(|e| store_error(e, "write data"))?;
         let sidecar = serde_json::to_vec(&MetaSidecar {
             written_at: entry.written_at,
+            render: entry.render,
         })
         .context("serialize sidecar")?;
         self.op
             .write(&meta_path(&path), sidecar)
             .await
-            .map_err(|e| anyhow!(e).context("write sidecar"))?;
+            .map_err(|e| store_error(e, "write sidecar"))?;
         Ok(())
     }
 
-    /// Write, read back and delete a probe object.
+    /// Write, read back and delete a probe object. The name is unique per
+    /// check, so replicas starting together against one container don't
+    /// trip over each other's probe.
     async fn check(&self) -> Result<()> {
+        let probe = format!("{PROBE}-{}", probe_suffix());
         let body = format!("kwms {}", now_unix_seconds());
-        self.op.write(PROBE, body.clone()).await.map_err(|e| {
-            anyhow!(e).context(
+        self.op.write(&probe, body.clone()).await.map_err(|e| {
+            store_error(
+                e,
                 "cannot write (check backend, container/root and credentials; the token must allow write and delete)",
             )
         })?;
         let back = self
             .op
-            .read(PROBE)
+            .read(&probe)
             .await
-            .map_err(|e| anyhow!(e).context("cannot read back what was written"))?;
+            .map_err(|e| store_error(e, "cannot read back what was written"))?;
         if back.to_bytes() != body.as_bytes() {
             return Err(anyhow!("read back different bytes than were written"));
         }
         self.op
-            .delete(PROBE)
+            .delete(&probe)
             .await
-            .map_err(|e| anyhow!(e).context("cannot delete (expired tiles could never be removed)"))?;
+            .map_err(|e| store_error(e, "cannot delete (expired tiles could never be removed)"))?;
         Ok(())
     }
 }
 
+/// 64 random bits, hex.
+fn probe_suffix() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes = u64::from(std::process::id())
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Build an [`Operator`] from a [`StoreTierConfig`].
 ///
-/// Two delegations to opendal:
-///
-/// 1. The backend name is parsed via [`Scheme::from_str`]
-///    (<https://docs.rs/opendal/0.50/opendal/enum.Scheme.html#impl-FromStr-for-Scheme>).
-/// 2. The merged option map is handed to [`Operator::via_iter`]
-///    (<https://docs.rs/opendal/0.50/opendal/struct.Operator.html#method.via_iter>),
-///    which dispatches to the matching builder in
-///    <https://docs.rs/opendal/0.50/opendal/services/index.html>.
-///
-/// A backend whose opendal Cargo feature is not compiled in fails with
-/// opendal's `Unsupported` error, propagated verbatim.
+/// The backend name (`fs`, `azblob`, …) and the merged option map are handed
+/// to [`Operator::via_iter`], which looks the scheme up in opendal's service
+/// registry (services compiled in through Cargo features register
+/// themselves at startup) and builds it from the options
+/// (<https://docs.rs/opendal/0.59/opendal/services/index.html>). A backend
+/// that isn't compiled in is an error naming it.
 ///
 /// Credentials: when `cfg.credentials` names a block in `secrets.yaml`, its
 /// key/value pairs are merged into `options`. Entries already present in
 /// `options` win, so an inline override in `config.yaml` beats the shared
 /// secret.
 pub fn build_operator(cfg: &StoreTierConfig, credentials: &HashMap<String, Credentials>) -> Result<Operator> {
-    let scheme = Scheme::from_str(&cfg.backend).map_err(|e| {
-        anyhow!(
-            "cache store backend '{backend}': {e} \
-             (see https://docs.rs/opendal/0.50/opendal/enum.Scheme.html for the full list)",
-            backend = cfg.backend
-        )
-    })?;
+    let scheme = cfg.backend.trim().to_ascii_lowercase();
 
     let mut options = cfg.options.clone();
     if let Some(name) = &cfg.credentials {
@@ -177,8 +200,25 @@ pub fn build_operator(cfg: &StoreTierConfig, credentials: &HashMap<String, Crede
         }
     }
 
-    Operator::via_iter(scheme, options)
-        .with_context(|| format!("building opendal operator for backend '{}'", cfg.backend))
+    // File system: write each object to a temporary file and rename it into
+    // place, so readers never see a partly written tile. The directory sits
+    // inside the root (same file system, so the rename is atomic) and starts
+    // with '.', which no layer name may.
+    if scheme == "fs" && !options.contains_key("atomic_write_dir") {
+        if let Some(root) = options.get("root") {
+            let dir = format!("{}/{FS_TMP_DIR}", root.trim_end_matches('/'));
+            options.insert("atomic_write_dir".into(), dir);
+        }
+    }
+
+    Operator::via_iter(&scheme, options)
+        .map_err(|e| anyhow!("{}", crate::redact::secrets(&e.to_string())))
+        .with_context(|| {
+            format!(
+                "building cache store backend '{}' (compiled in: fs, azblob, memory)",
+                cfg.backend
+            )
+        })
 }
 
 #[cfg(test)]
@@ -190,11 +230,7 @@ mod tests {
     use opendal::services;
 
     fn memory_tier() -> StoreTier {
-        StoreTier::new(
-            Operator::new(services::Memory::default())
-                .expect("memory builder")
-                .finish(),
-        )
+        StoreTier::new(Operator::new(services::Memory::default()).expect("memory builder"))
     }
 
     fn key() -> TileKey {
@@ -214,6 +250,7 @@ mod tests {
         let e = Entry {
             bytes: Bytes::from_static(b"abc"),
             written_at: now_unix_seconds() - 10,
+            render: None,
         };
         tier.put(&key(), e.clone()).await.expect("put");
         assert_eq!(tier.get(&key(), TTL).await.unwrap(), Some(e));
@@ -226,6 +263,7 @@ mod tests {
         let old = Entry {
             bytes: Bytes::from_static(b"abc"),
             written_at: now_unix_seconds() - 120,
+            render: None,
         };
         tier.put(&key(), old).await.expect("put");
         assert!(tier.get(&key(), TTL).await.unwrap().is_none());
@@ -295,9 +333,61 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let mut cfg = StoreTierConfig::default();
         cfg.options.insert("root".into(), file.to_string_lossy().into_owned());
+        // Fails when the tier is built (its atomic-write directory can't be
+        // created under a file) or, at the latest, at the startup check.
+        let err = match StoreTier::from_config(&cfg, &HashMap::new()) {
+            Err(e) => format!("{e:#}"),
+            Ok(tier) => format!("{:#}", tier.check().await.unwrap_err()),
+        };
+        assert!(
+            err.contains("cannot write") || err.contains("atomic_write_dir"),
+            "{err}"
+        );
+    }
+
+    /// fs writes go through a temporary file: a tile is complete or absent.
+    #[tokio::test]
+    async fn fs_writes_are_atomic_and_tmp_dir_is_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreTierConfig::default();
+        cfg.options
+            .insert("root".into(), dir.path().to_string_lossy().into_owned());
         let tier = StoreTier::from_config(&cfg, &HashMap::new()).unwrap();
-        let err = format!("{:#}", tier.check().await.unwrap_err());
-        assert!(err.contains("cannot write"), "{err}");
+        tier.put(&key(), Entry::now(Bytes::from_static(b"tile"))).await.unwrap();
+        assert!(dir.path().join(FS_TMP_DIR).is_dir());
+        let got = tier.get(&key(), Duration::from_secs(60)).await.unwrap().unwrap();
+        assert_eq!(got.bytes, Bytes::from_static(b"tile"));
+    }
+
+    /// A render time in the future is not trusted (it would never expire).
+    #[tokio::test]
+    async fn future_timestamps_are_stale() {
+        let tier = memory_tier();
+        let future = Entry {
+            bytes: Bytes::from_static(b"x"),
+            written_at: now_unix_seconds() + 3600,
+            render: None,
+        };
+        tier.put(&key(), future).await.unwrap();
+        assert!(tier.get(&key(), Duration::from_secs(86_400)).await.unwrap().is_none());
+        // Within the clock-skew allowance it is fine.
+        let skewed = Entry {
+            bytes: Bytes::from_static(b"x"),
+            written_at: now_unix_seconds() + 30,
+            render: Some("abc".into()),
+        };
+        tier.put(&key(), skewed).await.unwrap();
+        let got = tier.get(&key(), Duration::from_secs(86_400)).await.unwrap().unwrap();
+        assert_eq!(got.render.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn store_errors_hide_tokens() {
+        let e = opendal::Error::new(ErrorKind::PermissionDenied, "forbidden")
+            .with_context("uri", "https://acct.blob.core.windows.net/c/x.png?sv=1&sig=SECRET");
+        let msg = format!("{:#}", store_error(e, "read data"));
+        assert!(!msg.contains("SECRET"), "{msg}");
+        assert!(msg.contains("read data"), "{msg}");
     }
 
     #[test]

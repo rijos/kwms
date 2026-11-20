@@ -91,6 +91,7 @@ mod tests {
         let old = Entry {
             bytes: Bytes::from_static(b"x"),
             written_at: Entry::now(Bytes::new()).written_at - 120,
+            render: None,
         };
         tier.put(&key(0, 0, 0), old).await.unwrap();
         assert!(tier.get(&key(0, 0, 0), TTL).await.unwrap().is_none());

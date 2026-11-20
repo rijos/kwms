@@ -49,6 +49,8 @@ impl CpuPool {
         super::stage::record("cpu_wait", waiting);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Blocking threads are reused: start without another job's GDAL error.
+            crate::ffi::cpl_error_reset();
             let running = std::time::Instant::now();
             let out = job();
             super::stage::record(stage, running);

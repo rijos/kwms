@@ -154,7 +154,9 @@ pub fn probe(uri: &str, open_options: &[String]) -> Result<Option<TileIndex>> {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(location) = locations.get(i) else { break };
-                let tile = read_tile(location).map_err(|e| format!("{location}: {e:#}"));
+                // GDAL's message carries the signed URL: keep it out of logs.
+                let tile = read_tile(location)
+                    .map_err(|e| format!("{location}: {}", crate::redact::secrets(&format!("{e:#}"))));
                 if let Ok(mut r) = results.lock() {
                     r.push((i, tile));
                 }
@@ -274,13 +276,30 @@ fn read_index(index: &str, open_options: &[String]) -> Result<IndexContents> {
         };
         locations.push((loc, (e.MinX, e.MinY, e.MaxX, e.MaxY), geometry.wkb()?));
     }
+    // Tiles are GeoTIFFs, nothing else: a location naming another format
+    // (a VRT, a WMS description, …) could make GDAL read local files or
+    // other hosts. Remote non-TIFF names are also refused by GDAL itself
+    // (see `runtime`); this check names the culprit at startup.
+    let other: Vec<&str> = locations
+        .iter()
+        .map(|(l, _, _)| l.as_str())
+        .filter(|l| !super::runtime::is_tiff(l))
+        .collect();
+    if let Some(first) = other.first() {
+        bail!(
+            "{} tile location(s) are not GeoTIFFs (.tif/.tiff), e.g. '{first}'; kwms only reads GeoTIFF tiles",
+            other.len()
+        );
+    }
     let e = layer.get_extent().context("index extent")?;
     Ok((locations, (e.MinX, e.MinY, e.MaxX, e.MaxY), stored))
 }
 
 fn read_tile(location: &str) -> Result<Tile> {
+    // GeoTIFF only, whatever the bytes claim to be.
     let options = DatasetOptions {
         open_flags: GdalOpenFlags::GDAL_OF_RASTER | GdalOpenFlags::GDAL_OF_READONLY,
+        allowed_drivers: Some(&["GTiff"]),
         ..Default::default()
     };
     let ds = Dataset::open_ex(Path::new(location), options)?;
